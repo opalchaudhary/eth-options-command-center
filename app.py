@@ -21,7 +21,7 @@ st.set_page_config(
 st.title("ETH Options Command Center")
 st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 
-st.caption("Auto-refresh enabled: updates every 10 seconds")
+st.caption("Auto-refresh enabled: updates every 60 seconds")
 
 df = get_eth_options()
 eth_price_data = get_eth_spot_price()
