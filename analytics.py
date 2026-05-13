@@ -81,7 +81,7 @@ def calculate_max_pain(df):
     return max_pain_strike, pain_df
 
 
-def calculate_atm_and_expected_move(df):
+def calculate_atm_and_expected_move(df, spot_price=None):
     df = clean_options_df(df)
 
     calls = df[df["type"] == "call_options"].copy()
@@ -90,11 +90,22 @@ def calculate_atm_and_expected_move(df):
     if calls.empty or puts.empty:
         return None, None, None, None
 
-    # Approx ATM from median available strike for now
-    atm_strike = df["strike"].median()
+    if spot_price is not None:
+        atm_reference_price = float(spot_price)
+    else:
+        atm_reference_price = df["strike"].median()
 
-    atm_call = calls.iloc[(calls["strike"] - atm_strike).abs().argsort()[:1]]
-    atm_put = puts.iloc[(puts["strike"] - atm_strike).abs().argsort()[:1]]
+    atm_strike = df.iloc[
+        (df["strike"] - atm_reference_price).abs().argsort()[:1]
+    ]["strike"].iloc[0]
+
+    atm_call = calls.iloc[
+        (calls["strike"] - atm_strike).abs().argsort()[:1]
+    ]
+
+    atm_put = puts.iloc[
+        (puts["strike"] - atm_strike).abs().argsort()[:1]
+    ]
 
     ce_price = atm_call["mark_price"].iloc[0]
     pe_price = atm_put["mark_price"].iloc[0]

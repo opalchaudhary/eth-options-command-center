@@ -1,6 +1,7 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-from delta_api import get_eth_options
+from delta_api import get_eth_options, get_eth_spot_price
 
 from analytics import (
     basic_expiry_analytics,
@@ -18,12 +19,36 @@ st.set_page_config(
 )
 
 st.title("ETH Options Command Center")
+st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
+
+st.caption("Auto-refresh enabled: updates every 10 seconds")
 
 df = get_eth_options()
+eth_price_data = get_eth_spot_price()
 
 if df.empty:
     st.warning("No ETH option data found.")
     st.stop()
+
+eth_spot_price = eth_price_data.get("spot_price")
+eth_mark_price = eth_price_data.get("mark_price")
+
+price_col1, price_col2, price_col3 = st.columns(3)
+
+price_col1.metric(
+    "ETH Spot Price",
+    f"${eth_spot_price:,.2f}" if eth_spot_price else "NA"
+)
+
+price_col2.metric(
+    "ETH Mark Price",
+    f"${eth_mark_price:,.2f}" if eth_mark_price else "NA"
+)
+
+price_col3.metric(
+    "Price Source",
+    eth_price_data.get("symbol", "ETHUSD")
+)
 
 expiry_list = sorted(df["expiry"].dropna().unique())
 
@@ -38,7 +63,10 @@ analytics = basic_expiry_analytics(expiry_df)
 
 max_pain, pain_df = calculate_max_pain(expiry_df)
 
-atm_strike, expected_move, atm_ce_price, atm_pe_price = calculate_atm_and_expected_move(expiry_df)
+atm_strike, expected_move, atm_ce_price, atm_pe_price = calculate_atm_and_expected_move(
+    expiry_df,
+    eth_spot_price
+)
 
 insights = generate_rule_based_insights(
     analytics,
@@ -124,6 +152,12 @@ col12.metric(
     "ATM PE Price",
     round(atm_pe_price, 2) if atm_pe_price else "NA"
 )
+
+if eth_spot_price and atm_strike:
+    st.caption(
+        f"ATM is calculated using real ETH spot price: ${eth_spot_price:,.2f}. "
+        f"Nearest available option strike selected: {atm_strike}."
+    )
 
 st.subheader("Rule-Based Market Insights")
 
