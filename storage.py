@@ -3,10 +3,38 @@ import requests
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+def get_secret(key):
+    """
+    Works both locally and on Streamlit Cloud.
+    Local: reads from .env
+    Streamlit Cloud: reads from st.secrets
+    """
+    if st is not None:
+        try:
+            if key in st.secrets:
+                return st.secrets[key]
+        except Exception:
+            pass
+
+    return os.getenv(key)
+
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌ Supabase credentials missing. Check .env or Streamlit Secrets.")
+
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -16,9 +44,47 @@ HEADERS = {
 }
 
 
-def save_analytics_snapshot(analytics, expiry_label):
-    url = f"{SUPABASE_URL}/rest/v1/analytics_snapshots"
+def post_to_supabase(table_name, payload):
+    """
+    Central safe POST function.
+    Prevents app crash if Supabase fails temporarily.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("❌ Supabase not configured.")
+        return False
 
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    try:
+        response = requests.post(
+            url,
+            headers=HEADERS,
+            json=payload,
+            timeout=10
+        )
+
+        if response.status_code in [200, 201, 204]:
+            return True
+
+        print(f"❌ Supabase insert failed: {table_name}")
+        print("Status:", response.status_code)
+        print("Response:", response.text)
+        return False
+
+    except requests.exceptions.Timeout:
+        print(f"⚠️ Supabase timeout while saving to {table_name}")
+        return False
+
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Supabase request error in {table_name}:", str(e))
+        return False
+
+    except Exception as e:
+        print(f"❌ Unexpected Supabase error in {table_name}:", str(e))
+        return False
+
+
+def save_analytics_snapshot(analytics, expiry_label):
     row = {
         "snapshot_time": datetime.now(timezone.utc).isoformat(),
         "expiry_label": expiry_label,
@@ -32,18 +98,8 @@ def save_analytics_snapshot(analytics, expiry_label):
         "expected_move_lower": analytics.get("expected_move_lower")
     }
 
-    try:
-        response = requests.post(url, headers=HEADERS, json=row)
-
-        if response.status_code in [200, 201]:
-            print("✅ Analytics Snapshot Saved")
-        else:
-            print("❌ Analytics Snapshot Save Failed")
-            print("Status:", response.status_code)
-            print("Response:", response.text)
-
-    except Exception as e:
-        print("❌ Analytics Snapshot Error:", str(e))
+    if post_to_supabase("analytics_snapshots", row):
+        print("✅ Analytics Snapshot Saved")
 
 
 def save_premium_decay_snapshot(
@@ -53,8 +109,6 @@ def save_premium_decay_snapshot(
     atm_pe_price,
     atm_straddle_price
 ):
-    url = f"{SUPABASE_URL}/rest/v1/premium_decay_snapshots"
-
     row = {
         "snapshot_time": datetime.now(timezone.utc).isoformat(),
         "expiry_label": expiry_label,
@@ -64,18 +118,8 @@ def save_premium_decay_snapshot(
         "atm_straddle_price": atm_straddle_price
     }
 
-    try:
-        response = requests.post(url, headers=HEADERS, json=row)
-
-        if response.status_code in [200, 201]:
-            print("✅ Premium Decay Snapshot Saved")
-        else:
-            print("❌ Premium Decay Save Failed")
-            print("Status:", response.status_code)
-            print("Response:", response.text)
-
-    except Exception as e:
-        print("❌ Premium Decay Error:", str(e))
+    if post_to_supabase("premium_decay_snapshots", row):
+        print("✅ Premium Decay Snapshot Saved")
 
 
 def save_option_chain_snapshot(expiry_df, expiry_label):
@@ -83,9 +127,7 @@ def save_option_chain_snapshot(expiry_df, expiry_label):
         print("⚠️ Option Chain Snapshot Skipped: Empty dataframe")
         return
 
-    url = f"{SUPABASE_URL}/rest/v1/option_chain_snapshots"
     snapshot_time = datetime.now(timezone.utc).isoformat()
-
     rows = []
 
     for _, row in expiry_df.iterrows():
@@ -105,15 +147,5 @@ def save_option_chain_snapshot(expiry_df, expiry_label):
             "vega": row.get("vega")
         })
 
-    try:
-        response = requests.post(url, headers=HEADERS, json=rows)
-
-        if response.status_code in [200, 201]:
-            print(f"✅ Option Chain Snapshot Saved: {len(rows)} rows")
-        else:
-            print("❌ Option Chain Snapshot Save Failed")
-            print("Status:", response.status_code)
-            print("Response:", response.text)
-
-    except Exception as e:
-        print("❌ Option Chain Snapshot Error:", str(e))
+    if post_to_supabase("option_chain_snapshots", rows):
+        print(f"✅ Option Chain Snapshot Saved: {len(rows)} rows")
