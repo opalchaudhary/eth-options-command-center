@@ -310,11 +310,15 @@ try:
     text_insights = orderbook_data["text_insights"]
 
     try:
-        save_orderbook_insights(orderbook_insights)
-        st.sidebar.success("Order book database updated")
-    except Exception as e:
-        st.sidebar.warning(f"Order book snapshot not saved: {e}")
+    saved = save_orderbook_insights(orderbook_insights)
 
+    if saved:
+        st.sidebar.success("Order book database updated")
+    else:
+        st.sidebar.warning("Order book database NOT saved")
+
+except Exception as e:
+    st.sidebar.warning(f"Order book snapshot not saved: {e}")
     if orderbook_insights.get("status") == "ok":
 
         ob1, ob2, ob3, ob4 = st.columns(4)
