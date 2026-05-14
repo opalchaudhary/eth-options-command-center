@@ -13,11 +13,6 @@ load_dotenv()
 
 
 def get_secret(key):
-    """
-    Works both locally and on Streamlit Cloud.
-    Local: reads from .env
-    Streamlit Cloud: reads from st.secrets
-    """
     if st is not None:
         try:
             if key in st.secrets:
@@ -45,10 +40,6 @@ HEADERS = {
 
 
 def post_to_supabase(table_name, payload):
-    """
-    Central safe POST function.
-    Prevents app crash if Supabase fails temporarily.
-    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("❌ Supabase not configured.")
         return False
@@ -69,6 +60,7 @@ def post_to_supabase(table_name, payload):
         print(f"❌ Supabase insert failed: {table_name}")
         print("Status:", response.status_code)
         print("Response:", response.text)
+        print("Payload:", payload)
         return False
 
     except requests.exceptions.Timeout:
@@ -100,6 +92,9 @@ def save_analytics_snapshot(analytics, expiry_label):
 
     if post_to_supabase("analytics_snapshots", row):
         print("✅ Analytics Snapshot Saved")
+        return True
+
+    return False
 
 
 def save_premium_decay_snapshot(
@@ -120,6 +115,9 @@ def save_premium_decay_snapshot(
 
     if post_to_supabase("premium_decay_snapshots", row):
         print("✅ Premium Decay Snapshot Saved")
+        return True
+
+    return False
 
 
 def save_option_chain_snapshot(expiry_df, expiry_label):
@@ -155,18 +153,16 @@ def save_option_chain_snapshot(expiry_df, expiry_label):
 
 
 def save_orderbook_insights(insights):
-    """
-    Save summarized ETH perpetual order book intelligence to Supabase.
-    This stores only derived metrics, not the full raw order book.
-    """
-
     if not insights or insights.get("status") != "ok":
         print("⚠️ Order Book Snapshot Skipped: Invalid insights")
         return False
 
     row = {
         "timestamp": insights.get("timestamp"),
-        "last_updated_at": insights.get("last_updated_at"),
+
+        # Kept None to avoid timestamptz format errors from Delta API
+        "last_updated_at": None,
+
         "symbol": insights.get("symbol"),
 
         "eth_price": insights.get("mid_price"),
