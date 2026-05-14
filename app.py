@@ -11,6 +11,7 @@ from analytics import (
 
 from rules_engine import generate_rule_based_insights
 from strategy_engine import suggest_strategy
+from storage import save_analytics_snapshot
 
 
 st.set_page_config(
@@ -19,8 +20,8 @@ st.set_page_config(
 )
 
 st.title("ETH Options Command Center")
-st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 
+st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 st.caption("Auto-refresh enabled: updates every 60 seconds")
 
 df = get_eth_options()
@@ -60,13 +61,37 @@ selected_expiry = st.sidebar.selectbox(
 expiry_df = df[df["expiry"] == selected_expiry].copy()
 
 analytics = basic_expiry_analytics(expiry_df)
-
 max_pain, pain_df = calculate_max_pain(expiry_df)
 
 atm_strike, expected_move, atm_ce_price, atm_pe_price = calculate_atm_and_expected_move(
     expiry_df,
     eth_spot_price
 )
+
+expected_move_pct = None
+expected_move_upper = None
+expected_move_lower = None
+
+if eth_spot_price and expected_move:
+    expected_move_pct = (expected_move / eth_spot_price) * 100
+    expected_move_upper = eth_spot_price + expected_move
+    expected_move_lower = eth_spot_price - expected_move
+
+snapshot_analytics = {
+    "spot_price": eth_spot_price,
+    "max_pain": max_pain,
+    "atm_strike": atm_strike,
+    "pcr": analytics.get("pcr"),
+    "atm_straddle_price": expected_move,
+    "expected_move_pct": expected_move_pct,
+    "expected_move_upper": expected_move_upper,
+    "expected_move_lower": expected_move_lower
+}
+
+try:
+    save_analytics_snapshot(snapshot_analytics, selected_expiry)
+except Exception as e:
+    st.sidebar.warning(f"Supabase snapshot not saved: {e}")
 
 insights = generate_rule_based_insights(
     analytics,
@@ -111,32 +136,14 @@ col4.metric(
 
 col5, col6, col7, col8 = st.columns(4)
 
-col5.metric(
-    "Net Delta",
-    round(analytics["net_delta"], 4)
-)
-
-col6.metric(
-    "Net Gamma",
-    round(analytics["net_gamma"], 6)
-)
-
-col7.metric(
-    "Net Theta",
-    round(analytics["net_theta"], 4)
-)
-
-col8.metric(
-    "Net Vega",
-    round(analytics["net_vega"], 4)
-)
+col5.metric("Net Delta", round(analytics["net_delta"], 4))
+col6.metric("Net Gamma", round(analytics["net_gamma"], 6))
+col7.metric("Net Theta", round(analytics["net_theta"], 4))
+col8.metric("Net Vega", round(analytics["net_vega"], 4))
 
 col9, col10, col11, col12 = st.columns(4)
 
-col9.metric(
-    "ATM Strike",
-    atm_strike
-)
+col9.metric("ATM Strike", atm_strike)
 
 col10.metric(
     "Expected Move",
@@ -152,6 +159,12 @@ col12.metric(
     "ATM PE Price",
     round(atm_pe_price, 2) if atm_pe_price else "NA"
 )
+
+if eth_spot_price and expected_move:
+    st.caption(
+        f"Expected range: ${expected_move_lower:,.2f} – ${expected_move_upper:,.2f} "
+        f"({expected_move_pct:.2f}%)."
+    )
 
 if eth_spot_price and atm_strike:
     st.caption(
