@@ -125,7 +125,7 @@ def save_premium_decay_snapshot(
 def save_option_chain_snapshot(expiry_df, expiry_label):
     if expiry_df is None or expiry_df.empty:
         print("⚠️ Option Chain Snapshot Skipped: Empty dataframe")
-        return
+        return False
 
     snapshot_time = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -149,3 +149,52 @@ def save_option_chain_snapshot(expiry_df, expiry_label):
 
     if post_to_supabase("option_chain_snapshots", rows):
         print(f"✅ Option Chain Snapshot Saved: {len(rows)} rows")
+        return True
+
+    return False
+
+
+def save_orderbook_insights(insights):
+    """
+    Save summarized ETH perpetual order book intelligence to Supabase.
+    This stores only derived metrics, not the full raw order book.
+    """
+
+    if not insights or insights.get("status") != "ok":
+        print("⚠️ Order Book Snapshot Skipped: Invalid insights")
+        return False
+
+    row = {
+        "timestamp": insights.get("timestamp"),
+        "last_updated_at": insights.get("last_updated_at"),
+        "symbol": insights.get("symbol"),
+
+        "eth_price": insights.get("mid_price"),
+        "best_bid": insights.get("best_bid"),
+        "best_ask": insights.get("best_ask"),
+
+        "spread": insights.get("spread"),
+        "spread_pct": insights.get("spread_pct"),
+        "spread_quality": insights.get("spread_quality"),
+
+        "bid_depth": insights.get("bid_depth"),
+        "ask_depth": insights.get("ask_depth"),
+        "imbalance_ratio": insights.get("imbalance_ratio"),
+
+        "bias": insights.get("bias"),
+
+        "nearest_bid_wall_price": insights.get("nearest_bid_wall_price"),
+        "nearest_bid_wall_size": insights.get("nearest_bid_wall_size"),
+
+        "nearest_ask_wall_price": insights.get("nearest_ask_wall_price"),
+        "nearest_ask_wall_size": insights.get("nearest_ask_wall_size"),
+
+        "trap_risk": insights.get("trap_risk"),
+        "execution_signal": insights.get("execution_signal"),
+    }
+
+    if post_to_supabase("orderbook_insights", row):
+        print("✅ Order Book Insight Snapshot Saved")
+        return True
+
+    return False
