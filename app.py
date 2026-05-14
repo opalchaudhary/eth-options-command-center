@@ -436,4 +436,4 @@ st.info(
     "Use the sidebar navigation for Charts, Option Chain, and Insights. "
     "This home page is intentionally kept clean for quick market reading."
 )
-```
+
