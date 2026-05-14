@@ -312,7 +312,7 @@ try:
     try:
         saved = save_orderbook_insights(orderbook_insights)
 
-    if saved:
+        if saved:
         st.sidebar.success("Order book database updated")
     else:
         st.sidebar.warning("Order book database NOT saved")
