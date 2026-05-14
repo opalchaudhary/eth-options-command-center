@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -194,3 +195,202 @@ def save_orderbook_insights(insights):
         return True
 
     return False
+
+def save_ohlcv_data(df, symbol="ETHUSD", resolution="5m"):
+    """
+    Save OHLCV candle data into Supabase.
+    Uses upsert to avoid duplicate candle entries.
+    """
+
+    if df is None or df.empty:
+        print("No OHLCV data to save.")
+        return False
+
+    records = []
+
+    for _, row in df.iterrows():
+        records.append(
+            {
+                "symbol": symbol,
+                "resolution": resolution,
+                "candle_time": row["timestamp"].isoformat(),
+                "epoch_time": int(row["time"]),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row["volume"]),
+            }
+        )
+
+    url = f"{SUPABASE_URL}/rest/v1/eth_ohlcv"
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                **HEADERS,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+            },
+            params={
+                "on_conflict": "symbol,resolution,candle_time"
+            },
+            json=records,
+            timeout=15,
+        )
+
+        if response.status_code not in [200, 201]:
+            print("Failed to save OHLCV data:", response.status_code, response.text)
+            return False
+
+        print(f"Saved/updated {len(records)} OHLCV candles.")
+        return True
+
+    except Exception as e:
+        print("Error saving OHLCV data:", e)
+        return False
+    
+def save_market_events(events, symbol="ETHUSD", resolution="5m"):
+    if not events:
+        print("No market events to save.")
+        return False
+
+    records = []
+
+    for e in events:
+        records.append({
+            "symbol": symbol,
+            "resolution": resolution,
+            "event_type": e.get("event_type"),
+            "direction": e.get("direction"),
+            "event_time": e.get("event_time").isoformat(),
+            "price": e.get("price"),
+            "reference_price": e.get("reference_price"),
+            "strength": e.get("strength"),
+            "metadata": e.get("metadata", {}),
+        })
+
+    url = f"{SUPABASE_URL}/rest/v1/eth_market_events"
+
+    response = requests.post(
+        url,
+        headers={
+            **HEADERS,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        },
+        params={"on_conflict": "symbol,resolution,event_type,event_time,price"},
+        json=records,
+        timeout=15,
+    )
+
+    if response.status_code not in [200, 201]:
+        print("Failed to save market events:", response.status_code, response.text)
+        return False
+
+    print(f"Saved/updated {len(records)} market events.")
+    return True
+
+
+def save_smc_zones(zones, symbol="ETHUSD", resolution="5m"):
+    if not zones:
+        print("No SMC zones to save.")
+        return False
+
+    records = []
+    seen = set()
+
+    for z in zones:
+        key = (
+            symbol,
+            resolution,
+            z.get("zone_type"),
+            str(z.get("start_time")),
+            round(float(z.get("price_low")), 4),
+            round(float(z.get("price_high")), 4),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        records.append({
+            "symbol": symbol,
+            "resolution": resolution,
+            "zone_type": z.get("zone_type"),
+            "direction": z.get("direction"),
+            "start_time": z.get("start_time").isoformat(),
+            "end_time": z.get("end_time").isoformat(),
+            "price_low": z.get("price_low"),
+            "price_high": z.get("price_high"),
+            "strength": z.get("strength"),
+            "status": z.get("status", "active"),
+            "metadata": z.get("metadata", {}),
+        })
+
+    if not records:
+        print("No unique SMC zones to save.")
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/eth_smc_zones"
+
+    response = requests.post(
+        url,
+        headers={
+            **HEADERS,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        },
+        params={
+            "on_conflict": "symbol,resolution,zone_type,start_time,price_low,price_high"
+        },
+        json=records,
+        timeout=15,
+    )
+
+    if response.status_code not in [200, 201]:
+        print("Failed to save SMC zones:", response.status_code, response.text)
+        return False
+
+    print(f"Saved/updated {len(records)} SMC zones.")
+    return True
+
+def save_volume_profile(profile, symbol="ETHUSD", resolution="5m"):
+    if not profile:
+        print("No volume profile to save.")
+        return False
+
+    records = []
+
+    for p in profile:
+        records.append({
+            "symbol": symbol,
+            "resolution": resolution,
+            "price_level": p.get("price_level"),
+            "volume": p.get("volume"),
+            "profile_type": p.get("profile_type", "ohlcv_approx"),
+            "metadata": p.get("metadata", {}),
+        })
+
+    url = f"{SUPABASE_URL}/rest/v1/eth_volume_profile"
+
+    response = requests.post(
+        url,
+        headers={
+            **HEADERS,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        },
+        params={"on_conflict": "symbol,resolution,price_level"},
+        json=records,
+        timeout=15,
+    )
+
+    if response.status_code not in [200, 201]:
+        print("Failed to save volume profile:", response.status_code, response.text)
+        return False
+
+    print(f"Saved/updated {len(records)} volume profile rows.")
+    return True
