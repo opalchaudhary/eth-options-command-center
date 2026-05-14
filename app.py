@@ -310,7 +310,7 @@ try:
     text_insights = orderbook_data["text_insights"]
 
     try:
-    saved = save_orderbook_insights(orderbook_insights)
+        saved = save_orderbook_insights(orderbook_insights)
 
     if saved:
         st.sidebar.success("Order book database updated")
