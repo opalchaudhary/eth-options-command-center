@@ -317,8 +317,8 @@ try:
         else:
             st.sidebar.warning("Order book database NOT saved")
 
-except Exception as e:
-    st.sidebar.warning(f"Order book snapshot not saved: {e}")
+    except Exception as e:
+        st.sidebar.warning(f"Order book snapshot not saved: {e}")
     if orderbook_insights.get("status") == "ok":
 
         ob1, ob2, ob3, ob4 = st.columns(4)
