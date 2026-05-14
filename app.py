@@ -1,6 +1,8 @@
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
 from strike_engine import get_strike_recommendations
+from orderbook_engine import get_eth_orderbook_insights
 
 from delta_api import get_eth_options, get_eth_spot_price
 
@@ -13,7 +15,8 @@ from analytics import (
 from storage import (
     save_analytics_snapshot,
     save_premium_decay_snapshot,
-    save_option_chain_snapshot
+    save_option_chain_snapshot,
+    save_orderbook_insights
 )
 
 
@@ -28,6 +31,11 @@ st.caption("Clean ETH options dashboard powered by Delta Exchange + Supabase")
 
 st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 
+
+# --------------------------------------------------
+# FETCH OPTIONS + SPOT DATA
+# --------------------------------------------------
+
 df = get_eth_options()
 eth_price_data = get_eth_spot_price()
 
@@ -38,6 +46,11 @@ if df.empty:
 eth_spot_price = eth_price_data.get("spot_price")
 eth_mark_price = eth_price_data.get("mark_price")
 
+
+# --------------------------------------------------
+# SIDEBAR
+# --------------------------------------------------
+
 expiry_list = sorted(df["expiry"].dropna().unique())
 
 selected_expiry = st.sidebar.selectbox(
@@ -46,6 +59,11 @@ selected_expiry = st.sidebar.selectbox(
 )
 
 st.sidebar.caption("Auto-refresh: every 60 seconds")
+
+
+# --------------------------------------------------
+# EXPIRY ANALYTICS
+# --------------------------------------------------
 
 expiry_df = df[df["expiry"] == selected_expiry].copy()
 
@@ -65,6 +83,11 @@ if eth_spot_price and expected_move:
     expected_move_pct = (expected_move / eth_spot_price) * 100
     expected_move_upper = eth_spot_price + expected_move
     expected_move_lower = eth_spot_price - expected_move
+
+
+# --------------------------------------------------
+# SAVE OPTIONS SNAPSHOTS
+# --------------------------------------------------
 
 snapshot_analytics = {
     "spot_price": eth_spot_price,
@@ -93,11 +116,15 @@ try:
         selected_expiry
     )
 
-    st.sidebar.success("Database updated")
+    st.sidebar.success("Options database updated")
 
 except Exception as e:
-    st.sidebar.warning(f"Supabase snapshot not saved: {e}")
+    st.sidebar.warning(f"Supabase options snapshot not saved: {e}")
 
+
+# --------------------------------------------------
+# MARKET OVERVIEW
+# --------------------------------------------------
 
 st.subheader(f"Market Overview — {selected_expiry}")
 
@@ -124,6 +151,11 @@ with price_col3:
 
 st.divider()
 
+
+# --------------------------------------------------
+# CORE OPTIONS STRUCTURE
+# --------------------------------------------------
+
 st.subheader("Core Options Structure")
 
 col1, col2, col3, col4 = st.columns(4)
@@ -133,15 +165,9 @@ col1.metric(
     round(analytics["pcr"], 2) if analytics["pcr"] else "NA"
 )
 
-col2.metric(
-    "Max Pain",
-    max_pain
-)
+col2.metric("Max Pain", max_pain)
 
-col3.metric(
-    "ATM Strike",
-    atm_strike
-)
+col3.metric("ATM Strike", atm_strike)
 
 col4.metric(
     "Expected Move %",
@@ -151,15 +177,8 @@ col4.metric(
 
 col5, col6, col7, col8 = st.columns(4)
 
-col5.metric(
-    "Highest Call OI",
-    analytics["highest_call_oi_strike"]
-)
-
-col6.metric(
-    "Highest Put OI",
-    analytics["highest_put_oi_strike"]
-)
+col5.metric("Highest Call OI", analytics["highest_call_oi_strike"])
+col6.metric("Highest Put OI", analytics["highest_put_oi_strike"])
 
 col7.metric(
     "ATM CE Price",
@@ -174,6 +193,11 @@ col8.metric(
 
 st.divider()
 
+
+# --------------------------------------------------
+# GREEKS SNAPSHOT
+# --------------------------------------------------
+
 st.subheader("Greeks Snapshot")
 
 g1, g2, g3, g4 = st.columns(4)
@@ -186,25 +210,19 @@ g4.metric("Net Vega", round(analytics["net_vega"], 4))
 
 st.divider()
 
+
+# --------------------------------------------------
+# EXPECTED RANGE
+# --------------------------------------------------
+
 st.subheader("Expected Range")
 
 if eth_spot_price and expected_move:
     r1, r2, r3 = st.columns(3)
 
-    r1.metric(
-        "Lower Range",
-        f"${expected_move_lower:,.2f}"
-    )
-
-    r2.metric(
-        "Current Spot",
-        f"${eth_spot_price:,.2f}"
-    )
-
-    r3.metric(
-        "Upper Range",
-        f"${expected_move_upper:,.2f}"
-    )
+    r1.metric("Lower Range", f"${expected_move_lower:,.2f}")
+    r2.metric("Current Spot", f"${eth_spot_price:,.2f}")
+    r3.metric("Upper Range", f"${expected_move_upper:,.2f}")
 
     st.caption(
         f"ATM is calculated using real ETH spot price: ${eth_spot_price:,.2f}. "
@@ -213,9 +231,13 @@ if eth_spot_price and expected_move:
 else:
     st.warning("Expected range unavailable for this expiry.")
 
-st.divider()
 
 st.divider()
+
+
+# --------------------------------------------------
+# LIVE STRIKE RECOMMENDATION ENGINE
+# --------------------------------------------------
 
 st.subheader("Live Strike Recommendation Engine")
 st.caption("Best risk-adjusted option selling + hedge opportunities across all expiries.")
@@ -268,8 +290,150 @@ if not strike_recommendations.empty:
 
 else:
     st.warning("No strike recommendations available right now.")
-    
-    st.info(
+
+
+st.divider()
+
+
+# --------------------------------------------------
+# ETH PERPETUAL ORDER BOOK INTELLIGENCE
+# --------------------------------------------------
+
+st.subheader("ETH Perpetual Order Book Intelligence")
+st.caption("Execution confirmation layer for strike selection, liquidity walls, spread quality, and trap risk.")
+
+try:
+    orderbook_data = get_eth_orderbook_insights(depth=20)
+
+    orderbook = orderbook_data["orderbook"]
+    orderbook_insights = orderbook_data["insights"]
+    text_insights = orderbook_data["text_insights"]
+
+    try:
+        save_orderbook_insights(orderbook_insights)
+        st.sidebar.success("Order book database updated")
+    except Exception as e:
+        st.sidebar.warning(f"Order book snapshot not saved: {e}")
+
+    if orderbook_insights.get("status") == "ok":
+
+        ob1, ob2, ob3, ob4 = st.columns(4)
+
+        ob1.metric(
+            "Order Book Mid Price",
+            f"${orderbook_insights['mid_price']:,.2f}"
+        )
+
+        ob2.metric(
+            "Order Book Bias",
+            orderbook_insights["bias"]
+        )
+
+        ob3.metric(
+            "Imbalance Ratio",
+            orderbook_insights["imbalance_ratio"]
+        )
+
+        ob4.metric(
+            "Spread Quality",
+            orderbook_insights["spread_quality"]
+        )
+
+        ob5, ob6, ob7, ob8 = st.columns(4)
+
+        ob5.metric(
+            "Best Bid",
+            f"${orderbook_insights['best_bid']:,.2f}"
+        )
+
+        ob6.metric(
+            "Best Ask",
+            f"${orderbook_insights['best_ask']:,.2f}"
+        )
+
+        ob7.metric(
+            "Spread %",
+            f"{orderbook_insights['spread_pct']}%"
+        )
+
+        ob8.metric(
+            "Trap Risk",
+            orderbook_insights["trap_risk"]
+        )
+
+        st.markdown("#### Liquidity Walls")
+
+        wall1, wall2 = st.columns(2)
+
+        with wall1:
+            with st.container(border=True):
+                st.markdown("### Bid Wall / Support Zone")
+                st.metric(
+                    "Nearest Bid Wall Price",
+                    f"${orderbook_insights['nearest_bid_wall_price']:,.2f}"
+                )
+                st.metric(
+                    "Bid Wall Size",
+                    orderbook_insights["nearest_bid_wall_size"]
+                )
+
+        with wall2:
+            with st.container(border=True):
+                st.markdown("### Ask Wall / Resistance Zone")
+                st.metric(
+                    "Nearest Ask Wall Price",
+                    f"${orderbook_insights['nearest_ask_wall_price']:,.2f}"
+                )
+                st.metric(
+                    "Ask Wall Size",
+                    orderbook_insights["nearest_ask_wall_size"]
+                )
+
+        st.markdown("#### Execution Signal")
+
+        st.info(orderbook_insights["execution_signal"])
+
+        st.markdown("#### Text-Based Order Book Insights")
+
+        for insight in text_insights:
+            st.write(f"• {insight}")
+
+        with st.expander("View Raw ETH Perpetual Order Book"):
+            bid_col, ask_col = st.columns(2)
+
+            with bid_col:
+                st.markdown("#### Top Bids")
+                if not orderbook["bids"].empty:
+                    st.dataframe(
+                        orderbook["bids"][["price", "size"]].head(10),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.warning("No bid data available.")
+
+            with ask_col:
+                st.markdown("#### Top Asks")
+                if not orderbook["asks"].empty:
+                    st.dataframe(
+                        orderbook["asks"][["price", "size"]].head(10),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.warning("No ask data available.")
+
+    else:
+        st.warning(orderbook_insights.get("message", "Order book data unavailable."))
+
+except Exception as e:
+    st.warning(f"Order book intelligence unavailable: {e}")
+
+
+st.divider()
+
+st.info(
     "Use the sidebar navigation for Charts, Option Chain, and Insights. "
     "This home page is intentionally kept clean for quick market reading."
 )
+```
