@@ -315,7 +315,7 @@ try:
         if saved:
             st.sidebar.success("Order book database updated")
         else:
-        st.sidebar.warning("Order book database NOT saved")
+            st.sidebar.warning("Order book database NOT saved")
 
 except Exception as e:
     st.sidebar.warning(f"Order book snapshot not saved: {e}")
