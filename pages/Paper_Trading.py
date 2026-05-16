@@ -40,6 +40,18 @@ def _fmt_num(value, digits=4):
     return f"{float(value or 0):,.{digits}f}"
 
 
+def _fmt_ist(value):
+    if value in [None, ""]:
+        return "NA"
+
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+
+    if pd.isna(timestamp):
+        return str(value)
+
+    return timestamp.tz_convert("Asia/Kolkata").strftime("%d %b %Y, %I:%M:%S %p IST")
+
+
 def _json_value(row, key, default=None):
     data = row.get("trade_json")
     return data.get(key, default) if isinstance(data, dict) else default
@@ -92,7 +104,7 @@ def _greek_rows(trades):
         rows.append(
             {
                 "Strategy": trade.get("strategy"),
-                "Expiry": trade.get("expiry_label"),
+                "Expiry": _fmt_ist(trade.get("expiry_label")),
                 "Lots": trade.get("lots"),
                 "Delta": greeks.get("delta"),
                 "Gamma": greeks.get("gamma"),
@@ -217,7 +229,7 @@ st.subheader("Auto Trading Status")
 
 status_cols = st.columns(4)
 status_cols[0].metric("Status", "Enabled" if auto_enabled else "Disabled")
-status_cols[1].metric("Last Evaluation", "Available" if dashboard.get("last_evaluation_time") else "Idle")
+status_cols[1].metric("Last Evaluation", _fmt_ist(dashboard.get("last_evaluation_time")) if dashboard.get("last_evaluation_time") else "Idle")
 status_cols[2].metric(
     "Selected Strategy",
     selected.get("strategy") if selected else "No Trade",
@@ -267,7 +279,7 @@ else:
             {
                 "Trade ID": str(trade.get("id"))[:8],
                 "Strategy": trade.get("strategy"),
-                "Expiry": trade.get("expiry_label"),
+                "Expiry": _fmt_ist(trade.get("expiry_label")),
                 "Lots": trade.get("lots"),
                 "Entry Value": _fmt_usdt(trade.get("entry_premium_usdt")),
                 "Unrealized P&L": _fmt_usdt(trade.get("unrealized_pnl_usdt")),
@@ -282,7 +294,7 @@ else:
     st.markdown("#### Strategy Legs")
     for _, trade in open_trades.iterrows():
         label = (
-            f"{trade.get('strategy')} | {trade.get('expiry_label')} | "
+            f"{trade.get('strategy')} | {_fmt_ist(trade.get('expiry_label'))} | "
             f"{trade.get('lots')} lots | P&L {_fmt_usdt(trade.get('unrealized_pnl_usdt'))} USDT"
         )
         with st.expander(label, expanded=False):
@@ -295,7 +307,7 @@ else:
 
     st.markdown("#### Manual Close")
     trade_options = {
-        f"{row.get('strategy')} | {row.get('expiry_label')} | {row.get('id')}": row.get("id")
+        f"{row.get('strategy')} | {_fmt_ist(row.get('expiry_label'))} | {row.get('id')}": row.get("id")
         for _, row in open_trades.iterrows()
     }
 
@@ -328,10 +340,10 @@ with tab_closed:
             )
             rows.append(
                 {
-                    "Entry Time": trade.get("created_at"),
-                    "Exit Time": trade.get("closed_at"),
+                    "Entry Time": _fmt_ist(trade.get("created_at")),
+                    "Exit Time": _fmt_ist(trade.get("closed_at")),
                     "Strategy": trade.get("strategy"),
-                    "Expiry": trade.get("expiry_label"),
+                    "Expiry": _fmt_ist(trade.get("expiry_label")),
                     "P&L": _fmt_usdt(trade.get("realized_pnl_usdt")),
                     "P&L %": round(
                         (float(trade.get("realized_pnl_usdt") or 0) / max(float(trade.get("max_risk_usdt") or 1), 1)) * 100,
@@ -353,11 +365,12 @@ with tab_rejected:
 
         rejected_rows.append(
             {
-                "Expiry": candidate.get("expiry_label"),
+                "Expiry": _fmt_ist(candidate.get("expiry_label")),
                 "Strategy": candidate.get("strategy"),
                 "Score": candidate.get("selection_score"),
                 "Reward/Risk": candidate.get("reward_risk"),
                 "Margin": _fmt_usdt(candidate.get("margin_used_usdt")),
+                "Post-Trade Greeks": candidate.get("post_trade_greek_health"),
                 "Reason": ", ".join(candidate.get("rejection_reasons") or []),
             }
         )

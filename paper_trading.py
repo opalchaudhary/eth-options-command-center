@@ -112,6 +112,19 @@ def _greeks_from_legs(legs, lots=1):
     return {key: round(value, 6) for key, value in totals.items()}, signed_legs
 
 
+def _combine_greeks(*greek_sets):
+    totals = {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+
+    for greeks in greek_sets:
+        if not isinstance(greeks, dict):
+            continue
+
+        for greek in totals:
+            totals[greek] += _safe_float(greeks.get(greek))
+
+    return {key: round(value, 6) for key, value in totals.items()}
+
+
 def classify_greek_health(greeks, equity_usdt=None):
     equity_usdt = equity_usdt or PAPER_WALLET_CAPITAL_USDT
     delta_limit = max(0.12, equity_usdt / 3500)
@@ -487,6 +500,18 @@ def _candidate_score(insights, risk, wallet, open_trades):
     expiry_bucket = (insights.get("expiry_profile") or {}).get("bucket")
     side = _strategy_side(strategy, insights.get("directional_bias"))
     existing_same_side = 0
+    candidate_greeks, _ = _greeks_from_legs(legs, risk["lots"])
+    current_book_greeks = wallet.get("book_greeks") or {}
+    post_trade_greeks = _combine_greeks(current_book_greeks, candidate_greeks)
+    current_greek_health = classify_greek_health(current_book_greeks, wallet.get("current_equity_usdt"))
+    post_trade_greek_health = classify_greek_health(post_trade_greeks, wallet.get("current_equity_usdt"))
+    greek_check = {
+        "candidate_greeks": candidate_greeks,
+        "current_book_greeks": current_book_greeks,
+        "post_trade_book_greeks": post_trade_greeks,
+        "current_greek_health": current_greek_health,
+        "post_trade_greek_health": post_trade_greek_health,
+    }
 
     if open_trades is not None and not open_trades.empty and "side" in open_trades:
         existing_same_side = int((open_trades["side"] == side).sum())
@@ -528,8 +553,12 @@ def _candidate_score(insights, risk, wallet, open_trades):
         reasons.append("Liquidity issue")
     if existing_same_side and confidence < 75:
         reasons.append("Overlapping same-direction risk")
+    if current_greek_health != "Healthy":
+        reasons.append(f"Current book Greeks are {current_greek_health}")
+    if post_trade_greek_health != "Healthy":
+        reasons.append(f"Post-trade Greeks would be {post_trade_greek_health}")
 
-    return round(score, 2), reasons
+    return round(score, 2), reasons, greek_check
 
 
 def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_positions=True, auto_exit=False):
@@ -554,8 +583,10 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
             if not risk:
                 rejected.append("No executable risk model")
                 score = 0
+                greek_check = {}
             else:
-                score, rejected = _candidate_score(insights, risk, wallet, open_trades)
+                score, rejected, greek_check = _candidate_score(insights, risk, wallet, open_trades)
+                risk["greek_check"] = greek_check
 
             candidates.append(
                 {
@@ -567,6 +598,8 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
                     "effective_return_pct": (insights.get("strategy_risk_reward") or {}).get("effective_return_pct"),
                     "margin_used_usdt": risk.get("margin_used_usdt") if risk else None,
                     "max_risk_usdt": risk.get("max_risk_usdt") if risk else None,
+                    "post_trade_greek_health": greek_check.get("post_trade_greek_health"),
+                    "post_trade_book_greeks": greek_check.get("post_trade_book_greeks"),
                     "status": "Rejected" if rejected or score < MIN_SELECTION_SCORE else "Candidate",
                     "rejection_reasons": rejected or ([] if score >= MIN_SELECTION_SCORE else ["Low selection score"]),
                     "entry_reason": _entry_reason(insights, score),

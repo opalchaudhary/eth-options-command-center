@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 
 from data_refresh import refresh_market_structure_sources, refresh_options_sources
@@ -35,6 +36,15 @@ def _fmt_money(value):
         return "NA"
 
     return f"${float(value):,.2f}"
+
+
+def _fmt_ist(value):
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+
+    if pd.isna(timestamp):
+        return str(value)
+
+    return timestamp.tz_convert("Asia/Kolkata").strftime("%d %b %Y, %I:%M %p IST")
 
 
 def _show_strategy_legs(legs):
@@ -103,14 +113,14 @@ if not expiry_list:
     st.warning("No analytics snapshots found in Supabase yet, and automatic options refresh failed.")
     st.stop()
 
-selected_expiry = st.sidebar.selectbox("Select Expiry", expiry_list, index=0)
+selected_expiry = st.sidebar.selectbox("Select Expiry", expiry_list, index=0, format_func=_fmt_ist)
 
 if st.sidebar.button("Refresh Selected Expiry"):
     refresh_result = _refresh_options(selected_expiry)
 
     if refresh_result.get("ok"):
         st.sidebar.success(
-            f"{selected_expiry} refreshed with {refresh_result.get('row_count')} option rows"
+            f"{_fmt_ist(selected_expiry)} refreshed with {refresh_result.get('row_count')} option rows"
         )
         st.rerun()
     else:
@@ -151,7 +161,7 @@ if missing_option_chain and not st.session_state.get(auto_refresh_key):
 
     st.warning("Option-chain refresh failed; recommendation quality may be limited.")
 
-st.subheader(f"Market Read - {selected_expiry}")
+st.subheader(f"Market Read - {_fmt_ist(selected_expiry)}")
 
 summary_cols = st.columns(5)
 summary_cols[0].metric("Regime", insights["market_regime"])

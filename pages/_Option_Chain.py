@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 
 from delta_api import get_eth_options, get_eth_spot_price
@@ -22,14 +23,25 @@ eth_spot_price = eth_price_data.get("spot_price")
 
 expiry_list = sorted(df["expiry"].dropna().unique())
 
+
+def _fmt_ist(value):
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+
+    if pd.isna(timestamp):
+        return str(value)
+
+    return timestamp.tz_convert("Asia/Kolkata").strftime("%d %b %Y, %I:%M %p IST")
+
+
 selected_expiry = st.sidebar.selectbox(
     "Select Expiry",
-    expiry_list
+    expiry_list,
+    format_func=_fmt_ist,
 )
 
 expiry_df = df[df["expiry"] == selected_expiry].copy()
 
-st.subheader(f"Option Chain — {selected_expiry}")
+st.subheader(f"Option Chain - {_fmt_ist(selected_expiry)}")
 
 c1, c2, c3 = st.columns(3)
 
@@ -62,8 +74,13 @@ filtered_df = expiry_df[
     (expiry_df["type"].isin(option_type_filter))
 ].copy()
 
+display_df = filtered_df.copy()
+
+if "expiry" in display_df.columns:
+    display_df["expiry"] = display_df["expiry"].apply(_fmt_ist)
+
 st.dataframe(
-    filtered_df,
+    display_df,
     use_container_width=True,
     height=650
 )

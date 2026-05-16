@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 
 from delta_api import get_eth_options, get_eth_spot_price
@@ -28,9 +29,20 @@ eth_spot_price = eth_price_data.get("spot_price")
 
 expiry_list = sorted(df["expiry"].dropna().unique())
 
+
+def _fmt_ist(value):
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+
+    if pd.isna(timestamp):
+        return str(value)
+
+    return timestamp.tz_convert("Asia/Kolkata").strftime("%d %b %Y, %I:%M %p IST")
+
+
 selected_expiry = st.sidebar.selectbox(
     "Select Expiry",
-    expiry_list
+    expiry_list,
+    format_func=_fmt_ist,
 )
 
 expiry_df = df[df["expiry"] == selected_expiry].copy()
@@ -43,7 +55,7 @@ atm_strike, expected_move, atm_ce_price, atm_pe_price = calculate_atm_and_expect
     eth_spot_price
 )
 
-st.subheader(f"Charts for Expiry: {selected_expiry}")
+st.subheader(f"Charts for Expiry: {_fmt_ist(selected_expiry)}")
 
 c1, c2, c3, c4 = st.columns(4)
 
