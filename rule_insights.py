@@ -1919,6 +1919,21 @@ def _build_strategy_package(
     return strategy, legs, _strategy_text(legs), pricing, risk_reward
 
 
+def price_strategy_legs(expiry_label, strategy_legs):
+    option_latest_df, _ = _latest_snapshot_pair_for_expiry(
+        "option_chain_snapshots",
+        expiry_label,
+        limit=2400,
+    )
+    option_df = _prepare_option_chain(option_latest_df)
+
+    if option_df.empty:
+        live_context = _live_option_context(expiry_label)
+        option_df = live_context.get("option_df", pd.DataFrame())
+
+    return _strategy_pricing(option_df, strategy_legs)
+
+
 def _unique_strategy_names(strategies):
     names = []
 

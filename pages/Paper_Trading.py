@@ -104,6 +104,64 @@ def _greek_rows(trades):
     return rows
 
 
+def _leg_key(leg):
+    return (
+        str(leg.get("action") or ""),
+        str(leg.get("option") or ""),
+        float(leg.get("strike") or 0),
+    )
+
+
+def _leg_mark(leg):
+    for key in ["mark_price", "mark", "mid_price", "last_price"]:
+        value = leg.get(key)
+        if value not in [None, ""]:
+            return float(value or 0)
+
+    return 0.0
+
+
+def _position_leg_rows(trade):
+    trade_json = trade.get("trade_json") if isinstance(trade.get("trade_json"), dict) else {}
+    recommendation = trade_json.get("recommendation") or {}
+    rec_json = recommendation.get("recommendation_json") or {}
+    entry_legs = rec_json.get("legs") or trade_json.get("entry_legs") or []
+    current_legs = trade_json.get("current_legs") or entry_legs
+    current_by_key = {_leg_key(leg): leg for leg in current_legs}
+    lots = int(trade.get("lots") or 0)
+    eth_qty = lots * ETH_LOT_SIZE
+    rows = []
+
+    for entry_leg in entry_legs:
+        current_leg = current_by_key.get(_leg_key(entry_leg), entry_leg)
+        action = str(entry_leg.get("action") or "")
+        sign = 1 if action.lower().startswith("sell") else -1
+        current_mark = _leg_mark(current_leg)
+        entry_mark = _leg_mark(entry_leg)
+        signed_greeks = current_leg.get("signed_greeks") or {}
+
+        rows.append(
+            {
+                "Action": action,
+                "Strike": entry_leg.get("strike"),
+                "Type": entry_leg.get("option"),
+                "Entry Mark": _fmt_usdt(entry_mark),
+                "Current Mark": _fmt_usdt(current_mark),
+                "Lots": lots,
+                "ETH Qty": _fmt_num(eth_qty, 4),
+                "Leg Value": _fmt_usdt(sign * current_mark * eth_qty),
+                "OI": current_leg.get("oi"),
+                "Volume": current_leg.get("volume"),
+                "Delta": signed_greeks.get("delta"),
+                "Gamma": signed_greeks.get("gamma"),
+                "Theta": signed_greeks.get("theta"),
+                "Vega": signed_greeks.get("vega"),
+            }
+        )
+
+    return rows
+
+
 auto_enabled = st.sidebar.toggle("Auto Trading Enabled", value=False)
 limit_expiries = st.sidebar.slider("Expiries To Evaluate", 3, 12, 6)
 
@@ -220,6 +278,20 @@ else:
         )
 
     st.dataframe(open_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Strategy Legs")
+    for _, trade in open_trades.iterrows():
+        label = (
+            f"{trade.get('strategy')} | {trade.get('expiry_label')} | "
+            f"{trade.get('lots')} lots | P&L {_fmt_usdt(trade.get('unrealized_pnl_usdt'))} USDT"
+        )
+        with st.expander(label, expanded=False):
+            leg_rows = _position_leg_rows(trade)
+
+            if leg_rows:
+                st.dataframe(leg_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Leg details are not recorded for this position.")
 
     st.markdown("#### Manual Close")
     trade_options = {

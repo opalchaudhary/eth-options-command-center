@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from recommendation_journal import _request, read_table, save_recommendation_snapshot
-from rule_insights import build_rule_based_insights, get_available_expiries
+from rule_insights import build_rule_based_insights, get_available_expiries, price_strategy_legs
 from validation_config import (
     ETH_LOT_SIZE,
     INR_PER_USDT,
@@ -179,6 +179,8 @@ def estimate_trade_risk(recommendation):
     return {
         "lots": lots,
         "eth_quantity": round(lots * ETH_LOT_SIZE, 4),
+        "lots_by_risk": lots_by_risk,
+        "lots_by_margin": lots_by_margin,
         "risk_per_lot_usdt": round(risk_per_lot, 4),
         "max_risk_usdt": round(risk_per_lot * lots, 4),
         "max_risk_inr": usdt_to_inr(risk_per_lot * lots),
@@ -292,7 +294,8 @@ def _strategy_current_value(legs, lots):
 def estimate_trade_mtm(trade, insights):
     trade_json = _trade_json(trade)
     entry_legs = trade_json.get("recommendation", {}).get("recommendation_json", {}).get("legs") or []
-    current_legs = (insights.get("strategy_pricing") or {}).get("legs") or entry_legs
+    current_pricing = price_strategy_legs(trade.get("expiry_label"), entry_legs) if entry_legs else {}
+    current_legs = current_pricing.get("legs") or entry_legs
     lots = int(trade.get("lots") or 0)
     entry_value = _safe_float(trade.get("entry_premium_usdt"))
     current_value = _strategy_current_value(current_legs, lots)
