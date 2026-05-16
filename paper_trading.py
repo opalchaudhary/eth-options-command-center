@@ -386,7 +386,7 @@ def _exit_signal(trade, insights, mtm, wallet):
     return None
 
 
-def update_open_paper_trades(current_spot=None):
+def update_open_paper_trades(current_spot=None, auto_exit=False):
     open_trades = get_open_paper_trades(limit=200)
     updated = []
 
@@ -418,7 +418,7 @@ def update_open_paper_trades(current_spot=None):
                 "trade_json": _json_safe(trade_json),
             }
 
-            if exit_signal:
+            if exit_signal and (auto_exit or exit_signal["code"] == "EXPIRY"):
                 exit_wallet = wallet_state(open_trades=open_trades)
                 trade_json["exit_signal"] = exit_signal
                 trade_json["exit_reason_detail"] = exit_signal.get("detail")
@@ -532,9 +532,11 @@ def _candidate_score(insights, risk, wallet, open_trades):
     return round(score, 2), reasons
 
 
-def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_positions=True):
+def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_positions=True, auto_exit=False):
+    position_updates = []
+
     if update_positions:
-        update_open_paper_trades()
+        position_updates = update_open_paper_trades(auto_exit=auto_exit)
 
     open_trades = get_open_paper_trades(limit=200)
     closed_trades = get_closed_paper_trades(limit=500)
@@ -602,6 +604,7 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
         "closed_trades": closed_trades,
         "candidates": candidates,
         "selected": selected,
+        "position_updates": position_updates,
         "last_evaluation_time": _now_iso(),
     }
 
@@ -753,18 +756,34 @@ def create_paper_trade(recommendation, risk=None, selection=None, wallet_before=
 
 
 def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
+    open_before = get_open_paper_trades(limit=200)
+    had_open_before = not open_before.empty
     evaluation = evaluate_paper_trade_candidates(
         limit_expiries=limit_expiries,
         persist=persist,
         update_positions=True,
+        auto_exit=enabled,
     )
 
     if not enabled:
-        evaluation["action"] = "Auto trading disabled"
+        evaluation["action"] = (
+            "Manual refresh: positions marked to market and candidates evaluated. "
+            "Auto trading is disabled, so no new trades were opened."
+        )
         return evaluation
 
     if evaluation["wallet"].get("margin_health_pct", 100) < MIN_FREE_MARGIN_PCT * 100:
         evaluation["action"] = "No trade: margin health below required buffer"
+        return evaluation
+
+    open_trades = evaluation.get("open_trades")
+
+    if had_open_before:
+        if open_trades is None or open_trades.empty:
+            evaluation["action"] = "Position updated/closed; no replacement trade opened in the same refresh cycle"
+        else:
+            evaluation["action"] = "Monitoring existing open position(s); no new trade opened while the book has active risk"
+        evaluation["selected"] = None
         return evaluation
 
     selected = evaluation.get("selected")
@@ -772,8 +791,6 @@ def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
     if not selected:
         evaluation["action"] = "No trade: no candidate passed safety rules"
         return evaluation
-
-    open_trades = evaluation.get("open_trades")
 
     if open_trades is not None and not open_trades.empty:
         same_expiry = open_trades[open_trades["expiry_label"] == selected["expiry_label"]]
