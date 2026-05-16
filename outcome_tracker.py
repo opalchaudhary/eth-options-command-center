@@ -20,11 +20,11 @@ def _safe_float(value, default=None):
 
 
 def _strategy_direction(strategy, directional_bias):
-    if strategy in ["Bull Put Credit Spread"]:
+    if strategy in ["Bull Put Credit Spread", "Bull Call Debit Spread"]:
         return "BULLISH"
-    if strategy in ["Bear Call Credit Spread", "Put Broken Wing Butterfly"]:
+    if strategy in ["Bear Call Credit Spread", "Bear Put Debit Spread", "Put Broken Wing Butterfly"]:
         return "BEARISH"
-    if strategy == "Debit Spread":
+    if strategy in ["Debit Spread", "Directional Debit Spread"]:
         if directional_bias in ["Bullish", "Mild Bullish"]:
             return "BULLISH"
         if directional_bias in ["Bearish", "Mild Bearish"]:

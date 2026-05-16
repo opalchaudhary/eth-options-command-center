@@ -2,6 +2,11 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
+from analytics import (
+    basic_expiry_analytics,
+    calculate_atm_and_expected_move,
+    calculate_max_pain,
+)
 from database_reader import (
     HEADERS,
     SUPABASE_URL,
@@ -10,6 +15,7 @@ from database_reader import (
     get_smc_zones,
     get_volume_profile,
 )
+from delta_api import get_eth_options, get_eth_spot_price
 
 
 DEFAULT_SYMBOL = "ETHUSD"
@@ -177,6 +183,9 @@ def _prepare_option_chain(df):
 
     df = df.copy()
 
+    if "option_type" not in df.columns and "type" in df.columns:
+        df["option_type"] = df["type"]
+
     numeric_cols = [
         "strike",
         "mark_price",
@@ -194,6 +203,109 @@ def _prepare_option_chain(df):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
+
+
+def _expiry_key(expiry_label):
+    parsed = pd.to_datetime(expiry_label, utc=True, errors="coerce")
+
+    if pd.isna(parsed):
+        return str(expiry_label)
+
+    return parsed.isoformat()
+
+
+def _match_expiry_label(expiries, requested_expiry):
+    requested_key = _expiry_key(requested_expiry)
+
+    for expiry in expiries:
+        if str(expiry) == str(requested_expiry):
+            return expiry
+
+    for expiry in expiries:
+        if _expiry_key(expiry) == requested_key:
+            return expiry
+
+    return None
+
+
+def _live_option_context(expiry_label):
+    context = {
+        "option_df": pd.DataFrame(),
+        "analytics": {},
+        "premium": {},
+        "spot_price": None,
+        "matched_expiry": None,
+        "error": None,
+    }
+
+    try:
+        options_df = get_eth_options()
+        spot_data = get_eth_spot_price()
+    except Exception as e:
+        context["error"] = str(e)
+        return context
+
+    if options_df.empty or "expiry" not in options_df.columns:
+        context["error"] = "Delta returned no option rows."
+        return context
+
+    matched_expiry = _match_expiry_label(options_df["expiry"].dropna().unique(), expiry_label)
+
+    if not matched_expiry:
+        context["error"] = "Selected expiry was not found in the live Delta option list."
+        return context
+
+    expiry_df = options_df[options_df["expiry"] == matched_expiry].copy()
+
+    if expiry_df.empty:
+        context["error"] = "Selected expiry matched Delta but had no option rows."
+        return context
+
+    spot_price = spot_data.get("spot_price")
+    analytics = basic_expiry_analytics(expiry_df)
+    max_pain, _ = calculate_max_pain(expiry_df)
+    atm_strike, expected_move, atm_ce_price, atm_pe_price = calculate_atm_and_expected_move(
+        expiry_df,
+        spot_price,
+    )
+
+    expected_move_pct = None
+    expected_move_upper = None
+    expected_move_lower = None
+
+    if spot_price and expected_move:
+        expected_move_pct = (expected_move / spot_price) * 100
+        expected_move_upper = spot_price + expected_move
+        expected_move_lower = spot_price - expected_move
+
+    chain_df = expiry_df.copy()
+    chain_df["option_type"] = chain_df.get("type")
+
+    context.update(
+        {
+            "option_df": _prepare_option_chain(chain_df),
+            "analytics": {
+                "spot_price": spot_price,
+                "max_pain": max_pain,
+                "atm_strike": atm_strike,
+                "pcr": analytics.get("pcr"),
+                "atm_straddle_price": expected_move,
+                "expected_move_pct": expected_move_pct,
+                "expected_move_upper": expected_move_upper,
+                "expected_move_lower": expected_move_lower,
+            },
+            "premium": {
+                "atm_strike": atm_strike,
+                "atm_ce_price": atm_ce_price,
+                "atm_pe_price": atm_pe_price,
+                "atm_straddle_price": expected_move,
+            },
+            "spot_price": spot_price,
+            "matched_expiry": matched_expiry,
+        }
+    )
+
+    return context
 
 
 def _chain_metrics(option_df):
@@ -1101,11 +1213,11 @@ def _apply_expiry_adjustments(
 
     if bucket in ["D1", "D3"] and gamma_risk:
         if adjusted_strategy in short_vol_strategies:
-            adjusted_strategy = "Debit Spread"
+            adjusted_strategy = "Directional Debit Spread"
             notes.append("near-expiry gamma risk favors directional debit spread over short premium")
         adjusted_confidence -= 8
 
-    if bucket in ["WEEKLY", "MONTHLY"] and adjusted_strategy in ["Iron Condor", "Debit Spread"]:
+    if bucket in ["WEEKLY", "MONTHLY"] and adjusted_strategy in ["Iron Condor", "Directional Debit Spread"]:
         notes.append(f"{bucket.lower()} expiry allows wider wings and more patient management")
 
     if conflict_score >= 65:
@@ -1366,7 +1478,7 @@ def _strategy_legs(
             {"action": "Optional Buy Hedge", "strike": lower_wing, "option": "P"},
         ]
 
-    if strategy == "Debit Spread":
+    if strategy in ["Debit Spread", "Directional Debit Spread", "Bull Call Debit Spread", "Bear Put Debit Spread"]:
         if directional_bias in ["Bullish", "Mild Bullish"]:
             buy_call = atm
             sell_call = best_call_sell_strike or _nearest_strike(strikes, atm + move)
@@ -1395,18 +1507,6 @@ def _strategy_legs(
         ]
 
     if strategy == "Wait / Defined-Risk Spread Only":
-        if directional_bias in ["Mild Bearish", "Bearish"]:
-            return [
-                {"action": "Sell", "strike": best_call_sell_strike, "option": "C"},
-                {"action": "Buy", "strike": call_buy_strike, "option": "C"},
-            ]
-
-        if directional_bias in ["Mild Bullish", "Bullish"]:
-            return [
-                {"action": "Sell", "strike": best_put_sell_strike, "option": "P"},
-                {"action": "Buy", "strike": put_buy_strike, "option": "P"},
-            ]
-
         return []
 
     return []
@@ -1428,6 +1528,23 @@ def _has_executable_legs(legs):
         return False
 
     return all(_safe_float(leg.get("strike")) is not None for leg in legs)
+
+
+def _directional_debit_strategy(directional_bias):
+    if directional_bias in ["Bullish", "Mild Bullish"]:
+        return "Bull Call Debit Spread"
+
+    if directional_bias in ["Bearish", "Mild Bearish"]:
+        return "Bear Put Debit Spread"
+
+    return "Directional Debit Spread"
+
+
+def _normalize_strategy_name(strategy, directional_bias):
+    if strategy in ["Debit Spread", "Directional Debit Spread"]:
+        return _directional_debit_strategy(directional_bias)
+
+    return strategy
 
 
 def _best_strategy(
@@ -1477,7 +1594,7 @@ def _best_strategy(
             "Mild Bullish",
             "Mild Bearish",
         ]:
-            return "Debit Spread"
+            return "Directional Debit Spread"
         return "Wait / Defined-Risk Spread Only"
 
     long_vol_risk = (
@@ -1493,7 +1610,7 @@ def _best_strategy(
             "Mild Bullish",
             "Mild Bearish",
         ]:
-            return "Debit Spread"
+            return "Directional Debit Spread"
         return "Wait / Defined-Risk Spread Only"
 
     if (
@@ -1522,7 +1639,7 @@ def _best_strategy(
         and momentum in ["Bullish", "Bearish"]
         and directional_bias in ["Bullish", "Bearish", "Mild Bullish", "Mild Bearish"]
     ):
-        return "Debit Spread"
+        return "Directional Debit Spread"
 
     if vol_label == "Elevated" and directional_bias in ["Mild Bearish", "Bearish"]:
         return "Put Broken Wing Butterfly"
@@ -1598,11 +1715,11 @@ def _confidence_score(
     return int(_bounded_score(score))
 
 
-def _leg_price(option_df, strike, option_code):
+def _leg_snapshot(option_df, strike, option_code):
     strike = _safe_float(strike)
 
     if option_df.empty or strike is None or "option_type" not in option_df.columns:
-        return None
+        return {}
 
     option_type = "call_options" if option_code == "C" else "put_options"
     data = option_df[
@@ -1611,9 +1728,24 @@ def _leg_price(option_df, strike, option_code):
     ]
 
     if data.empty or "mark_price" not in data.columns:
-        return None
+        return {}
 
-    return _safe_float(data.iloc[0].get("mark_price"))
+    row = data.iloc[0]
+
+    return {
+        "mark_price": _safe_float(row.get("mark_price")),
+        "oi": _safe_float(row.get("oi")),
+        "volume": _safe_float(row.get("volume")),
+        "iv": _safe_float(row.get("iv")),
+        "delta": _safe_float(row.get("delta")),
+        "gamma": _safe_float(row.get("gamma")),
+        "theta": _safe_float(row.get("theta")),
+        "vega": _safe_float(row.get("vega")),
+    }
+
+
+def _leg_price(option_df, strike, option_code):
+    return _leg_snapshot(option_df, strike, option_code).get("mark_price")
 
 
 def _strategy_pricing(option_df, strategy_legs):
@@ -1622,9 +1754,10 @@ def _strategy_pricing(option_df, strategy_legs):
     net_debit = 0
 
     for leg in strategy_legs:
-        price = _leg_price(option_df, leg.get("strike"), leg.get("option"))
+        leg_snapshot = _leg_snapshot(option_df, leg.get("strike"), leg.get("option"))
+        price = leg_snapshot.get("mark_price")
         priced_leg = dict(leg)
-        priced_leg["mark_price"] = price
+        priced_leg.update(leg_snapshot)
         priced_legs.append(priced_leg)
 
         if price is None:
@@ -1646,6 +1779,362 @@ def _strategy_pricing(option_df, strategy_legs):
     }
 
 
+def _leg_widths(legs):
+    calls = sorted(
+        [
+            strike
+            for strike in [_safe_float(leg.get("strike")) for leg in legs if leg.get("option") == "C"]
+            if strike is not None
+        ],
+    )
+    puts = sorted(
+        [
+            strike
+            for strike in [_safe_float(leg.get("strike")) for leg in legs if leg.get("option") == "P"]
+            if strike is not None
+        ],
+    )
+    widths = []
+
+    if len(calls) >= 2:
+        widths.append(abs(calls[-1] - calls[0]))
+
+    if len(puts) >= 2:
+        widths.append(abs(puts[-1] - puts[0]))
+
+    return widths
+
+
+def _strategy_risk_reward(strategy, strategy_legs, strategy_pricing):
+    widths = _leg_widths(strategy_legs)
+    max_width = max(widths) if widths else None
+    net_credit = _safe_float(strategy_pricing.get("net_credit_usdt"), 0)
+    net_debit = _safe_float(strategy_pricing.get("net_debit_usdt"), 0)
+
+    metrics = {
+        "max_profit_usdt": None,
+        "max_loss_usdt": None,
+        "reward_risk": None,
+        "effective_return_pct": None,
+        "quality": "Unknown",
+        "notes": [],
+    }
+
+    if not strategy_legs or max_width is None:
+        metrics["quality"] = "No Trade"
+        return metrics
+
+    if strategy in ["Bull Put Credit Spread", "Bear Call Credit Spread", "Iron Condor", "Iron Fly"]:
+        max_profit = net_credit
+        max_loss = max(max_width - net_credit, 0)
+
+        if max_profit <= 0:
+            metrics["max_profit_usdt"] = round(max_profit, 4)
+            metrics["max_loss_usdt"] = round(max_loss, 4)
+            metrics["quality"] = "Poor"
+            metrics["notes"].append("credit spread has no effective credit")
+        elif max_loss <= 0:
+            metrics["max_profit_usdt"] = round(max_profit, 4)
+            metrics["max_loss_usdt"] = 0
+            metrics["quality"] = "Good"
+        else:
+            reward_risk = max_profit / max_loss
+            effective_return = (max_profit / max_loss) * 100
+            metrics.update(
+                {
+                    "max_profit_usdt": round(max_profit, 4),
+                    "max_loss_usdt": round(max_loss, 4),
+                    "reward_risk": round(reward_risk, 4),
+                    "effective_return_pct": round(effective_return, 2),
+                }
+            )
+
+            if reward_risk >= 0.30:
+                metrics["quality"] = "Good"
+            elif reward_risk >= 0.20:
+                metrics["quality"] = "Acceptable"
+            else:
+                metrics["quality"] = "Poor"
+                metrics["notes"].append("credit spread reward/risk is too weak")
+
+        return metrics
+
+    if strategy in ["Bull Call Debit Spread", "Bear Put Debit Spread", "Directional Debit Spread", "Debit Spread"]:
+        max_profit = max(max_width - net_debit, 0) if net_debit else 0
+        max_loss = net_debit
+
+        if max_loss <= 0 or max_profit <= 0:
+            metrics["max_profit_usdt"] = round(max_profit, 4)
+            metrics["max_loss_usdt"] = round(max_loss, 4)
+            metrics["quality"] = "Poor"
+            metrics["notes"].append("debit spread has no effective payout")
+        else:
+            reward_risk = max_profit / max_loss
+            effective_return = (max_profit / max_loss) * 100
+            quality = "Good" if reward_risk >= 1.25 else "Acceptable"
+            if reward_risk < 1:
+                quality = "Poor"
+                metrics["notes"].append("debit spread reward/risk is too weak")
+
+            metrics.update(
+                {
+                    "max_profit_usdt": round(max_profit, 4),
+                    "max_loss_usdt": round(max_loss, 4),
+                    "reward_risk": round(reward_risk, 4),
+                    "effective_return_pct": round(effective_return, 2),
+                    "quality": quality,
+                }
+            )
+
+        return metrics
+
+    metrics["quality"] = "Informational"
+    return metrics
+
+
+def _build_strategy_package(
+    strategy,
+    option_df,
+    spot_price,
+    expected_move,
+    atm_strike,
+    best_call_sell_strike,
+    best_put_sell_strike,
+    directional_bias,
+):
+    strategy = _normalize_strategy_name(strategy, directional_bias)
+    legs = _strategy_legs(
+        strategy,
+        option_df,
+        spot_price,
+        expected_move,
+        atm_strike,
+        best_call_sell_strike,
+        best_put_sell_strike,
+        directional_bias,
+    )
+    pricing = _strategy_pricing(option_df, legs)
+    risk_reward = _strategy_risk_reward(strategy, legs, pricing)
+
+    return strategy, legs, _strategy_text(legs), pricing, risk_reward
+
+
+def _unique_strategy_names(strategies):
+    names = []
+
+    for strategy in strategies:
+        if strategy and strategy not in names:
+            names.append(strategy)
+
+    return names
+
+
+def _candidate_strategy_names(primary_strategy, directional_bias, market_regime, volatility_regime, pinning_score):
+    candidates = [primary_strategy]
+
+    if directional_bias in ["Bullish", "Mild Bullish"]:
+        candidates.extend(["Bull Call Debit Spread", "Bull Put Credit Spread"])
+    elif directional_bias in ["Bearish", "Mild Bearish"]:
+        candidates.extend(["Bear Put Debit Spread", "Bear Call Credit Spread", "Put Broken Wing Butterfly"])
+    else:
+        candidates.extend(["Iron Condor", "Iron Fly"])
+
+    if market_regime in ["Pinning / Range", "Balanced / Two-Sided"] or pinning_score >= 55:
+        candidates.extend(["Iron Condor", "Iron Fly"])
+
+    if volatility_regime in ["Elevated", "Expansion / Long Vol Favored"]:
+        candidates.append(_directional_debit_strategy(directional_bias))
+
+    return _unique_strategy_names(candidates)
+
+
+def _strategy_market_fit_score(
+    strategy,
+    risk_reward,
+    directional_bias,
+    market_regime,
+    volatility_context,
+    pinning_score,
+    conflict_score,
+    trap_risk,
+    price_action,
+):
+    if strategy in ["No Trade", "Wait / Defined-Risk Spread Only"]:
+        return -1, ["not an executable recommendation"]
+
+    if risk_reward.get("quality") == "Poor":
+        return -1, risk_reward.get("notes", []) or ["poor reward/risk"]
+
+    if trap_risk == "High":
+        return -1, ["high trap risk blocks executable recommendations"]
+
+    if conflict_score >= 65:
+        return -1, ["high signal conflict blocks executable recommendations"]
+
+    score = 0
+    notes = []
+    reward_risk = _safe_float(risk_reward.get("reward_risk"), 0)
+    option_selling = volatility_context.get("option_selling_environment")
+    momentum = price_action.get("momentum") if price_action else "Neutral"
+
+    if risk_reward.get("quality") == "Good":
+        score += 40
+    elif risk_reward.get("quality") == "Acceptable":
+        score += 25
+    else:
+        return -1, ["missing defined risk/reward"]
+
+    score += min(30, reward_risk * 15)
+
+    if strategy in ["Bull Call Debit Spread", "Bull Put Credit Spread"]:
+        if directional_bias in ["Bullish", "Mild Bullish"]:
+            score += 25
+            notes.append("matches bullish bias")
+        else:
+            score -= 25
+
+    if strategy in ["Bear Put Debit Spread", "Bear Call Credit Spread", "Put Broken Wing Butterfly"]:
+        if directional_bias in ["Bearish", "Mild Bearish"]:
+            score += 25
+            notes.append("matches bearish bias")
+        else:
+            score -= 25
+
+    if strategy in ["Bull Call Debit Spread", "Bear Put Debit Spread"]:
+        if momentum in ["Bullish", "Bearish"]:
+            score += 10
+        if option_selling == "Unfavorable":
+            score += 8
+
+    if strategy in ["Bull Put Credit Spread", "Bear Call Credit Spread", "Iron Condor", "Iron Fly"]:
+        if option_selling in ["Favorable", "Neutral"]:
+            score += 10
+        elif option_selling == "Unfavorable":
+            score -= 20
+
+    if strategy in ["Iron Condor", "Iron Fly"]:
+        if market_regime == "Pinning / Range" or pinning_score >= 70:
+            score += 25
+        elif directional_bias != "Neutral":
+            score -= 15
+
+    if conflict_score >= 45:
+        score -= 15
+
+    if trap_risk == "High":
+        score -= 40
+    elif trap_risk == "Medium":
+        score -= 10
+
+    return score, notes
+
+
+def _select_best_strategy_package(
+    primary_strategy,
+    option_df,
+    spot_price,
+    expected_move,
+    atm_strike,
+    best_call_sell_strike,
+    best_put_sell_strike,
+    directional_bias,
+    market_regime,
+    volatility_regime,
+    volatility_context,
+    pinning_score,
+    conflict_score,
+    trap_risk,
+    price_action,
+):
+    candidates = _candidate_strategy_names(
+        primary_strategy,
+        directional_bias,
+        market_regime,
+        volatility_regime,
+        pinning_score,
+    )
+    evaluated = []
+
+    for candidate in candidates:
+        strategy, legs, text, pricing, risk_reward = _build_strategy_package(
+            candidate,
+            option_df,
+            spot_price,
+            expected_move,
+            atm_strike,
+            best_call_sell_strike,
+            best_put_sell_strike,
+            directional_bias,
+        )
+
+        if not _has_executable_legs(legs):
+            evaluated.append(
+                {
+                    "strategy": strategy,
+                    "score": -1,
+                    "quality": "No Trade",
+                    "reason": "missing executable legs",
+                }
+            )
+            continue
+
+        score, notes = _strategy_market_fit_score(
+            strategy,
+            risk_reward,
+            directional_bias,
+            market_regime,
+            volatility_context,
+            pinning_score,
+            conflict_score,
+            trap_risk,
+            price_action,
+        )
+        evaluated.append(
+            {
+                "strategy": strategy,
+                "score": round(score, 2),
+                "quality": risk_reward.get("quality"),
+                "reward_risk": risk_reward.get("reward_risk"),
+                "effective_return_pct": risk_reward.get("effective_return_pct"),
+                "reason": ", ".join(notes),
+                "package": (strategy, legs, text, pricing, risk_reward),
+            }
+        )
+
+    viable = [item for item in evaluated if item.get("score", -1) >= 50]
+
+    if not viable:
+        pricing = _strategy_pricing(option_df, [])
+        risk_reward = _strategy_risk_reward("Wait / Defined-Risk Spread Only", [], pricing)
+        return (
+            "Wait / Defined-Risk Spread Only",
+            [],
+            ["Wait - no candidate strategy passed the minimum risk/reward and market-fit filters."],
+            pricing,
+            risk_reward,
+            evaluated,
+            ["No candidate strategy passed the minimum risk/reward and market-fit score."],
+        )
+
+    best = sorted(
+        viable,
+        key=lambda item: (
+            item.get("score", 0),
+            item.get("reward_risk") or 0,
+            item.get("effective_return_pct") or 0,
+        ),
+        reverse=True,
+    )[0]
+    notes = []
+
+    if best["strategy"] != _normalize_strategy_name(primary_strategy, directional_bias):
+        notes.append(
+            f"{_normalize_strategy_name(primary_strategy, directional_bias)} was passed over; {best['strategy']} had the better executable risk/reward and market-fit score."
+        )
+
+    return (*best["package"], evaluated, notes)
+
+
 def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION):
     generated_at = _utc_now().isoformat()
     expiry_profile = _expiry_profile(expiry_label)
@@ -1658,6 +2147,30 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
     )
     option_df = _prepare_option_chain(option_latest_df)
     previous_option_df = _prepare_option_chain(option_previous_df)
+    live_option_context = {}
+    option_chain_source = "supabase"
+
+    if option_df.empty:
+        live_option_context = _live_option_context(expiry_label)
+
+        if not live_option_context.get("option_df", pd.DataFrame()).empty:
+            option_df = live_option_context.get("option_df")
+            option_chain_source = "live_delta"
+
+            if not analytics:
+                analytics = live_option_context.get("analytics") or {}
+            else:
+                for key, value in (live_option_context.get("analytics") or {}).items():
+                    if analytics.get(key) is None:
+                        analytics[key] = value
+
+            if not premium:
+                premium = live_option_context.get("premium") or {}
+            else:
+                for key, value in (live_option_context.get("premium") or {}).items():
+                    if premium.get(key) is None:
+                        premium[key] = value
+
     orderbook = _latest_orderbook(symbol=symbol)
     ohlcv_df = get_latest_ohlcv_data(symbol=symbol, resolution=resolution, limit=300)
     events_df = get_market_events(symbol=symbol, resolution=resolution, limit=200)
@@ -1756,34 +2269,6 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
         profile_context,
         smc_context,
     )
-    initial_strategy = best_strategy
-    strategy_legs = _strategy_legs(
-        best_strategy,
-        option_df,
-        spot_price,
-        expected_move,
-        analytics.get("atm_strike") or premium.get("atm_strike"),
-        best_call_sell_strike,
-        best_put_sell_strike,
-        directional_bias,
-    )
-    strategy_text = _strategy_text(strategy_legs)
-    no_executable_strategy = (
-        best_strategy not in ["No Trade", "Wait / Defined-Risk Spread Only"]
-        and not _has_executable_legs(strategy_legs)
-    )
-
-    if best_strategy == "No Trade":
-        strategy_text = ["No trade - high trap risk with conflicting directional signals."]
-    elif best_strategy == "Wait / Defined-Risk Spread Only" and not strategy_text:
-        strategy_text = [
-            "Wait - risk is elevated and directional signals are not clean enough for a defined-risk spread."
-        ]
-    elif no_executable_strategy:
-        strategy_text = [
-            "No executable strikes found for the recommended structure in the latest option-chain snapshot."
-        ]
-
     data_flags = {
         "analytics": bool(analytics),
         "option_chain": not option_df.empty,
@@ -1824,32 +2309,42 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
         conflict_score,
     )
 
-    if best_strategy != initial_strategy:
-        strategy_legs = _strategy_legs(
-            best_strategy,
-            option_df,
-            spot_price,
-            expected_move,
-            analytics.get("atm_strike") or premium.get("atm_strike"),
-            best_call_sell_strike,
-            best_put_sell_strike,
-            directional_bias,
-        )
-        strategy_text = _strategy_text(strategy_legs)
-        no_executable_strategy = (
-            best_strategy not in ["No Trade", "Wait / Defined-Risk Spread Only"]
-            and not _has_executable_legs(strategy_legs)
-        )
+    (
+        best_strategy,
+        strategy_legs,
+        strategy_text,
+        strategy_pricing,
+        strategy_risk_reward,
+        strategy_candidates,
+        strategy_quality_notes,
+    ) = _select_best_strategy_package(
+        best_strategy,
+        option_df,
+        spot_price,
+        expected_move,
+        analytics.get("atm_strike") or premium.get("atm_strike"),
+        best_call_sell_strike,
+        best_put_sell_strike,
+        directional_bias,
+        market_regime,
+        volatility_regime,
+        volatility_context,
+        pinning_score,
+        conflict_score,
+        trap_risk,
+        price_action,
+    )
+    no_executable_strategy = (
+        best_strategy not in ["No Trade", "Wait / Defined-Risk Spread Only"]
+        and not _has_executable_legs(strategy_legs)
+    )
 
-        if best_strategy == "Wait / Defined-Risk Spread Only" and not strategy_text:
-            strategy_text = [
-                "Wait - risk is elevated and directional signals are not clean enough for a defined-risk spread."
-            ]
-
-    if no_executable_strategy:
+    if best_strategy in ["No Trade", "Wait / Defined-Risk Spread Only"]:
         confidence_score = min(confidence_score, 50)
-
-    strategy_pricing = _strategy_pricing(option_df, strategy_legs)
+    elif no_executable_strategy:
+        confidence_score = min(confidence_score, 50)
+    elif strategy_risk_reward.get("quality") == "Good":
+        confidence_score = min(100, confidence_score + 5)
 
     poc_price = profile_context.get("poc_price")
 
@@ -1865,6 +2360,12 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
     ]
 
     key_insights.extend(strategy_text)
+    key_insights.extend(strategy_quality_notes)
+
+    if strategy_risk_reward.get("reward_risk") is not None:
+        key_insights.append(
+            f"Strategy reward/risk is {strategy_risk_reward.get('reward_risk')} with effective return {strategy_risk_reward.get('effective_return_pct')}%."
+        )
 
     for note in chain_context.get("notes", []):
         key_insights.append(f"Option chain: {note}.")
@@ -1922,6 +2423,24 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
     if no_executable_strategy:
         risk_warnings.append("Recommended structure has incomplete strikes in the latest option-chain snapshot.")
 
+    if option_chain_source == "live_delta":
+        risk_warnings.append(
+            "Option-chain snapshot was missing in Supabase; live Delta option data was used for this calculation."
+        )
+    elif live_option_context.get("error"):
+        risk_warnings.append(
+            "Option-chain snapshot was missing and live Delta fallback failed: "
+            + live_option_context.get("error")
+        )
+
+    if strategy_risk_reward.get("quality") == "Poor":
+        risk_warnings.append(
+            "Recommended structure failed the basic reward/risk filter; avoid execution unless pricing improves."
+        )
+
+    for note in strategy_risk_reward.get("notes", []):
+        risk_warnings.append(note.capitalize() + ".")
+
     if volatility_regime == "Elevated" and best_strategy in ["Short Strangle", "Short Straddle with Hedge"]:
         risk_warnings.append("Short premium is risky in elevated volatility unless hedged and sized small.")
 
@@ -1942,6 +2461,11 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
         "best_strategy": best_strategy,
         "strategy_legs": strategy_legs,
         "strategy_pricing": strategy_pricing,
+        "strategy_risk_reward": strategy_risk_reward,
+        "strategy_candidates": [
+            {key: value for key, value in candidate.items() if key != "package"}
+            for candidate in strategy_candidates
+        ],
         "strategy_text": strategy_text,
         "best_call_sell_strike": best_call_sell_strike,
         "best_put_sell_strike": best_put_sell_strike,
@@ -1960,6 +2484,7 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
         "median_iv": chain.get("median_iv"),
         "data_flags": data_flags,
         "missing_sources": missing_sources,
+        "option_chain_source": option_chain_source,
         "option_selling_environment": volatility_context.get("option_selling_environment"),
         "momentum": price_action.get("momentum"),
         "call_wall": chain_context.get("call_wall"),

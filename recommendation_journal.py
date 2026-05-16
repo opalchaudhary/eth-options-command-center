@@ -140,6 +140,7 @@ def build_recommendation_payload(insights):
         "strategy": insights.get("best_strategy"),
         "legs": strategy_legs,
         "pricing": insights.get("strategy_pricing"),
+        "risk_reward": insights.get("strategy_risk_reward"),
         "expiry_profile": insights.get("expiry_profile"),
     }
 

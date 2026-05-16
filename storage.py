@@ -3,6 +3,7 @@ import json
 import requests
 from dotenv import load_dotenv
 from datetime import datetime, timezone
+import math
 
 try:
     import streamlit as st
@@ -77,6 +78,25 @@ def post_to_supabase(table_name, payload):
         return False
 
 
+def _json_safe_value(value):
+    if value is None:
+        return None
+
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+    except Exception:
+        pass
+
+    if str(value) in ["nan", "NaN", "<NA>", "NaT"]:
+        return None
+
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+
+    return value
+
+
 def save_analytics_snapshot(analytics, expiry_label):
     row = {
         "snapshot_time": datetime.now(timezone.utc).isoformat(),
@@ -134,23 +154,28 @@ def save_option_chain_snapshot(expiry_df, expiry_label):
             "snapshot_time": snapshot_time,
             "expiry_label": expiry_label,
             "expiry_date": str(row.get("expiry")),
-            "strike": row.get("strike"),
+            "strike": _json_safe_value(row.get("strike")),
             "option_type": row.get("type"),
-            "mark_price": row.get("mark_price"),
-            "oi": row.get("oi"),
-            "volume": row.get("volume"),
-            "iv": row.get("iv"),
-            "delta": row.get("delta"),
-            "gamma": row.get("gamma"),
-            "theta": row.get("theta"),
-            "vega": row.get("vega")
+            "mark_price": _json_safe_value(row.get("mark_price")),
+            "oi": _json_safe_value(row.get("oi")),
+            "volume": _json_safe_value(row.get("volume")),
+            "iv": _json_safe_value(row.get("iv")),
+            "delta": _json_safe_value(row.get("delta")),
+            "gamma": _json_safe_value(row.get("gamma")),
+            "theta": _json_safe_value(row.get("theta")),
+            "vega": _json_safe_value(row.get("vega"))
         })
 
-    if post_to_supabase("option_chain_snapshots", rows):
-        print(f"✅ Option Chain Snapshot Saved: {len(rows)} rows")
-        return True
+    chunk_size = 300
 
-    return False
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start:start + chunk_size]
+
+        if not post_to_supabase("option_chain_snapshots", chunk):
+            return False
+
+    print(f"✅ Option Chain Snapshot Saved: {len(rows)} rows")
+    return True
 
 
 def save_orderbook_insights(insights):
