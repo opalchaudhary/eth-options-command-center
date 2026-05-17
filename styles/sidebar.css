@@ -1,0 +1,66 @@
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F2F7FC 100%);
+    border-right: 1px solid var(--border);
+}
+
+[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+    padding-top: 1.2rem;
+}
+
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label {
+    color: var(--text-primary);
+}
+
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
+    color: var(--text-secondary);
+}
+
+[data-testid="stSidebar"] .stButton > button {
+    width: 100%;
+    background: var(--primary-blue);
+    border-color: var(--primary-blue);
+    color: #FFFFFF;
+}
+
+[data-testid="stSidebar"] .stButton > button p,
+[data-testid="stSidebar"] .stButton > button span,
+[data-testid="stSidebar"] .stButton > button div {
+    color: #FFFFFF;
+}
+
+[data-testid="stSidebar"] .stButton > button:hover {
+    background: var(--dark-blue);
+    border-color: var(--dark-blue);
+    color: #FFFFFF;
+}
+
+[data-testid="stSidebar"] .stButton > button:hover p,
+[data-testid="stSidebar"] .stButton > button:hover span,
+[data-testid="stSidebar"] .stButton > button:hover div,
+[data-testid="stSidebar"] .stButton > button:focus p,
+[data-testid="stSidebar"] .stButton > button:focus span,
+[data-testid="stSidebar"] .stButton > button:focus div,
+[data-testid="stSidebar"] .stButton > button:active p,
+[data-testid="stSidebar"] .stButton > button:active span,
+[data-testid="stSidebar"] .stButton > button:active div {
+    color: #FFFFFF;
+}
+
+[data-testid="stSidebar"] .stButton > button:focus,
+[data-testid="stSidebar"] .stButton > button:active {
+    background: var(--primary-blue);
+    border-color: var(--primary-blue);
+    color: #FFFFFF;
+}
+
+[data-testid="stSidebar"] [data-testid="stAlert"] {
+    box-shadow: none;
+}
+
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+    font-weight: 700;
+}

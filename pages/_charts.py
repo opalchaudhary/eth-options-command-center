@@ -8,6 +8,7 @@ from analytics import (
     calculate_max_pain,
     calculate_atm_and_expected_move
 )
+from ui_styles import load_css
 
 
 st.set_page_config(
@@ -15,7 +16,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📊 Charts")
+load_css()
+
+st.title("Charts")
 st.caption("Visual view of ETH options positioning, OI structure, and max pain.")
 
 df = get_eth_options()

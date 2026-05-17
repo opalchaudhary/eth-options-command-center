@@ -3,12 +3,15 @@ import streamlit as st
 
 from data_refresh import refresh_market_structure_sources, refresh_options_sources
 from rule_insights import build_rule_based_insights, get_available_expiries
+from ui_styles import load_css
 
 
 st.set_page_config(
     page_title="Insights | ETH Options Command Center",
     layout="wide",
 )
+
+load_css()
 
 st.title("Insights")
 st.caption("Single rule-based market read, strategy selection, risk/reward, and data-source health.")
@@ -161,64 +164,66 @@ if missing_option_chain and not st.session_state.get(auto_refresh_key):
 
     st.warning("Option-chain refresh failed; recommendation quality may be limited.")
 
-st.subheader(f"Market Read - {_fmt_ist(selected_expiry)}")
+with st.container(key="insights_market_read"):
+    st.subheader(f"Market Read - {_fmt_ist(selected_expiry)}")
 
-summary_cols = st.columns(5)
-summary_cols[0].metric("Regime", insights["market_regime"])
-summary_cols[1].metric("Direction", insights["directional_bias"])
-summary_cols[2].metric("Volatility", insights["volatility_regime"])
-summary_cols[3].metric("Confidence", f"{insights['confidence_score']}/100")
-summary_cols[4].metric("Conflict", f"{insights['signal_conflict_score']}/100")
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Regime", insights["market_regime"])
+    summary_cols[1].metric("Direction", insights["directional_bias"])
+    summary_cols[2].metric("Volatility", insights["volatility_regime"])
+    summary_cols[3].metric("Confidence", f"{insights['confidence_score']}/100")
+    summary_cols[4].metric("Conflict", f"{insights['signal_conflict_score']}/100")
 
-market_cols = st.columns(5)
-market_cols[0].metric("ETH Spot", _fmt_money(insights.get("spot_price")))
-market_cols[1].metric("ATM Strike", _fmt_price(insights.get("atm_strike"), 0))
-market_cols[2].metric("Max Pain", _fmt_price(insights.get("max_pain"), 0))
-market_cols[3].metric("Expected Move", _fmt_money(insights.get("expected_move")))
-market_cols[4].metric("Expiry Bucket", insights["expiry_profile"]["bucket"])
+    market_cols = st.columns(5)
+    market_cols[0].metric("ETH Spot", _fmt_money(insights.get("spot_price")))
+    market_cols[1].metric("ATM Strike", _fmt_price(insights.get("atm_strike"), 0))
+    market_cols[2].metric("Max Pain", _fmt_price(insights.get("max_pain"), 0))
+    market_cols[3].metric("Expected Move", _fmt_money(insights.get("expected_move")))
+    market_cols[4].metric("Expiry Bucket", insights["expiry_profile"]["bucket"])
 
 st.divider()
 
-st.subheader("Recommended Strategy")
-st.markdown(f"**{insights['best_strategy']}**")
+with st.container(key="insights_strategy"):
+    st.subheader("Recommended Strategy")
+    st.markdown(f"**{insights['best_strategy']}**")
 
-pricing = insights.get("strategy_pricing") or {}
-risk_reward = insights.get("strategy_risk_reward") or {}
+    pricing = insights.get("strategy_pricing") or {}
+    risk_reward = insights.get("strategy_risk_reward") or {}
 
-strategy_cols = st.columns(5)
-strategy_cols[0].metric("Quality", risk_reward.get("quality", "Unknown"))
-strategy_cols[1].metric("Net Credit", _fmt_money(pricing.get("net_credit_usdt")))
-strategy_cols[2].metric("Net Debit", _fmt_money(pricing.get("net_debit_usdt")))
-strategy_cols[3].metric(
-    "Reward / Risk",
-    risk_reward.get("reward_risk") if risk_reward.get("reward_risk") is not None else "NA",
-)
-strategy_cols[4].metric(
-    "Effective Return",
-    f"{risk_reward.get('effective_return_pct')}%"
-    if risk_reward.get("effective_return_pct") is not None
-    else "NA",
-)
+    strategy_cols = st.columns(5)
+    strategy_cols[0].metric("Quality", risk_reward.get("quality", "Unknown"))
+    strategy_cols[1].metric("Net Credit", _fmt_money(pricing.get("net_credit_usdt")))
+    strategy_cols[2].metric("Net Debit", _fmt_money(pricing.get("net_debit_usdt")))
+    strategy_cols[3].metric(
+        "Reward / Risk",
+        risk_reward.get("reward_risk") if risk_reward.get("reward_risk") is not None else "NA",
+    )
+    strategy_cols[4].metric(
+        "Effective Return",
+        f"{risk_reward.get('effective_return_pct')}%"
+        if risk_reward.get("effective_return_pct") is not None
+        else "NA",
+    )
 
-_show_strategy_legs(pricing.get("legs") or insights.get("strategy_legs") or [])
+    _show_strategy_legs(pricing.get("legs") or insights.get("strategy_legs") or [])
 
-if risk_reward.get("max_profit_usdt") is not None or risk_reward.get("max_loss_usdt") is not None:
-    payoff_cols = st.columns(2)
-    payoff_cols[0].metric("Max Profit", _fmt_money(risk_reward.get("max_profit_usdt")))
-    payoff_cols[1].metric("Max Loss", _fmt_money(risk_reward.get("max_loss_usdt")))
+    if risk_reward.get("max_profit_usdt") is not None or risk_reward.get("max_loss_usdt") is not None:
+        payoff_cols = st.columns(2)
+        payoff_cols[0].metric("Max Profit", _fmt_money(risk_reward.get("max_profit_usdt")))
+        payoff_cols[1].metric("Max Loss", _fmt_money(risk_reward.get("max_loss_usdt")))
 
-with st.expander("Strategy Candidate Scores"):
-    candidates = insights.get("strategy_candidates") or []
-    if candidates:
-        st.dataframe(candidates, use_container_width=True, hide_index=True)
-    else:
-        st.info("Candidate scoring will appear after the strategy engine evaluates executable spreads.")
+    with st.expander("Strategy Candidate Scores"):
+        candidates = insights.get("strategy_candidates") or []
+        if candidates:
+            st.dataframe(candidates, use_container_width=True, hide_index=True)
+        else:
+            st.info("Candidate scoring will appear after the strategy engine evaluates executable spreads.")
 
-st.write(
-    f"The engine prefers **{insights['best_strategy']}** with a "
-    f"**{insights['directional_bias']}** bias, **{insights['trap_risk']}** trap risk, "
-    f"and **{insights['option_selling_environment']}** option-selling conditions."
-)
+    st.write(
+        f"The engine prefers **{insights['best_strategy']}** with a "
+        f"**{insights['directional_bias']}** bias, **{insights['trap_risk']}** trap risk, "
+        f"and **{insights['option_selling_environment']}** option-selling conditions."
+    )
 
 st.divider()
 

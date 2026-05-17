@@ -1,0 +1,30 @@
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+    background: #FFFFFF;
+}
+
+[data-testid="stDataFrame"] div[role="grid"] {
+    border: 0;
+}
+
+[data-testid="stDataFrame"] [role="columnheader"] {
+    background: #F0F6FC;
+    color: var(--dark-blue);
+    font-weight: 760;
+}
+
+[data-testid="stDataFrame"] [role="gridcell"] {
+    color: var(--text-primary);
+}
+
+[data-testid="stDataFrame"] canvas {
+    border-radius: var(--radius-card);
+}
+
+.st-key-option_chain_table [data-testid="stDataFrame"],
+.st-key-paper_journal [data-testid="stDataFrame"] {
+    box-shadow: 0 8px 22px rgba(16, 42, 67, 0.07);
+}

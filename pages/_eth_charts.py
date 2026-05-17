@@ -11,12 +11,15 @@ from chart_engine import (
     create_eth_candlestick_chart,
     create_volume_profile_chart,
 )
+from ui_styles import load_css
 
 
 st.set_page_config(
     page_title="ETH Chart",
     layout="wide",
 )
+
+load_css()
 
 st.title("ETH Smart Money Chart")
 

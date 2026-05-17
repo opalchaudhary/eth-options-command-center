@@ -3,6 +3,7 @@ import streamlit as st
 import importlib
 
 import paper_trading as paper_engine
+from ui_styles import load_css
 
 
 paper_engine = importlib.reload(paper_engine)
@@ -19,6 +20,8 @@ st.set_page_config(
     page_title="Paper Trading | ETH Options Command Center",
     layout="wide",
 )
+
+load_css()
 
 st.title("Paper Trading")
 st.caption("Automated paper wallet, strategy selection, running book risk, and trade journal.")
@@ -203,179 +206,184 @@ closed_trades = dashboard["closed_trades"]
 candidates = dashboard.get("candidates") or []
 selected = dashboard.get("selected")
 
-st.subheader("Wallet Overview")
+with st.container(key="paper_wallet"):
+    st.subheader("Wallet Overview")
 
-top_wallet_cols = st.columns(4)
-top_wallet_cols[0].metric("Current Equity", _fmt_inr(wallet["current_equity_inr"]))
-top_wallet_cols[1].metric("Available Margin", f"{_fmt_usdt(wallet['available_margin_usdt'])} USDT")
-top_wallet_cols[2].metric("Used Margin", f"{_fmt_usdt(wallet['used_margin_usdt'])} USDT")
-top_wallet_cols[3].metric("Margin Health", _fmt_pct(wallet["margin_health_pct"]))
+    top_wallet_cols = st.columns(4)
+    top_wallet_cols[0].metric("Current Equity", _fmt_inr(wallet["current_equity_inr"]))
+    top_wallet_cols[1].metric("Available Margin", f"{_fmt_usdt(wallet['available_margin_usdt'])} USDT")
+    top_wallet_cols[2].metric("Used Margin", f"{_fmt_usdt(wallet['used_margin_usdt'])} USDT")
+    top_wallet_cols[3].metric("Margin Health", _fmt_pct(wallet["margin_health_pct"]))
 
-wallet_rows = [
-    {"Metric": "Starting capital", "INR": _fmt_inr(PAPER_WALLET_CAPITAL_INR), "USDT": _fmt_usdt(PAPER_WALLET_CAPITAL_USDT)},
-    {"Metric": "Current equity", "INR": _fmt_inr(wallet["current_equity_inr"]), "USDT": _fmt_usdt(wallet["current_equity_usdt"])},
-    {"Metric": "Available margin", "INR": _fmt_inr(wallet["available_margin_inr"]), "USDT": _fmt_usdt(wallet["available_margin_usdt"])},
-    {"Metric": "Used margin", "INR": _fmt_inr(wallet["used_margin_inr"]), "USDT": _fmt_usdt(wallet["used_margin_usdt"])},
-    {"Metric": "Realized P&L", "INR": _fmt_inr(wallet["realized_pnl_inr"]), "USDT": _fmt_usdt(wallet["realized_pnl_usdt"])},
-    {"Metric": "Unrealized P&L", "INR": _fmt_inr(wallet["unrealized_pnl_inr"]), "USDT": _fmt_usdt(wallet["unrealized_pnl_usdt"])},
-    {"Metric": "Assumptions", "INR": f"1 USDT = Rs {INR_PER_USDT}", "USDT": f"1 lot = {ETH_LOT_SIZE} ETH"},
-]
+    wallet_rows = [
+        {"Metric": "Starting capital", "INR": _fmt_inr(PAPER_WALLET_CAPITAL_INR), "USDT": _fmt_usdt(PAPER_WALLET_CAPITAL_USDT)},
+        {"Metric": "Current equity", "INR": _fmt_inr(wallet["current_equity_inr"]), "USDT": _fmt_usdt(wallet["current_equity_usdt"])},
+        {"Metric": "Available margin", "INR": _fmt_inr(wallet["available_margin_inr"]), "USDT": _fmt_usdt(wallet["available_margin_usdt"])},
+        {"Metric": "Used margin", "INR": _fmt_inr(wallet["used_margin_inr"]), "USDT": _fmt_usdt(wallet["used_margin_usdt"])},
+        {"Metric": "Realized P&L", "INR": _fmt_inr(wallet["realized_pnl_inr"]), "USDT": _fmt_usdt(wallet["realized_pnl_usdt"])},
+        {"Metric": "Unrealized P&L", "INR": _fmt_inr(wallet["unrealized_pnl_inr"]), "USDT": _fmt_usdt(wallet["unrealized_pnl_usdt"])},
+        {"Metric": "Assumptions", "INR": f"1 USDT = Rs {INR_PER_USDT}", "USDT": f"1 lot = {ETH_LOT_SIZE} ETH"},
+    ]
 
-st.dataframe(wallet_rows, use_container_width=True, hide_index=True)
-
-st.divider()
-
-st.subheader("Auto Trading Status")
-
-status_cols = st.columns(4)
-status_cols[0].metric("Status", "Enabled" if auto_enabled else "Disabled")
-status_cols[1].metric("Last Evaluation", _fmt_ist(dashboard.get("last_evaluation_time")) if dashboard.get("last_evaluation_time") else "Idle")
-status_cols[2].metric(
-    "Selected Strategy",
-    selected.get("strategy") if selected else "No Trade",
-)
-status_cols[3].metric(
-    "Selection Score",
-    selected.get("selection_score") if selected else "NA",
-)
-
-if selected:
-    st.success(selected.get("entry_reason", "Candidate passed paper trading filters."))
-else:
-    st.warning(dashboard.get("action") or "No candidate passed the current selection rules.")
+    st.dataframe(wallet_rows, use_container_width=True, hide_index=True)
 
 st.divider()
 
-st.subheader("Running Book Greeks")
+with st.container(key="paper_status"):
+    st.subheader("Auto Trading Status")
 
-book_greeks = wallet.get("book_greeks") or {}
-greek_health = wallet.get("greek_health") or classify_greek_health(book_greeks)
-greek_cols = st.columns(5)
-greek_cols[0].metric("Net Delta", _fmt_num(book_greeks.get("delta", 0), 4))
-greek_cols[1].metric("Net Gamma", _fmt_num(book_greeks.get("gamma", 0), 6))
-greek_cols[2].metric("Net Theta", _fmt_num(book_greeks.get("theta", 0), 4))
-greek_cols[3].metric("Net Vega", _fmt_num(book_greeks.get("vega", 0), 4))
-greek_cols[4].metric("Greek Health", greek_health)
+    status_cols = st.columns(4)
+    status_cols[0].metric("Status", "Enabled" if auto_enabled else "Disabled")
+    status_cols[1].metric("Last Evaluation", _fmt_ist(dashboard.get("last_evaluation_time")) if dashboard.get("last_evaluation_time") else "Idle")
+    status_cols[2].metric(
+        "Selected Strategy",
+        selected.get("strategy") if selected else "No Trade",
+    )
+    status_cols[3].metric(
+        "Selection Score",
+        selected.get("selection_score") if selected else "NA",
+    )
 
-per_position_greeks = _greek_rows(open_trades)
-
-if per_position_greeks:
-    st.dataframe(per_position_greeks, use_container_width=True, hide_index=True)
-else:
-    st.info("No open position Greeks yet.")
-
-st.divider()
-
-st.subheader("Open Paper Positions")
-
-if open_trades.empty:
-    st.info("No open paper positions.")
-else:
-    open_rows = []
-
-    for _, trade in open_trades.iterrows():
-        selection = _json_value(trade, "selection", {}) or {}
-        open_rows.append(
-            {
-                "Trade ID": str(trade.get("id"))[:8],
-                "Strategy": trade.get("strategy"),
-                "Expiry": _fmt_ist(trade.get("expiry_label")),
-                "Lots": trade.get("lots"),
-                "Entry Value": _fmt_usdt(trade.get("entry_premium_usdt")),
-                "Unrealized P&L": _fmt_usdt(trade.get("unrealized_pnl_usdt")),
-                "Margin Used": _fmt_usdt(trade.get("margin_used_usdt")),
-                "Max Risk": _fmt_usdt(trade.get("max_risk_usdt")),
-                "Selection Score": selection.get("selection_score"),
-            }
-        )
-
-    st.dataframe(open_rows, use_container_width=True, hide_index=True)
-
-    st.markdown("#### Strategy Legs")
-    for _, trade in open_trades.iterrows():
-        label = (
-            f"{trade.get('strategy')} | {_fmt_ist(trade.get('expiry_label'))} | "
-            f"{trade.get('lots')} lots | P&L {_fmt_usdt(trade.get('unrealized_pnl_usdt'))} USDT"
-        )
-        with st.expander(label, expanded=False):
-            leg_rows = _position_leg_rows(trade)
-
-            if leg_rows:
-                st.dataframe(leg_rows, use_container_width=True, hide_index=True)
-            else:
-                st.info("Leg details are not recorded for this position.")
-
-    st.markdown("#### Manual Close")
-    trade_options = {
-        f"{row.get('strategy')} | {_fmt_ist(row.get('expiry_label'))} | {row.get('id')}": row.get("id")
-        for _, row in open_trades.iterrows()
-    }
-
-    selected_trade_label = st.selectbox("Open position", list(trade_options.keys()))
-
-    if st.button("Close Selected Position"):
-        result = manual_close_trade(trade_options[selected_trade_label])
-        if result:
-            st.success("Paper position closed.")
-            st.rerun()
-        else:
-            st.warning("Unable to close selected paper position.")
-
-st.divider()
-
-tab_closed, tab_rejected = st.tabs(["Closed Paper Trades / Journal", "Rejected Recommendations"])
-
-with tab_closed:
-    if closed_trades.empty:
-        st.info("No closed paper trades yet.")
+    if selected:
+        st.success(selected.get("entry_reason", "Candidate passed paper trading filters."))
     else:
-        rows = []
-        for _, trade in closed_trades.iterrows():
+        st.warning(dashboard.get("action") or "No candidate passed the current selection rules.")
+
+st.divider()
+
+with st.container(key="paper_greeks"):
+    st.subheader("Running Book Greeks")
+
+    book_greeks = wallet.get("book_greeks") or {}
+    greek_health = wallet.get("greek_health") or classify_greek_health(book_greeks)
+    greek_cols = st.columns(5)
+    greek_cols[0].metric("Net Delta", _fmt_num(book_greeks.get("delta", 0), 4))
+    greek_cols[1].metric("Net Gamma", _fmt_num(book_greeks.get("gamma", 0), 6))
+    greek_cols[2].metric("Net Theta", _fmt_num(book_greeks.get("theta", 0), 4))
+    greek_cols[3].metric("Net Vega", _fmt_num(book_greeks.get("vega", 0), 4))
+    greek_cols[4].metric("Greek Health", greek_health)
+
+    per_position_greeks = _greek_rows(open_trades)
+
+    if per_position_greeks:
+        st.dataframe(per_position_greeks, use_container_width=True, hide_index=True)
+    else:
+        st.info("No open position Greeks yet.")
+
+st.divider()
+
+with st.container(key="paper_open_positions"):
+    st.subheader("Open Paper Positions")
+
+    if open_trades.empty:
+        st.info("No open paper positions.")
+    else:
+        open_rows = []
+
+        for _, trade in open_trades.iterrows():
             selection = _json_value(trade, "selection", {}) or {}
-            entry_reason = _trade_value(trade, "entry_reason", default="Not recorded")
-            selection_score = _trade_value(
-                trade,
-                "selection_score",
-                default=selection.get("selection_score"),
-            )
-            rows.append(
+            open_rows.append(
                 {
-                    "Entry Time": _fmt_ist(trade.get("created_at")),
-                    "Exit Time": _fmt_ist(trade.get("closed_at")),
+                    "Trade ID": str(trade.get("id"))[:8],
                     "Strategy": trade.get("strategy"),
                     "Expiry": _fmt_ist(trade.get("expiry_label")),
-                    "P&L": _fmt_usdt(trade.get("realized_pnl_usdt")),
-                    "P&L %": round(
-                        (float(trade.get("realized_pnl_usdt") or 0) / max(float(trade.get("max_risk_usdt") or 1), 1)) * 100,
-                        2,
-                    ),
-                    "Entry Reason": entry_reason,
-                    "Exit Reason": _exit_reason_display(trade),
-                    "Selection Score": selection_score,
+                    "Lots": trade.get("lots"),
+                    "Entry Value": _fmt_usdt(trade.get("entry_premium_usdt")),
+                    "Unrealized P&L": _fmt_usdt(trade.get("unrealized_pnl_usdt")),
+                    "Margin Used": _fmt_usdt(trade.get("margin_used_usdt")),
+                    "Max Risk": _fmt_usdt(trade.get("max_risk_usdt")),
+                    "Selection Score": selection.get("selection_score"),
                 }
             )
-        st.dataframe(rows, use_container_width=True, hide_index=True)
 
-with tab_rejected:
-    rejected_rows = []
+        st.dataframe(open_rows, use_container_width=True, hide_index=True)
 
-    for candidate in candidates:
-        if candidate.get("status") != "Rejected":
-            continue
+        st.markdown("#### Strategy Legs")
+        for _, trade in open_trades.iterrows():
+            label = (
+                f"{trade.get('strategy')} | {_fmt_ist(trade.get('expiry_label'))} | "
+                f"{trade.get('lots')} lots | P&L {_fmt_usdt(trade.get('unrealized_pnl_usdt'))} USDT"
+            )
+            with st.expander(label, expanded=False):
+                leg_rows = _position_leg_rows(trade)
 
-        rejected_rows.append(
-            {
-                "Expiry": _fmt_ist(candidate.get("expiry_label")),
-                "Strategy": candidate.get("strategy"),
-                "Score": candidate.get("selection_score"),
-                "Reward/Risk": candidate.get("reward_risk"),
-                "Margin": _fmt_usdt(candidate.get("margin_used_usdt")),
-                "Post-Trade Greeks": candidate.get("post_trade_greek_health"),
-                "Reason": ", ".join(candidate.get("rejection_reasons") or []),
-            }
-        )
+                if leg_rows:
+                    st.dataframe(leg_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Leg details are not recorded for this position.")
 
-    if rejected_rows:
-        st.dataframe(rejected_rows, use_container_width=True, hide_index=True)
-    else:
-        st.success("No rejected candidates in the latest evaluation.")
+        st.markdown("#### Manual Close")
+        trade_options = {
+            f"{row.get('strategy')} | {_fmt_ist(row.get('expiry_label'))} | {row.get('id')}": row.get("id")
+            for _, row in open_trades.iterrows()
+        }
+
+        selected_trade_label = st.selectbox("Open position", list(trade_options.keys()))
+
+        if st.button("Close Selected Position"):
+            result = manual_close_trade(trade_options[selected_trade_label])
+            if result:
+                st.success("Paper position closed.")
+                st.rerun()
+            else:
+                st.warning("Unable to close selected paper position.")
+
+st.divider()
+
+with st.container(key="paper_journal"):
+    tab_closed, tab_rejected = st.tabs(["Closed Paper Trades / Journal", "Rejected Recommendations"])
+
+    with tab_closed:
+        if closed_trades.empty:
+            st.info("No closed paper trades yet.")
+        else:
+            rows = []
+            for _, trade in closed_trades.iterrows():
+                selection = _json_value(trade, "selection", {}) or {}
+                entry_reason = _trade_value(trade, "entry_reason", default="Not recorded")
+                selection_score = _trade_value(
+                    trade,
+                    "selection_score",
+                    default=selection.get("selection_score"),
+                )
+                rows.append(
+                    {
+                        "Entry Time": _fmt_ist(trade.get("created_at")),
+                        "Exit Time": _fmt_ist(trade.get("closed_at")),
+                        "Strategy": trade.get("strategy"),
+                        "Expiry": _fmt_ist(trade.get("expiry_label")),
+                        "P&L": _fmt_usdt(trade.get("realized_pnl_usdt")),
+                        "P&L %": round(
+                            (float(trade.get("realized_pnl_usdt") or 0) / max(float(trade.get("max_risk_usdt") or 1), 1)) * 100,
+                            2,
+                        ),
+                        "Entry Reason": entry_reason,
+                        "Exit Reason": _exit_reason_display(trade),
+                        "Selection Score": selection_score,
+                    }
+                )
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    with tab_rejected:
+        rejected_rows = []
+
+        for candidate in candidates:
+            if candidate.get("status") != "Rejected":
+                continue
+
+            rejected_rows.append(
+                {
+                    "Expiry": _fmt_ist(candidate.get("expiry_label")),
+                    "Strategy": candidate.get("strategy"),
+                    "Score": candidate.get("selection_score"),
+                    "Reward/Risk": candidate.get("reward_risk"),
+                    "Margin": _fmt_usdt(candidate.get("margin_used_usdt")),
+                    "Post-Trade Greeks": candidate.get("post_trade_greek_health"),
+                    "Reason": ", ".join(candidate.get("rejection_reasons") or []),
+                }
+            )
+
+        if rejected_rows:
+            st.dataframe(rejected_rows, use_container_width=True, hide_index=True)
+        else:
+            st.success("No rejected candidates in the latest evaluation.")

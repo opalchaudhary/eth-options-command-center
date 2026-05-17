@@ -1,0 +1,102 @@
+.st-key-market_overview,
+.st-key-core_options,
+.st-key-greeks_snapshot,
+.st-key-expected_range,
+.st-key-strike_recommendations,
+.st-key-orderbook_intelligence,
+.st-key-insights_market_read,
+.st-key-insights_strategy {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow-soft);
+    padding: 1.15rem 1.15rem 1.25rem;
+    margin-bottom: 1rem;
+}
+
+.st-key-market_overview {
+    border-top: 4px solid var(--primary-blue);
+}
+
+.st-key-market_overview [data-testid="stMetricValue"] {
+    color: var(--dark-blue);
+    font-size: 2rem;
+}
+
+.st-key-core_options,
+.st-key-greeks_snapshot,
+.st-key-expected_range {
+    box-shadow: var(--shadow-card);
+}
+
+.st-key-strike_recommendations {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F9FCFF 100%);
+}
+
+.st-key-orderbook_intelligence {
+    border-top: 4px solid var(--dark-blue);
+}
+
+.st-key-insights_market_read {
+    border-top: 4px solid var(--primary-blue);
+}
+
+.st-key-insights_strategy {
+    border-top: 4px solid var(--success);
+}
+
+[data-testid="stMetric"] {
+    background: #FFFFFF;
+    border: 1px solid rgba(217, 226, 236, 0.92);
+    border-radius: 12px;
+    box-shadow: 0 5px 14px rgba(16, 42, 67, 0.045);
+    padding: 0.82rem 0.9rem;
+    min-height: 96px;
+}
+
+[data-testid="stMetricLabel"] {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    font-weight: 720;
+    letter-spacing: 0;
+}
+
+[data-testid="stMetricValue"] {
+    color: var(--text-primary);
+    font-size: 1.42rem;
+    font-weight: 760;
+}
+
+[data-testid="stMetricDelta"] {
+    font-weight: 700;
+}
+
+[data-testid="stHorizontalBlock"] {
+    gap: 1rem;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.35rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 10px 10px 0 0;
+    color: var(--text-secondary);
+    font-weight: 700;
+}
+
+.stTabs [aria-selected="true"] {
+    color: var(--dark-blue);
+    background: var(--light-blue);
+}
+
+@media (max-width: 900px) {
+    [data-testid="stMetric"] {
+        min-height: 84px;
+    }
+
+    [data-testid="stMetricValue"] {
+        font-size: 1.18rem;
+    }
+}

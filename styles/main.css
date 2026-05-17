@@ -1,0 +1,128 @@
+:root {
+    --primary-blue: #0070BA;
+    --dark-blue: #003087;
+    --light-blue: #E7F3FF;
+    --background: #F5F8FB;
+    --surface: #FFFFFF;
+    --border: #D9E2EC;
+    --text-primary: #102A43;
+    --text-secondary: #627D98;
+    --success: #12B76A;
+    --warning: #F79009;
+    --danger: #F04438;
+    --shadow-soft: 0 10px 28px rgba(16, 42, 67, 0.08);
+    --shadow-card: 0 6px 18px rgba(16, 42, 67, 0.06);
+    --radius-card: 12px;
+}
+
+html,
+body,
+[data-testid="stAppViewContainer"] {
+    background: var(--background);
+    color: var(--text-primary);
+    font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+[data-testid="stAppViewContainer"] > .main {
+    background:
+        linear-gradient(180deg, rgba(231, 243, 255, 0.88) 0, rgba(245, 248, 251, 0.96) 280px),
+        var(--background);
+}
+
+.block-container {
+    max-width: 1440px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+
+h1,
+h2,
+h3,
+h4 {
+    color: var(--text-primary);
+    font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+    letter-spacing: 0;
+}
+
+h1 {
+    font-size: 2.25rem;
+    font-weight: 760;
+    margin-bottom: 0.25rem;
+}
+
+h2,
+[data-testid="stMarkdownContainer"] h2 {
+    font-size: 1.35rem;
+    font-weight: 740;
+    margin-top: 0.4rem;
+}
+
+h3,
+[data-testid="stMarkdownContainer"] h3 {
+    font-size: 1.06rem;
+    font-weight: 720;
+}
+
+p,
+li,
+label,
+[data-testid="stMarkdownContainer"] {
+    color: var(--text-primary);
+    font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
+[data-testid="stCaptionContainer"],
+.stCaption,
+small {
+    color: var(--text-secondary);
+}
+
+hr {
+    margin: 1.45rem 0;
+    border-color: rgba(217, 226, 236, 0.78);
+}
+
+[data-testid="stAlert"] {
+    border-radius: var(--radius-card);
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(16, 42, 67, 0.04);
+}
+
+.stButton > button,
+[data-testid="stBaseButton-secondary"],
+[data-testid="stBaseButton-primary"] {
+    border-radius: 10px;
+    border: 1px solid rgba(0, 112, 186, 0.24);
+    box-shadow: 0 3px 10px rgba(0, 112, 186, 0.08);
+    font-weight: 700;
+}
+
+[data-testid="stBaseButton-primary"] {
+    background: var(--primary-blue);
+    color: #FFFFFF;
+}
+
+.stSelectbox,
+.stSlider,
+.stMultiSelect {
+    color: var(--text-primary);
+}
+
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div,
+textarea {
+    border-color: var(--border);
+    border-radius: 10px;
+    background: #FFFFFF;
+}
+
+@media (max-width: 900px) {
+    .block-container {
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    h1 {
+        font-size: 1.8rem;
+    }
+}

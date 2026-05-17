@@ -1,0 +1,46 @@
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+    background: var(--surface);
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+    border-color: rgba(0, 112, 186, 0.34);
+    box-shadow: 0 12px 30px rgba(16, 42, 67, 0.09);
+}
+
+.st-key-strike_recommendations div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-top: 4px solid var(--primary-blue);
+}
+
+.st-key-strike_recommendations h3 {
+    color: var(--dark-blue);
+}
+
+.st-key-orderbook_intelligence div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: linear-gradient(180deg, #FFFFFF 0%, #F7FBFF 100%);
+}
+
+.stExpander {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    overflow: hidden;
+    box-shadow: 0 4px 12px rgba(16, 42, 67, 0.04);
+}
+
+.streamlit-expanderHeader {
+    color: var(--text-primary);
+    font-weight: 720;
+    background: #FFFFFF;
+}
+
+.st-key-paper_status [data-testid="stAlert"],
+.st-key-insights_strategy [data-testid="stAlert"] {
+    font-weight: 600;
+}
+
+.st-key-paper_status [data-testid="stAlert"][kind="success"],
+.st-key-insights_strategy [data-testid="stAlert"][kind="success"] {
+    border-color: rgba(18, 183, 106, 0.32);
+}

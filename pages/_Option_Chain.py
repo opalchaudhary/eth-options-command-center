@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 
 from delta_api import get_eth_options, get_eth_spot_price
+from ui_styles import load_css
 
 
 st.set_page_config(
@@ -9,7 +10,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📋 Option Chain")
+load_css()
+
+st.title("Option Chain")
 st.caption("Live ETH option-chain table with expiry and strike filters.")
 
 df = get_eth_options()

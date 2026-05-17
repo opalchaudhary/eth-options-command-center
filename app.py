@@ -18,6 +18,7 @@ from storage import (
     save_option_chain_snapshot,
     save_orderbook_insights
 )
+from ui_styles import load_css
 
 
 st.set_page_config(
@@ -25,6 +26,7 @@ st.set_page_config(
     layout="wide"
 )
 
+load_css()
 
 st.title("ETH Options Command Center")
 st.caption("Clean ETH options dashboard powered by Delta Exchange + Supabase")
