@@ -1013,5 +1013,5 @@ def paper_trading_dashboard_data(auto_enabled=False, run_evaluation=False, limit
         "selected": selected,
         "last_evaluation_time": last_evaluation_time,
         "engine_status": engine_status,
-        "action": "Autonomous paper trading service is monitoring the book.",
+        "action": "Waiting for a paper trading worker heartbeat.",
     }

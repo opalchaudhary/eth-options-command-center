@@ -3,6 +3,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 import paper_trading as paper_engine
+from paper_trading_runtime import start_streamlit_paper_trading_worker
 from ui_styles import load_css
 
 
@@ -20,6 +21,7 @@ st.set_page_config(
 )
 
 load_css()
+start_streamlit_paper_trading_worker()
 st_autorefresh(interval=60 * 1000, key="paper_trading_observer_refresh")
 
 st.title("Paper Trading")
@@ -56,7 +58,7 @@ def _fmt_ist(value):
 
 def _engine_display(engine_status):
     if not engine_status:
-        return "No heartbeat"
+        return "Not connected"
 
     status = engine_status.get("status") or "Unknown"
     created_at = pd.to_datetime(engine_status.get("created_at"), utc=True, errors="coerce")
@@ -68,6 +70,34 @@ def _engine_display(engine_status):
             return "Stale"
 
     return status
+
+
+def _engine_interval_display(engine_status):
+    value = engine_status.get("interval_seconds") if engine_status else None
+    return f"{value}s" if value else "Waiting"
+
+
+def _engine_limit_display(engine_status):
+    return engine_status.get("limit_expiries") if engine_status else "Waiting"
+
+
+def _engine_message(engine_status, dashboard_action):
+    if not engine_status:
+        return (
+            "No paper trading worker heartbeat has been recorded yet. Apply the paper_trading_engine_runs "
+            "migration. The Streamlit-hosted worker will write a heartbeat while the app is awake."
+        )
+
+    if _engine_display(engine_status) == "Stale":
+        return (
+            "The last paper trading worker heartbeat is stale. The Streamlit app may have slept, restarted, "
+            "or unable to reach Supabase."
+        )
+
+    if engine_status.get("error"):
+        return f"Latest engine cycle failed: {engine_status.get('error')}"
+
+    return engine_status.get("action") or dashboard_action or "Paper trading worker heartbeat received."
 
 
 def _json_value(row, key, default=None):
@@ -203,10 +233,10 @@ selected = dashboard.get("selected")
 engine_status = dashboard.get("engine_status") or {}
 engine_display = _engine_display(engine_status)
 
-st.sidebar.caption("Paper trading engine is an external daemon, independent of Streamlit.")
+st.sidebar.caption("Paper trading engine runs in the Streamlit Cloud process while the app is awake.")
 st.sidebar.metric("Engine", engine_display)
-st.sidebar.metric("Cycle Interval", f"{engine_status.get('interval_seconds') or 'NA'}s")
-st.sidebar.metric("Expiries Evaluated", engine_status.get("limit_expiries") or "NA")
+st.sidebar.metric("Cycle Interval", _engine_interval_display(engine_status))
+st.sidebar.metric("Expiries Evaluated", _engine_limit_display(engine_status))
 
 with st.container(key="paper_wallet"):
     st.subheader("Wallet Overview")
@@ -254,9 +284,11 @@ with st.container(key="paper_status"):
     if selected:
         st.success(selected.get("entry_reason", "Candidate passed paper trading filters."))
     elif engine_status.get("error"):
-        st.error(f"Latest engine cycle failed: {engine_status.get('error')}")
+        st.error(_engine_message(engine_status, dashboard.get("action")))
+    elif not engine_status or engine_display == "Stale":
+        st.warning(_engine_message(engine_status, dashboard.get("action")))
     else:
-        st.warning(engine_status.get("action") or dashboard.get("action") or "No candidate passed the current selection rules.")
+        st.info(_engine_message(engine_status, dashboard.get("action")))
 
 st.divider()
 

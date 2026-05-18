@@ -1,8 +1,18 @@
 # Paper Trading Daemon
 
-The Paper Trading engine is intentionally independent of Streamlit. The web app does not start trades, refresh trades, or control execution. It only reads persisted state from Supabase.
+The Paper Trading engine does not depend on buttons, Streamlit session state, or the Paper Trading page refresh cycle.
 
-To keep trading while your browser and Windows machine are closed, run `paper_trading_daemon.py` on always-on compute:
+There are two supported runtime modes.
+
+## Streamlit-hosted mode
+
+When the Streamlit Cloud app is awake, `app.py` and the Paper Trading page start one process-local background worker with `paper_trading_runtime.start_streamlit_paper_trading_worker()`.
+
+This is suitable if you access the app often enough that Streamlit Cloud does not hibernate it. Streamlit Community Cloud can sleep after inactivity, so trading pauses while the app is asleep and resumes when the app wakes.
+
+## Always-on worker mode
+
+To keep trading even when Streamlit Cloud sleeps, run `paper_trading_daemon.py` on always-on compute:
 
 - a VPS
 - a cloud worker service
@@ -37,4 +47,4 @@ Platforms that support Procfile workers can run:
 worker: python paper_trading_daemon.py
 ```
 
-The daemon writes every cycle to `paper_trading_engine_runs`, plus recommendation evaluations, wallet snapshots, and paper trades. When you later open the Streamlit app, the Paper Trading page reads those records and shows what happened while you were away.
+Both modes write every cycle to `paper_trading_engine_runs`, plus recommendation evaluations, wallet snapshots, and paper trades. The Paper Trading page reads those records and shows the latest engine heartbeat and trade state.
