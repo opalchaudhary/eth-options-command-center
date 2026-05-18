@@ -1,18 +1,16 @@
 import pandas as pd
 import streamlit as st
-import importlib
+from streamlit_autorefresh import st_autorefresh
 
 import paper_trading as paper_engine
 from ui_styles import load_css
 
 
-paper_engine = importlib.reload(paper_engine)
 INR_PER_USDT = paper_engine.INR_PER_USDT
 PAPER_WALLET_CAPITAL_INR = paper_engine.PAPER_WALLET_CAPITAL_INR
 PAPER_WALLET_CAPITAL_USDT = paper_engine.PAPER_WALLET_CAPITAL_USDT
 ETH_LOT_SIZE = paper_engine.ETH_LOT_SIZE
 classify_greek_health = paper_engine.classify_greek_health
-manual_close_trade = paper_engine.manual_close_trade
 paper_trading_dashboard_data = paper_engine.paper_trading_dashboard_data
 
 
@@ -22,9 +20,10 @@ st.set_page_config(
 )
 
 load_css()
+st_autorefresh(interval=60 * 1000, key="paper_trading_observer_refresh")
 
 st.title("Paper Trading")
-st.caption("Automated paper wallet, strategy selection, running book risk, and trade journal.")
+st.caption("Autonomous paper wallet, strategy selection, running book risk, and trade journal.")
 
 
 def _fmt_usdt(value):
@@ -53,6 +52,22 @@ def _fmt_ist(value):
         return str(value)
 
     return timestamp.tz_convert("Asia/Kolkata").strftime("%d %b %Y, %I:%M:%S %p IST")
+
+
+def _engine_display(engine_status):
+    if not engine_status:
+        return "No heartbeat"
+
+    status = engine_status.get("status") or "Unknown"
+    created_at = pd.to_datetime(engine_status.get("created_at"), utc=True, errors="coerce")
+    interval_seconds = float(engine_status.get("interval_seconds") or 60)
+
+    if not pd.isna(created_at):
+        age_seconds = (pd.Timestamp.utcnow() - created_at).total_seconds()
+        if age_seconds > max(interval_seconds * 3, 180):
+            return "Stale"
+
+    return status
 
 
 def _json_value(row, key, default=None):
@@ -177,34 +192,21 @@ def _position_leg_rows(trade):
     return rows
 
 
-auto_enabled = st.sidebar.toggle("Auto Trading Enabled", value=False)
-limit_expiries = st.sidebar.slider("Expiries To Evaluate", 3, 12, 6)
-
-if st.sidebar.button("Refresh Paper Trading"):
-    st.cache_data.clear()
-    st.session_state["run_paper_evaluation"] = True
-
-run_evaluation = st.session_state.pop("run_paper_evaluation", False)
-
 with st.spinner("Loading paper trading book..."):
-    try:
-        dashboard = paper_trading_dashboard_data(
-            auto_enabled=auto_enabled,
-            run_evaluation=run_evaluation,
-            limit_expiries=limit_expiries,
-        )
-    except TypeError as exc:
-        if "run_evaluation" not in str(exc):
-            raise
-
-        st.warning("Reloading paper trading engine; please click Refresh Paper Trading again.")
-        dashboard = paper_trading_dashboard_data(auto_enabled=False)
+    dashboard = paper_trading_dashboard_data()
 
 wallet = dashboard["wallet"]
 open_trades = dashboard["open_trades"]
 closed_trades = dashboard["closed_trades"]
 candidates = dashboard.get("candidates") or []
 selected = dashboard.get("selected")
+engine_status = dashboard.get("engine_status") or {}
+engine_display = _engine_display(engine_status)
+
+st.sidebar.caption("Paper trading engine is an external daemon, independent of Streamlit.")
+st.sidebar.metric("Engine", engine_display)
+st.sidebar.metric("Cycle Interval", f"{engine_status.get('interval_seconds') or 'NA'}s")
+st.sidebar.metric("Expiries Evaluated", engine_status.get("limit_expiries") or "NA")
 
 with st.container(key="paper_wallet"):
     st.subheader("Wallet Overview")
@@ -230,11 +232,16 @@ with st.container(key="paper_wallet"):
 st.divider()
 
 with st.container(key="paper_status"):
-    st.subheader("Auto Trading Status")
+    st.subheader("Autonomous Trading Status")
 
     status_cols = st.columns(4)
-    status_cols[0].metric("Status", "Enabled" if auto_enabled else "Disabled")
-    status_cols[1].metric("Last Evaluation", _fmt_ist(dashboard.get("last_evaluation_time")) if dashboard.get("last_evaluation_time") else "Idle")
+    status_cols[0].metric("Daemon", engine_display)
+    status_cols[1].metric(
+        "Last Evaluation",
+        _fmt_ist(dashboard.get("last_evaluation_time") or engine_status.get("created_at"))
+        if dashboard.get("last_evaluation_time") or engine_status.get("created_at")
+        else "Pending",
+    )
     status_cols[2].metric(
         "Selected Strategy",
         selected.get("strategy") if selected else "No Trade",
@@ -246,8 +253,10 @@ with st.container(key="paper_status"):
 
     if selected:
         st.success(selected.get("entry_reason", "Candidate passed paper trading filters."))
+    elif engine_status.get("error"):
+        st.error(f"Latest engine cycle failed: {engine_status.get('error')}")
     else:
-        st.warning(dashboard.get("action") or "No candidate passed the current selection rules.")
+        st.warning(engine_status.get("action") or dashboard.get("action") or "No candidate passed the current selection rules.")
 
 st.divider()
 
@@ -311,22 +320,6 @@ with st.container(key="paper_open_positions"):
                     st.dataframe(leg_rows, use_container_width=True, hide_index=True)
                 else:
                     st.info("Leg details are not recorded for this position.")
-
-        st.markdown("#### Manual Close")
-        trade_options = {
-            f"{row.get('strategy')} | {_fmt_ist(row.get('expiry_label'))} | {row.get('id')}": row.get("id")
-            for _, row in open_trades.iterrows()
-        }
-
-        selected_trade_label = st.selectbox("Open position", list(trade_options.keys()))
-
-        if st.button("Close Selected Position"):
-            result = manual_close_trade(trade_options[selected_trade_label])
-            if result:
-                st.success("Paper position closed.")
-                st.rerun()
-            else:
-                st.warning("Unable to close selected paper position.")
 
 st.divider()
 

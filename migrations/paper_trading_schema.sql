@@ -50,3 +50,28 @@ create table if not exists paper_wallet_snapshots (
 
 create index if not exists idx_paper_wallet_snapshots_created_at
     on paper_wallet_snapshots (created_at desc);
+
+create table if not exists paper_trading_engine_runs (
+    id uuid primary key default gen_random_uuid(),
+    created_at timestamptz not null default now(),
+    cycle_started_at timestamptz,
+    cycle_finished_at timestamptz,
+    status text not null,
+    action text,
+    error text,
+    interval_seconds integer,
+    limit_expiries integer,
+    opened_trade_id uuid,
+    selected_strategy text,
+    selected_expiry_label text,
+    selected_score numeric,
+    open_trade_count integer,
+    closed_trade_count integer,
+    cycle_json jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_paper_trading_engine_runs_created_at
+    on paper_trading_engine_runs (created_at desc);
+
+create index if not exists idx_paper_trading_engine_runs_status
+    on paper_trading_engine_runs (status, created_at desc);

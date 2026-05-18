@@ -647,12 +647,13 @@ def _record_evaluation_cycle(candidates, selected, wallet):
         selected.get("expiry_label"),
         selected.get("strategy"),
     ) if selected else None
+    cycle_created_at = _now_iso()
 
     for candidate in candidates:
         recommendation = candidate.get("recommendation") or {}
         candidate_key = (candidate.get("expiry_label"), candidate.get("strategy"))
         payload = {
-            "created_at": _now_iso(),
+            "created_at": cycle_created_at,
             "expiry_label": candidate.get("expiry_label"),
             "strategy": candidate.get("strategy"),
             "recommendation_id": recommendation.get("id"),
@@ -684,6 +685,115 @@ def _record_wallet_snapshot(wallet):
         "snapshot_json": _json_safe(wallet),
     }
     _request("POST", "paper_wallet_snapshots", payload=payload, prefer="return=minimal")
+
+
+def _frame_count(value):
+    return 0 if value is None or value.empty else len(value)
+
+
+def record_paper_engine_run(
+    status,
+    cycle_started_at=None,
+    action=None,
+    error=None,
+    interval_seconds=None,
+    limit_expiries=None,
+    evaluation=None,
+):
+    evaluation = evaluation or {}
+    selected = evaluation.get("selected") or {}
+    opened_trade = evaluation.get("opened_trade") or {}
+    payload = {
+        "created_at": _now_iso(),
+        "cycle_started_at": cycle_started_at,
+        "cycle_finished_at": _now_iso(),
+        "status": status,
+        "action": action or evaluation.get("action"),
+        "error": error,
+        "interval_seconds": interval_seconds,
+        "limit_expiries": limit_expiries,
+        "opened_trade_id": opened_trade.get("id"),
+        "selected_strategy": selected.get("strategy"),
+        "selected_expiry_label": selected.get("expiry_label"),
+        "selected_score": selected.get("selection_score"),
+        "open_trade_count": _frame_count(evaluation.get("open_trades")),
+        "closed_trade_count": _frame_count(evaluation.get("closed_trades")),
+        "cycle_json": _json_safe(
+            {
+                "action": action or evaluation.get("action"),
+                "error": error,
+                "selected": {
+                    key: selected.get(key)
+                    for key in ["expiry_label", "strategy", "selection_score", "entry_reason"]
+                } if selected else None,
+                "opened_trade_id": opened_trade.get("id"),
+                "position_updates": evaluation.get("position_updates") or [],
+            }
+        ),
+    }
+    result = _request("POST", "paper_trading_engine_runs", payload=payload, prefer="return=representation")
+
+    if isinstance(result, list) and result:
+        return result[0]
+
+    return payload
+
+
+def get_latest_paper_engine_run():
+    runs = read_table(
+        "paper_trading_engine_runs",
+        {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": 1,
+        },
+    )
+
+    if runs.empty:
+        return {}
+
+    return runs.iloc[0].to_dict()
+
+
+def get_latest_paper_evaluations(limit=100):
+    evaluations = read_table(
+        "paper_recommendation_evaluations",
+        {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": limit,
+        },
+    )
+
+    if evaluations.empty:
+        return [], None, None
+
+    latest_time = evaluations.iloc[0].get("created_at")
+    latest_cycle = evaluations[evaluations["created_at"] == latest_time].copy()
+
+    if latest_cycle.empty:
+        latest_cycle = evaluations.head(1).copy()
+
+    candidates = []
+    selected = None
+
+    for _, row in latest_cycle.iterrows():
+        candidate = row.get("candidate_json")
+        candidate = candidate if isinstance(candidate, dict) else {}
+        candidate = {
+            **candidate,
+            "expiry_label": candidate.get("expiry_label") or row.get("expiry_label"),
+            "strategy": candidate.get("strategy") or row.get("strategy"),
+            "selection_score": candidate.get("selection_score") or row.get("selection_score"),
+            "rejection_reasons": candidate.get("rejection_reasons") or row.get("rejection_reasons") or [],
+        }
+        candidates.append(candidate)
+
+        if bool(row.get("selected")):
+            selected = candidate
+
+    candidates = sorted(candidates, key=lambda item: item.get("selection_score") or 0, reverse=True)
+    return candidates, selected, latest_time
 
 
 def _entry_reason(insights, score):
@@ -800,7 +910,7 @@ def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
 
     if not enabled:
         evaluation["action"] = (
-            "Manual refresh: positions marked to market and candidates evaluated. "
+            "Positions marked to market and candidates evaluated. "
             "Auto trading is disabled, so no new trades were opened."
         )
         return evaluation
@@ -889,32 +999,19 @@ def manual_close_trade(trade_id, reason="MANUAL"):
 
 
 def paper_trading_dashboard_data(auto_enabled=False, run_evaluation=False, limit_expiries=6):
-    if auto_enabled or run_evaluation:
-        evaluation = auto_trade_cycle(
-            enabled=auto_enabled,
-            limit_expiries=limit_expiries,
-            persist=True,
-        )
-    else:
-        open_trades = get_open_paper_trades(limit=100)
-        closed_trades = get_closed_paper_trades(limit=200)
-        evaluation = {
-            "wallet": wallet_state(open_trades, closed_trades),
-            "open_trades": open_trades,
-            "closed_trades": closed_trades,
-            "candidates": [],
-            "selected": None,
-            "last_evaluation_time": None,
-            "action": "Idle: click Refresh Paper Trading to evaluate candidates.",
-        }
-
     open_trades = get_open_paper_trades(limit=100)
     closed_trades = get_closed_paper_trades(limit=200)
     wallet = wallet_state(open_trades, closed_trades)
+    candidates, selected, last_evaluation_time = get_latest_paper_evaluations()
+    engine_status = get_latest_paper_engine_run()
 
     return {
-        **evaluation,
         "wallet": wallet,
         "open_trades": open_trades,
         "closed_trades": closed_trades,
+        "candidates": candidates,
+        "selected": selected,
+        "last_evaluation_time": last_evaluation_time,
+        "engine_status": engine_status,
+        "action": "Autonomous paper trading service is monitoring the book.",
     }
