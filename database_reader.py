@@ -225,3 +225,186 @@ def get_volume_profile(symbol="ETHUSD", resolution="5m", limit=100):
     except Exception as e:
         print("Error reading volume profile:", e)
         return pd.DataFrame()
+
+
+def read_supabase_table(table_name, params=None, timeout=15):
+    """
+    Generic read helper for dashboard history tables.
+    Returns an empty dataframe instead of raising so pages stay usable.
+    """
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Supabase credentials missing.")
+        return pd.DataFrame()
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            params=params or {"select": "*"},
+            timeout=timeout,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Failed to read {table_name}:",
+                response.status_code,
+                response.text,
+            )
+            return pd.DataFrame()
+
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame()
+
+        return pd.DataFrame(data)
+
+    except Exception as e:
+        print(f"Error reading {table_name}:", e)
+        return pd.DataFrame()
+
+
+def get_analytics_snapshots(expiry_label=None, limit=500):
+    params = {
+        "select": "*",
+        "order": "snapshot_time.asc",
+        "limit": limit,
+    }
+
+    if expiry_label:
+        params["expiry_label"] = f"eq.{expiry_label}"
+
+    df = read_supabase_table("analytics_snapshots", params=params)
+
+    if df.empty:
+        return df
+
+    if "snapshot_time" in df.columns:
+        df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], utc=True)
+
+    numeric_cols = [
+        "spot_price",
+        "max_pain",
+        "atm_strike",
+        "pcr",
+        "atm_straddle_price",
+        "expected_move_pct",
+        "expected_move_upper",
+        "expected_move_lower",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("snapshot_time").reset_index(drop=True)
+
+
+def get_premium_decay_snapshots(expiry_label=None, limit=500):
+    params = {
+        "select": "*",
+        "order": "snapshot_time.asc",
+        "limit": limit,
+    }
+
+    if expiry_label:
+        params["expiry_label"] = f"eq.{expiry_label}"
+
+    df = read_supabase_table("premium_decay_snapshots", params=params)
+
+    if df.empty:
+        return df
+
+    if "snapshot_time" in df.columns:
+        df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], utc=True)
+
+    numeric_cols = [
+        "atm_strike",
+        "atm_ce_price",
+        "atm_pe_price",
+        "atm_straddle_price",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("snapshot_time").reset_index(drop=True)
+
+
+def get_option_chain_snapshots(expiry_label=None, limit=2000):
+    params = {
+        "select": "*",
+        "order": "snapshot_time.asc",
+        "limit": limit,
+    }
+
+    if expiry_label:
+        params["expiry_label"] = f"eq.{expiry_label}"
+
+    df = read_supabase_table("option_chain_snapshots", params=params)
+
+    if df.empty:
+        return df
+
+    if "snapshot_time" in df.columns:
+        df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], utc=True)
+
+    numeric_cols = [
+        "strike",
+        "mark_price",
+        "oi",
+        "volume",
+        "iv",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("snapshot_time").reset_index(drop=True)
+
+
+def get_orderbook_insight_snapshots(symbol="ETHUSD", limit=500):
+    params = {
+        "select": "*",
+        "symbol": f"eq.{symbol}",
+        "order": "timestamp.asc",
+        "limit": limit,
+    }
+
+    df = read_supabase_table("orderbook_insights", params=params)
+
+    if df.empty:
+        return df
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    numeric_cols = [
+        "eth_price",
+        "best_bid",
+        "best_ask",
+        "spread",
+        "spread_pct",
+        "bid_depth",
+        "ask_depth",
+        "imbalance_ratio",
+        "nearest_bid_wall_price",
+        "nearest_bid_wall_size",
+        "nearest_ask_wall_price",
+        "nearest_ask_wall_size",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.sort_values("timestamp").reset_index(drop=True)
