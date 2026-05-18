@@ -37,6 +37,24 @@ def _fmt_price(value):
     return f"{float(value or 0):,.2f}"
 
 
+def _fmt_optional_price(value):
+    try:
+        if value is None or pd.isna(value):
+            return "NA"
+        return f"{float(value):,.2f}"
+    except Exception:
+        return "NA"
+
+
+def _fmt_optional_num(value, digits=2):
+    try:
+        if value is None or pd.isna(value):
+            return "NA"
+        return f"{float(value):,.{digits}f}"
+    except Exception:
+        return "NA"
+
+
 def _fmt_ist(value):
     if value in [None, ""]:
         return "NA"
@@ -90,6 +108,86 @@ def _json_text(value, fallback="NA"):
     if isinstance(value, list):
         return "; ".join(str(item) for item in value[:3]) if value else fallback
     return value or fallback
+
+
+def _yes_no(value):
+    return "Yes" if bool(value) else "No"
+
+
+def _join_parts(parts):
+    clean_parts = []
+
+    for part in parts:
+        if not part:
+            continue
+
+        if str(part).split(": ")[-1] == "NA":
+            continue
+
+        clean_parts.append(part)
+
+    return " | ".join(clean_parts) if clean_parts else "NA"
+
+
+def _smc_summary(smc):
+    smc = smc if isinstance(smc, dict) else {}
+    notes = smc.get("notes") or []
+    warnings = smc.get("warnings") or []
+
+    parts = [
+        f"Inside demand: {_yes_no(smc.get('inside_demand'))}",
+        f"Inside supply: {_yes_no(smc.get('inside_supply'))}",
+        f"Zone break risk: {_yes_no(smc.get('zone_break_risk'))}",
+        f"Call sell confidence: {smc.get('call_sell_confidence') or 'NA'}",
+        f"Put sell confidence: {smc.get('put_sell_confidence') or 'NA'}",
+    ]
+
+    if warnings:
+        parts.append("Warning: " + "; ".join(str(item) for item in warnings[:2]))
+    elif notes:
+        parts.append("Note: " + "; ".join(str(item) for item in notes[:2]))
+
+    return _join_parts(parts)
+
+
+def _volume_summary(volume):
+    volume = volume if isinstance(volume, dict) else {}
+    notes = volume.get("notes") or []
+    warnings = volume.get("warnings") or []
+
+    parts = [
+        f"POC: {_fmt_optional_price(volume.get('poc_price'))}",
+        f"Near HVN: {_yes_no(volume.get('near_hvn'))}",
+        f"Near LVN: {_yes_no(volume.get('near_lvn'))}",
+        f"Expiry magnet: {_yes_no(volume.get('expiry_magnet'))}",
+        f"Breakout risk: {_yes_no(volume.get('breakout_risk'))}",
+    ]
+
+    if warnings:
+        parts.append("Warning: " + "; ".join(str(item) for item in warnings[:2]))
+    elif notes:
+        parts.append("Note: " + "; ".join(str(item) for item in notes[:2]))
+
+    return _join_parts(parts)
+
+
+def _options_summary(options):
+    options = options if isinstance(options, dict) else {}
+    parts = [
+        f"PCR: {_fmt_optional_num(options.get('pcr'), 2)}",
+        f"Max pain: {_fmt_optional_price(options.get('max_pain'))}",
+        f"Call wall: {_fmt_optional_price(options.get('call_wall'))}",
+        f"Put wall: {_fmt_optional_price(options.get('put_wall'))}",
+        f"Median IV: {_fmt_optional_num(options.get('median_iv'), 2)}",
+        f"Net delta: {_fmt_optional_num(options.get('net_delta'), 2)}",
+        f"Net gamma: {_fmt_optional_num(options.get('net_gamma'), 4)}",
+    ]
+
+    environment = options.get("option_selling_environment")
+    if environment:
+        parts.append(f"Option selling: {environment}")
+
+    return _join_parts(parts)
 
 
 st.sidebar.caption("Futures worker runs automatically while the Streamlit process is awake.")
@@ -178,9 +276,9 @@ with st.container(key="futures_context"):
     context_cols[4].metric("Conflict", _fmt_pct(context.get("signal_conflict_score")))
 
     context_rows = [
-        {"Context": "SMC", "Value": _json_text(context.get("smc_context"))},
-        {"Context": "Volume", "Value": _json_text(context.get("volume_context"))},
-        {"Context": "Options", "Value": _json_text(context.get("options_context"))},
+        {"Context": "SMC", "Value": _smc_summary(context.get("smc_context"))},
+        {"Context": "Volume", "Value": _volume_summary(context.get("volume_context"))},
+        {"Context": "Options", "Value": _options_summary(context.get("options_context"))},
         {"Context": "Key insight", "Value": _json_text(context.get("key_insights"))},
         {"Context": "Risk warning", "Value": _json_text(context.get("risk_warnings"))},
     ]
