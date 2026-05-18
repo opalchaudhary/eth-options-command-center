@@ -50,11 +50,42 @@ def _fmt_ist(value):
 
 
 def _json_text(value, fallback="NA"):
+    def _is_empty(item):
+        if item is None:
+            return True
+        if isinstance(item, str):
+            return item == ""
+        if isinstance(item, (list, tuple, set, dict)):
+            return len(item) == 0
+        if isinstance(item, pd.DataFrame):
+            return item.empty
+        try:
+            return bool(pd.isna(item))
+        except Exception:
+            return False
+
+    def _compact_value(item):
+        if isinstance(item, pd.DataFrame):
+            return f"{len(item)} rows"
+        if isinstance(item, dict):
+            return {
+                key: _compact_value(nested)
+                for key, nested in item.items()
+                if not _is_empty(nested)
+            }
+        if isinstance(item, list):
+            return [_compact_value(nested) for nested in item[:3]]
+        return item
+
     if isinstance(value, dict):
         notes = value.get("notes") or value.get("warnings") or []
         if notes:
             return "; ".join(str(item) for item in notes[:3])
-        compact = {key: item for key, item in value.items() if item not in [None, "", [], {}]}
+        compact = {
+            key: _compact_value(item)
+            for key, item in value.items()
+            if not _is_empty(item)
+        }
         return str(compact)[:180] if compact else fallback
     if isinstance(value, list):
         return "; ".join(str(item) for item in value[:3]) if value else fallback
