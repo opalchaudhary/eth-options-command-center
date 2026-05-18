@@ -195,6 +195,8 @@ def estimate_trade_risk(recommendation):
         "lots_by_risk": lots_by_risk,
         "lots_by_margin": lots_by_margin,
         "risk_per_lot_usdt": round(risk_per_lot, 4),
+        "margin_per_lot_usdt": round(margin_per_lot, 4),
+        "entry_premium_per_lot_usdt": round(premium_per_lot, 4),
         "max_risk_usdt": round(risk_per_lot * lots, 4),
         "max_risk_inr": usdt_to_inr(risk_per_lot * lots),
         "margin_used_usdt": round(margin_per_lot * lots, 4),
@@ -485,6 +487,86 @@ def _liquidity_score(legs):
     return round(sum(scores) / max(len(scores), 1), 2)
 
 
+def _risk_for_lots(risk, lots):
+    lots = int(lots or 0)
+    risk_per_lot = _safe_float(risk.get("risk_per_lot_usdt"))
+    margin_per_lot = _safe_float(risk.get("margin_per_lot_usdt"))
+    premium_per_lot = _safe_float(risk.get("entry_premium_per_lot_usdt"))
+
+    if not margin_per_lot and risk.get("lots"):
+        margin_per_lot = _safe_float(risk.get("margin_used_usdt")) / max(int(risk.get("lots") or 1), 1)
+
+    if not premium_per_lot and risk.get("lots"):
+        premium_per_lot = _safe_float(risk.get("entry_premium_usdt")) / max(int(risk.get("lots") or 1), 1)
+
+    resized = dict(risk)
+    resized.update(
+        {
+            "lots": lots,
+            "eth_quantity": round(lots * ETH_LOT_SIZE, 4),
+            "max_risk_usdt": round(risk_per_lot * lots, 4),
+            "max_risk_inr": usdt_to_inr(risk_per_lot * lots),
+            "margin_used_usdt": round(margin_per_lot * lots, 4),
+            "margin_used_inr": usdt_to_inr(margin_per_lot * lots),
+            "entry_premium_usdt": round(premium_per_lot * lots, 4),
+        }
+    )
+    return resized
+
+
+def _fit_risk_to_wallet_and_greeks(insights, risk, wallet):
+    pricing = insights.get("strategy_pricing") or {}
+    legs = pricing.get("legs") or insights.get("strategy_legs") or []
+    current_book_greeks = wallet.get("book_greeks") or {}
+    equity = wallet.get("current_equity_usdt")
+    max_lots = int(risk.get("lots") or 0)
+    best_rejected_check = {}
+
+    for lots in range(max_lots, 0, -1):
+        resized = _risk_for_lots(risk, lots)
+        margin_pct = resized["margin_used_usdt"] / max(wallet["current_equity_usdt"], 1)
+        free_after = (wallet["available_margin_usdt"] - resized["margin_used_usdt"]) / max(wallet["current_equity_usdt"], 1)
+        candidate_greeks, _ = _greeks_from_legs(legs, lots)
+        post_trade_greeks = _combine_greeks(current_book_greeks, candidate_greeks)
+        current_greek_health = classify_greek_health(current_book_greeks, equity)
+        post_trade_greek_health = classify_greek_health(post_trade_greeks, equity)
+        greek_check = {
+            "candidate_greeks": candidate_greeks,
+            "current_book_greeks": current_book_greeks,
+            "post_trade_book_greeks": post_trade_greeks,
+            "current_greek_health": current_greek_health,
+            "post_trade_greek_health": post_trade_greek_health,
+            "sized_lots": lots,
+            "original_lots": max_lots,
+            "lot_sizing_reason": "Sized by margin and Greek health",
+        }
+        best_rejected_check = greek_check
+
+        if free_after < MIN_FREE_MARGIN_PCT:
+            continue
+
+        if margin_pct > MAX_SINGLE_TRADE_MARGIN_PCT:
+            continue
+
+        if current_greek_health != "Healthy":
+            continue
+
+        if post_trade_greek_health == "Healthy":
+            resized["greek_check"] = greek_check
+            return resized, greek_check
+
+    return None, best_rejected_check
+
+
+def _has_open_recommendation(open_trades, recommendation):
+    recommendation_id = recommendation.get("id")
+
+    if not recommendation_id or open_trades is None or open_trades.empty or "recommendation_id" not in open_trades:
+        return False
+
+    return str(recommendation_id) in set(open_trades["recommendation_id"].dropna().astype(str))
+
+
 def _candidate_score(insights, risk, wallet, open_trades):
     strategy = insights.get("best_strategy")
     pricing = insights.get("strategy_pricing") or {}
@@ -500,18 +582,11 @@ def _candidate_score(insights, risk, wallet, open_trades):
     expiry_bucket = (insights.get("expiry_profile") or {}).get("bucket")
     side = _strategy_side(strategy, insights.get("directional_bias"))
     existing_same_side = 0
-    candidate_greeks, _ = _greeks_from_legs(legs, risk["lots"])
-    current_book_greeks = wallet.get("book_greeks") or {}
-    post_trade_greeks = _combine_greeks(current_book_greeks, candidate_greeks)
-    current_greek_health = classify_greek_health(current_book_greeks, wallet.get("current_equity_usdt"))
-    post_trade_greek_health = classify_greek_health(post_trade_greeks, wallet.get("current_equity_usdt"))
-    greek_check = {
-        "candidate_greeks": candidate_greeks,
-        "current_book_greeks": current_book_greeks,
-        "post_trade_book_greeks": post_trade_greeks,
-        "current_greek_health": current_greek_health,
-        "post_trade_greek_health": post_trade_greek_health,
-    }
+    greek_check = risk.get("greek_check") or {}
+    current_greek_health = greek_check.get("current_greek_health") or classify_greek_health(
+        wallet.get("book_greeks") or {},
+        wallet.get("current_equity_usdt"),
+    )
 
     if open_trades is not None and not open_trades.empty and "side" in open_trades:
         existing_same_side = int((open_trades["side"] == side).sum())
@@ -555,8 +630,6 @@ def _candidate_score(insights, risk, wallet, open_trades):
         reasons.append("Overlapping same-direction risk")
     if current_greek_health != "Healthy":
         reasons.append(f"Current book Greeks are {current_greek_health}")
-    if post_trade_greek_health != "Healthy":
-        reasons.append(f"Post-trade Greeks would be {post_trade_greek_health}")
 
     return round(score, 2), reasons, greek_check
 
@@ -580,13 +653,25 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
             risk = estimate_trade_risk(recommendation)
             rejected = []
 
-            if not risk:
+            if _has_open_recommendation(open_trades, recommendation):
+                rejected.append("Recommendation already has an open paper position")
+                score = 0
+                greek_check = {}
+            elif not risk:
                 rejected.append("No executable risk model")
                 score = 0
                 greek_check = {}
             else:
-                score, rejected, greek_check = _candidate_score(insights, risk, wallet, open_trades)
-                risk["greek_check"] = greek_check
+                sized_risk, greek_check = _fit_risk_to_wallet_and_greeks(insights, risk, wallet)
+
+                if sized_risk:
+                    risk = sized_risk
+                    score, rejected, greek_check = _candidate_score(insights, risk, wallet, open_trades)
+                    risk["greek_check"] = greek_check
+                else:
+                    score = 0
+                    rejected.append("No safe lot size keeps margin and Greeks healthy")
+                    risk["greek_check"] = greek_check
 
             candidates.append(
                 {
@@ -899,8 +984,6 @@ def create_paper_trade(recommendation, risk=None, selection=None, wallet_before=
 
 
 def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
-    open_before = get_open_paper_trades(limit=200)
-    had_open_before = not open_before.empty
     evaluation = evaluate_paper_trade_candidates(
         limit_expiries=limit_expiries,
         persist=persist,
@@ -919,27 +1002,11 @@ def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
         evaluation["action"] = "No trade: margin health below required buffer"
         return evaluation
 
-    open_trades = evaluation.get("open_trades")
-
-    if had_open_before:
-        if open_trades is None or open_trades.empty:
-            evaluation["action"] = "Position updated/closed; no replacement trade opened in the same refresh cycle"
-        else:
-            evaluation["action"] = "Monitoring existing open position(s); no new trade opened while the book has active risk"
-        evaluation["selected"] = None
-        return evaluation
-
     selected = evaluation.get("selected")
 
     if not selected:
         evaluation["action"] = "No trade: no candidate passed safety rules"
         return evaluation
-
-    if open_trades is not None and not open_trades.empty:
-        same_expiry = open_trades[open_trades["expiry_label"] == selected["expiry_label"]]
-        if not same_expiry.empty:
-            evaluation["action"] = "No trade: selected expiry already has an open paper position"
-            return evaluation
 
     trade = create_paper_trade(
         selected["recommendation"],
