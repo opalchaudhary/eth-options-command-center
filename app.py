@@ -245,21 +245,66 @@ st.divider()
 # LIVE STRIKE RECOMMENDATION ENGINE
 # --------------------------------------------------
 
-st.subheader("Live Strike Recommendation Engine")
-st.caption("Best risk-adjusted option selling + hedge opportunities across all expiries.")
+with st.container(key="strike_recommendations"):
+    st.subheader("Strike Recommendations")
+    st.caption("Top defined-risk option selling candidates. Full strategy selection lives in Insights and Paper Trading.")
 
-strike_recommendations = get_strike_recommendations(
-    df,
-    eth_spot_price,
-    top_n=3
-)
+    strike_recommendations = get_strike_recommendations(
+        df,
+        eth_spot_price,
+        top_n=3
+    )
 
-if not strike_recommendations.empty:
-    rec_cols = st.columns(3)
+    if not strike_recommendations.empty:
+        ranked_recommendations = strike_recommendations.reset_index(drop=True).copy()
+        top_setup = ranked_recommendations.iloc[0]
 
-    for index, row in strike_recommendations.reset_index(drop=True).iterrows():
-        with rec_cols[index % 3]:
-            with st.container(border=True):
+        top_cols = st.columns([1.15, 0.85, 0.85, 0.85])
+        top_cols[0].metric("Top Setup", top_setup["side"])
+        top_cols[1].metric("Sell / Hedge", f"{top_setup['sell_strike']:g} / {top_setup['hedge_strike']:g}")
+        top_cols[2].metric("Net Credit", f"{top_setup['net_credit']:.2f}")
+        top_cols[3].metric("Score", f"{top_setup['sell_score']:.2f}")
+
+        display_recommendations = ranked_recommendations[
+            [
+                "side",
+                "expiry",
+                "sell_strike",
+                "hedge_strike",
+                "net_credit",
+                "sell_score",
+                "hedge_score",
+                "delta",
+                "iv",
+                "oi",
+                "reason",
+            ]
+        ].copy()
+        display_recommendations.insert(0, "rank", display_recommendations.index + 1)
+
+        st.dataframe(
+            display_recommendations,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "rank": st.column_config.NumberColumn("Rank", width="small"),
+                "side": st.column_config.TextColumn("Side", width="medium"),
+                "expiry": st.column_config.TextColumn("Expiry", width="medium"),
+                "sell_strike": st.column_config.NumberColumn("Sell", format="%.0f"),
+                "hedge_strike": st.column_config.NumberColumn("Hedge", format="%.0f"),
+                "net_credit": st.column_config.NumberColumn("Credit", format="%.2f"),
+                "sell_score": st.column_config.NumberColumn("Sell Score", format="%.2f"),
+                "hedge_score": st.column_config.NumberColumn("Hedge Score", format="%.2f"),
+                "delta": st.column_config.NumberColumn("Delta", format="%.4f"),
+                "iv": st.column_config.NumberColumn("IV", format="%.2f"),
+                "oi": st.column_config.NumberColumn("OI", format="%.0f"),
+                "reason": st.column_config.TextColumn("Reason", width="large"),
+            },
+        )
+
+        with st.expander("Review recommendation details", expanded=False):
+            for index, row in ranked_recommendations.iterrows():
+                st.divider() if index else None
                 st.markdown(f"### #{index + 1} — {row['side']}")
                 st.caption(f"Expiry: {row['expiry']}")
 
@@ -294,8 +339,8 @@ if not strike_recommendations.empty:
                 st.markdown("#### Reasoning")
                 st.info(row["reason"])
 
-else:
-    st.warning("No strike recommendations available right now.")
+    else:
+        st.info("No strike recommendations available right now.")
 
 
 st.divider()
