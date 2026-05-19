@@ -528,9 +528,14 @@ def render_smc_liquidity_zone_charts(zones_df):
 
     clean_df = clean_df.copy()
     clean_df["mid_price"] = (clean_df["price_low"] + clean_df["price_high"]) / 2
-    clean_df["width"] = (clean_df["price_high"] - clean_df["price_low"]).abs()
+    clean_df["width"] = (clean_df["price_high"] - clean_df["price_low"]).abs().clip(lower=0.35)
+    clean_df["zone_family"] = clean_df["zone_type"].astype(str).str.replace("_", " ").str.title()
+    clean_df["direction_label"] = clean_df.get(
+        "direction",
+        pd.Series("", index=clean_df.index),
+    ).fillna("").astype(str).str.title()
     clean_df["zone_label"] = clean_df.apply(
-        lambda row: f"{row.get('zone_type', 'zone')} {row.get('direction', '')}".strip(),
+        lambda row: f"{row['zone_family']} {row['direction_label']}".strip(),
         axis=1,
     )
     clean_df["strength_display"] = clean_df.get("strength", pd.Series(index=clean_df.index)).fillna(1)
@@ -550,6 +555,8 @@ def render_smc_liquidity_zone_charts(zones_df):
         for zone_type in clean_df["zone_type"]
     ]
 
+    clean_df = clean_df.sort_values(["zone_type", "direction", "mid_price"])
+
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
@@ -558,19 +565,28 @@ def render_smc_liquidity_zone_charts(zones_df):
             base=clean_df["price_low"],
             orientation="h",
             marker_color=colors,
-            text=clean_df["mid_price"].round(2),
+            customdata=clean_df[
+                ["price_low", "price_high", "mid_price", "strength_display"]
+            ],
             hovertemplate=(
                 "Zone: %{y}<br>"
-                "Low: %{base:.2f}<br>"
-                "Width: %{x:.2f}<br>"
-                "Mid: %{text}<extra></extra>"
+                "Low: %{customdata[0]:,.2f}<br>"
+                "High: %{customdata[1]:,.2f}<br>"
+                "Mid: %{customdata[2]:,.2f}<br>"
+                "Strength: %{customdata[3]}<extra></extra>"
             ),
+            opacity=0.82,
             name="Zones",
         )
     )
     fig.update_xaxes(title_text="Price Zone")
     fig.update_yaxes(title_text="SMC / Liquidity Zone", automargin=True)
-    return _base_layout(fig, "Liquidity and SMC Zones", height=520)
+    fig.update_layout(
+        bargap=0.32,
+        showlegend=False,
+        uniformtext=dict(mode="hide", minsize=10),
+    )
+    return _base_layout(fig, "Liquidity and SMC Zones", height=560)
 
 
 def render_liquidation_charts(orderbook_df=None):
@@ -638,3 +654,88 @@ def render_liquidation_charts(orderbook_df=None):
     fig.update_xaxes(title_text="Approx Liquidity Size")
     fig.update_yaxes(title_text="Price")
     return _base_layout(fig, "Liquidation Zone Approximation", height=380)
+
+
+def render_composite_liquidation_heatmap(heatmap_df):
+    required = {
+        "zone_low",
+        "zone_high",
+        "zone_mid",
+        "direction",
+        "liquidation_magnet_score",
+        "confidence_level",
+        "primary_reason",
+    }
+
+    if _empty_guard(heatmap_df, required):
+        return None
+
+    clean_df = _numeric(
+        heatmap_df,
+        [
+            "zone_low",
+            "zone_high",
+            "zone_mid",
+            "liquidation_magnet_score",
+        ],
+    ).dropna(subset=["zone_mid", "liquidation_magnet_score"])
+
+    if clean_df.empty:
+        return None
+
+    clean_df = clean_df.sort_values("zone_mid", ascending=True).copy()
+    clean_df["zone_label"] = clean_df.apply(
+        lambda row: f"{row['zone_low']:,.0f} - {row['zone_high']:,.0f}",
+        axis=1,
+    )
+    clean_df["direction_label"] = clean_df["direction"].map(
+        {
+            "upside_short_liquidation": "Upside short liquidation",
+            "downside_long_liquidation": "Downside long liquidation",
+            "neutral": "Neutral",
+        }
+    ).fillna(clean_df["direction"])
+
+    color_map = {
+        "upside_short_liquidation": "#f04438",
+        "downside_long_liquidation": "#2e90fa",
+        "neutral": "#667085",
+    }
+    colors = [color_map.get(direction, "#667085") for direction in clean_df["direction"]]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=clean_df["liquidation_magnet_score"],
+            y=clean_df["zone_label"],
+            orientation="h",
+            marker=dict(
+                color=clean_df["liquidation_magnet_score"],
+                colorscale=[
+                    [0.0, "#f2f4f7"],
+                    [0.35, "#84caff"],
+                    [0.65, "#fdb022"],
+                    [1.0, "#f04438"],
+                ],
+                line=dict(color=colors, width=2),
+                cmin=0,
+                cmax=100,
+                colorbar=dict(title="Score"),
+            ),
+            text=clean_df["direction_label"],
+            customdata=clean_df[["confidence_level", "primary_reason", "zone_mid"]],
+            hovertemplate=(
+                "Zone: %{y}<br>"
+                "Mid: %{customdata[2]:,.2f}<br>"
+                "Score: %{x:.2f}<br>"
+                "Direction: %{text}<br>"
+                "Confidence: %{customdata[0]}<br>"
+                "%{customdata[1]}<extra></extra>"
+            ),
+            name="Composite liquidation pressure",
+        )
+    )
+
+    fig.update_xaxes(title_text="Liquidation Magnet Score", range=[0, 100])
+    fig.update_yaxes(title_text="Price Zones", automargin=True)
+    return _base_layout(fig, "Composite Liquidation Heatmap", height=620)
