@@ -13,6 +13,16 @@ def safe_float(value):
         return None
 
 
+def iv_to_percent(value):
+    iv = safe_float(value)
+
+    if iv is None:
+        return None
+
+    # Delta returns option IV as a decimal volatility value, e.g. 0.846 = 84.6%.
+    return iv * 100 if abs(iv) <= 10 else iv
+
+
 def get_products():
     url = f"{BASE_URL}/products"
 
@@ -71,7 +81,13 @@ def get_eth_options():
             continue
 
         ticker = ticker_map.get(symbol, {})
+        quotes = ticker.get("quotes") or {}
         greeks = ticker.get("greeks", {})
+        mark_iv = (
+            quotes.get("mark_iv")
+            or ticker.get("mark_iv")
+            or ticker.get("mark_vol")
+        )
 
         rows.append({
             "symbol": symbol,
@@ -81,7 +97,7 @@ def get_eth_options():
             "mark_price": safe_float(ticker.get("mark_price")),
             "oi": safe_float(ticker.get("oi")),
             "volume": safe_float(ticker.get("volume")),
-            "iv": safe_float(ticker.get("mark_iv")),
+            "iv": iv_to_percent(mark_iv),
             "delta": safe_float(greeks.get("delta")),
             "gamma": safe_float(greeks.get("gamma")),
             "theta": safe_float(greeks.get("theta")),

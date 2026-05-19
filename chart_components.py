@@ -265,7 +265,20 @@ def render_iv_vs_rv_chart(expiry_df, ohlcv_df):
         return None
 
     iv = iv_values.mean()
-    rv = returns.std() * (365 * 24 * 12) ** 0.5
+    periods_per_year = 365 * 24 * 12
+
+    for time_col in ["candle_time", "timestamp"]:
+        if time_col not in ohlcv_df.columns:
+            continue
+
+        times = pd.to_datetime(ohlcv_df[time_col], utc=True, errors="coerce").dropna().sort_values()
+        median_interval = times.diff().dropna().median()
+
+        if pd.notna(median_interval) and median_interval.total_seconds() > 0:
+            periods_per_year = (365 * 24 * 60 * 60) / median_interval.total_seconds()
+            break
+
+    rv = returns.std() * (periods_per_year ** 0.5) * 100
     spread = iv - rv
 
     fig = make_subplots(
