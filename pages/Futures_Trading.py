@@ -179,6 +179,8 @@ def _options_summary(options):
         f"Call wall: {_fmt_optional_price(options.get('call_wall'))}",
         f"Put wall: {_fmt_optional_price(options.get('put_wall'))}",
         f"Median IV: {_fmt_optional_num(options.get('median_iv'), 2)}",
+        f"Realized vol: {_fmt_optional_num(options.get('realized_vol_pct'), 2)}",
+        f"IV-RV: {_fmt_optional_num(options.get('iv_rv_spread'), 2)}",
         f"Net delta: {_fmt_optional_num(options.get('net_delta'), 2)}",
         f"Net gamma: {_fmt_optional_num(options.get('net_gamma'), 4)}",
     ]

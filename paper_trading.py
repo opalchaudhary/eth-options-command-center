@@ -679,6 +679,11 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
                     "strategy": insights.get("best_strategy"),
                     "confidence_score": insights.get("confidence_score"),
                     "selection_score": score,
+                    "volatility_regime": insights.get("volatility_regime"),
+                    "median_iv": insights.get("median_iv"),
+                    "realized_vol_pct": insights.get("realized_vol_pct"),
+                    "iv_rv_spread": insights.get("iv_rv_spread"),
+                    "option_selling_environment": insights.get("option_selling_environment"),
                     "reward_risk": (insights.get("strategy_risk_reward") or {}).get("reward_risk"),
                     "effective_return_pct": (insights.get("strategy_risk_reward") or {}).get("effective_return_pct"),
                     "margin_used_usdt": risk.get("margin_used_usdt") if risk else None,
@@ -885,7 +890,8 @@ def _entry_reason(insights, score):
     risk_reward = insights.get("strategy_risk_reward") or {}
     return (
         f"Score {score}; confidence {insights.get('confidence_score')}; "
-        f"RR {risk_reward.get('reward_risk')}; regime {insights.get('market_regime')}."
+        f"RR {risk_reward.get('reward_risk')}; regime {insights.get('market_regime')}; "
+        f"IV-RV {insights.get('iv_rv_spread')}."
     )
 
 

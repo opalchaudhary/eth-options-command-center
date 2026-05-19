@@ -109,6 +109,9 @@ def collect_market_context():
         "expected_move": insights.get("expected_move"),
         "max_pain": insights.get("max_pain"),
         "pcr": insights.get("pcr"),
+        "median_iv": insights.get("median_iv"),
+        "realized_vol_pct": insights.get("realized_vol_pct"),
+        "iv_rv_spread": insights.get("iv_rv_spread"),
         "momentum": insights.get("momentum") or price_action.get("momentum"),
         "trend_context": price_action.get("regime") or insights.get("directional_bias"),
         "support": insights.get("downside_support") or insights.get("put_wall"),
@@ -121,6 +124,8 @@ def collect_market_context():
             "pcr": insights.get("pcr"),
             "max_pain": insights.get("max_pain"),
             "median_iv": insights.get("median_iv"),
+            "realized_vol_pct": insights.get("realized_vol_pct"),
+            "iv_rv_spread": insights.get("iv_rv_spread"),
             "net_delta": insights.get("net_delta"),
             "net_gamma": insights.get("net_gamma"),
             "call_wall": insights.get("call_wall"),
@@ -142,6 +147,7 @@ def _direction_score(context):
     momentum = context.get("momentum")
     regime = context.get("market_regime")
     pcr = safe_float(context.get("pcr"), None)
+    iv_rv_spread = safe_float(context.get("iv_rv_spread"), None)
     mark = safe_float(context.get("mark_price"))
     max_pain = safe_float(context.get("max_pain"), None)
 
@@ -181,6 +187,18 @@ def _direction_score(context):
         elif pcr > 1.25:
             short_score += 8
             notes.append("PCR is put-skewed")
+
+    if iv_rv_spread is not None:
+        if iv_rv_spread <= -5 and momentum in ["Bullish", "Bearish"]:
+            if momentum == "Bullish":
+                long_score += 6
+            else:
+                short_score += 6
+            notes.append("realized volatility is running above IV, supporting directional follow-through")
+        elif iv_rv_spread >= 15:
+            long_score -= 6
+            short_score -= 6
+            notes.append("IV is rich versus RV, reducing futures trend conviction")
 
     if mark and max_pain:
         if mark > max_pain * 1.006:

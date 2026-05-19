@@ -181,6 +181,11 @@ with st.container(key="insights_market_read"):
     market_cols[3].metric("Expected Move", _fmt_money(insights.get("expected_move")))
     market_cols[4].metric("Expiry Bucket", insights["expiry_profile"]["bucket"])
 
+    vol_cols = st.columns(3)
+    vol_cols[0].metric("Median IV", _fmt_price(insights.get("median_iv"), 2))
+    vol_cols[1].metric("Realized Vol", _fmt_price(insights.get("realized_vol_pct"), 2))
+    vol_cols[2].metric("IV - RV", _fmt_price(insights.get("iv_rv_spread"), 2))
+
 st.divider()
 
 with st.container(key="insights_strategy"):

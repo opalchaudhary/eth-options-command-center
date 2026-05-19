@@ -507,13 +507,34 @@ def _expiry_profile(expiry_label):
 
 
 def _realized_volatility_pct(ohlcv_df):
-    if ohlcv_df.empty or len(ohlcv_df) < 20:
+    if ohlcv_df.empty or len(ohlcv_df) < 20 or "close" not in ohlcv_df.columns:
         return None
 
     data = ohlcv_df.tail(60).copy()
-    data["range_pct"] = ((data["high"] - data["low"]) / data["close"]) * 100
+    close = pd.to_numeric(data["close"], errors="coerce").dropna()
 
-    return data["range_pct"].mean()
+    if len(close) < 20:
+        return None
+
+    returns = close.pct_change().dropna()
+
+    if returns.empty:
+        return None
+
+    periods_per_year = 365 * 24 * 12
+
+    for time_col in ["candle_time", "timestamp"]:
+        if time_col not in data.columns:
+            continue
+
+        times = pd.to_datetime(data[time_col], utc=True, errors="coerce").dropna().sort_values()
+        median_interval = times.diff().dropna().median()
+
+        if pd.notna(median_interval) and median_interval.total_seconds() > 0:
+            periods_per_year = (365 * 24 * 60 * 60) / median_interval.total_seconds()
+            break
+
+    return returns.std() * (periods_per_year ** 0.5) * 100
 
 
 def _recent_structure(events_df):
@@ -719,9 +740,9 @@ def _volatility_regime(analytics, chain, realized_vol_pct):
             return "Elevated"
 
     if realized_vol_pct is not None:
-        if realized_vol_pct < 0.35:
+        if realized_vol_pct < 45:
             return "Compressed"
-        if realized_vol_pct > 0.9:
+        if realized_vol_pct > 80:
             return "Elevated"
 
     if median_iv is not None:
@@ -737,6 +758,10 @@ def _volatility_context(analytics, premium, previous_premium, option_df, previou
     context = {
         "regime": _volatility_regime(analytics, chain={}, realized_vol_pct=realized_vol_pct),
         "option_selling_environment": "Neutral",
+        "current_iv": None,
+        "previous_iv": None,
+        "realized_vol_pct": realized_vol_pct,
+        "iv_rv_spread": None,
         "gamma_risk": False,
         "notes": [],
         "warnings": [],
@@ -752,6 +777,14 @@ def _volatility_context(analytics, premium, previous_premium, option_df, previou
         if not previous_option_df.empty and "iv" in previous_option_df
         else None
     )
+    iv_rv_spread = (
+        current_iv - realized_vol_pct
+        if current_iv is not None and realized_vol_pct is not None
+        else None
+    )
+    context["current_iv"] = current_iv
+    context["previous_iv"] = previous_iv
+    context["iv_rv_spread"] = iv_rv_spread
 
     current_gamma = option_df["gamma"].abs().median() if not option_df.empty and "gamma" in option_df else None
     previous_gamma = (
@@ -792,6 +825,10 @@ def _volatility_context(analytics, premium, previous_premium, option_df, previou
             realized_vol_pct,
         )
 
+    if gamma_rising:
+        context["gamma_risk"] = True
+        context["warnings"].append("Short option risk is increasing because gamma is rising sharply.")
+
     if current_theta is not None and current_gamma is not None:
         if current_theta >= 1 and current_gamma <= 0.0025:
             context["option_selling_environment"] = "Favorable"
@@ -799,9 +836,17 @@ def _volatility_context(analytics, premium, previous_premium, option_df, previou
         elif current_gamma > 0.004:
             context["option_selling_environment"] = "Unfavorable"
 
-    if gamma_rising:
-        context["gamma_risk"] = True
-        context["warnings"].append("Short option risk is increasing because gamma is rising sharply.")
+    if iv_rv_spread is not None:
+        if (
+            iv_rv_spread >= 15
+            and not context["gamma_risk"]
+            and context["option_selling_environment"] != "Unfavorable"
+        ):
+            context["option_selling_environment"] = "Favorable"
+            context["notes"].append("IV is materially above realized volatility")
+        elif iv_rv_spread <= -5:
+            context["option_selling_environment"] = "Unfavorable"
+            context["notes"].append("realized volatility is above implied volatility")
 
     return context
 
@@ -2497,6 +2542,8 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
         "net_delta": chain.get("net_delta"),
         "net_gamma": chain.get("net_gamma"),
         "median_iv": chain.get("median_iv"),
+        "realized_vol_pct": volatility_context.get("realized_vol_pct"),
+        "iv_rv_spread": volatility_context.get("iv_rv_spread"),
         "data_flags": data_flags,
         "missing_sources": missing_sources,
         "option_chain_source": option_chain_source,
