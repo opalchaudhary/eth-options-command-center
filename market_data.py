@@ -46,7 +46,7 @@ def fetch_ohlcv(symbol="ETHUSD", resolution="5m", minutes_back=720):
         candles = data.get("result", [])
 
         if not candles:
-            print("No OHLCV candles received from Delta.")
+            print(f"No OHLCV candles received from Delta for {symbol} {resolution}.")
             return pd.DataFrame()
 
         df = pd.DataFrame(candles)

@@ -22,6 +22,11 @@ ALT_FUTURES_SYMBOLS = [
     "SEIUSDT",
 ]
 
+DELTA_SYMBOL_MAP = {
+    symbol: symbol.replace("USDT", "USD")
+    for symbol in ALT_FUTURES_SYMBOLS
+}
+
 
 def safe_float(value, default=None):
     try:
@@ -318,12 +323,17 @@ def _score_candidate(ticker, indicators, orderbook):
     }
 
 
+def exchange_symbol_for(symbol):
+    return DELTA_SYMBOL_MAP.get(symbol, symbol)
+
+
 def scan_symbol(symbol, ticker_map=None, resolution="5m", minutes_back=720):
     ticker_map = ticker_map if ticker_map is not None else fetch_ticker_map()
-    ticker = ticker_map.get(symbol, {})
-    candles = fetch_ohlcv(symbol=symbol, resolution=resolution, minutes_back=minutes_back)
+    exchange_symbol = exchange_symbol_for(symbol)
+    ticker = ticker_map.get(exchange_symbol, ticker_map.get(symbol, {}))
+    candles = fetch_ohlcv(symbol=exchange_symbol, resolution=resolution, minutes_back=minutes_back)
     indicators = _indicators(candles)
-    orderbook = analyze_orderbook(fetch_orderbook(symbol))
+    orderbook = analyze_orderbook(fetch_orderbook(exchange_symbol))
     scored = _score_candidate(ticker, indicators, orderbook)
     market_regime = "Trend" if indicators.get("trend") in ["Bullish", "Bearish"] else "Mixed"
 
@@ -332,6 +342,7 @@ def scan_symbol(symbol, ticker_map=None, resolution="5m", minutes_back=720):
 
     return {
         "symbol": symbol,
+        "exchange_symbol": exchange_symbol,
         "market_regime": market_regime,
         "indicators": indicators,
         "orderbook": orderbook,
