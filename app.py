@@ -2,6 +2,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from futures_trading_runtime import start_streamlit_futures_trading_worker
+from alt_futures_trading_runtime import start_streamlit_alt_futures_worker
 from paper_trading_runtime import start_streamlit_paper_trading_worker
 from orderbook_engine import get_eth_orderbook_insights
 
@@ -30,6 +31,7 @@ st.set_page_config(
 load_css()
 start_streamlit_paper_trading_worker()
 start_streamlit_futures_trading_worker()
+start_streamlit_alt_futures_worker()
 
 st.title("ETH Options Command Center")
 st.caption("Clean ETH options dashboard powered by Delta Exchange + Supabase")
@@ -382,7 +384,7 @@ except Exception as e:
 st.divider()
 
 st.info(
-    "Use the sidebar navigation for Charts, Option Chain, Insights, Paper Trading, and Futures Trading. "
+    "Use the sidebar navigation for Charts, Option Chain, Insights, Paper Trading, Futures Trading, and Alt Futures Scanner. "
     "This home page is intentionally kept clean for quick market reading."
 )
 
