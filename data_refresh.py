@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from ohlcv_job import run_ohlcv_job
 from orderbook_engine import get_eth_orderbook_insights
 from smc_job import run_smc_job
@@ -14,6 +16,7 @@ from storage import (
     save_option_chain_snapshot,
     save_orderbook_insights,
     save_premium_decay_snapshot,
+    delete_from_supabase,
 )
 
 
@@ -184,7 +187,7 @@ def refresh_options_sources(expiry_label=None):
     }
 
 
-def refresh_market_structure_sources():
+def refresh_market_structure_sources(include_smc=True):
     """
     Populate the source tables used by Rule Based Insights:
     - eth_ohlcv via Delta candles
@@ -203,11 +206,54 @@ def refresh_market_structure_sources():
     except Exception as e:
         print("Orderbook refresh failed:", e)
 
-    if ohlcv_saved:
+    if include_smc and ohlcv_saved:
         smc_saved = run_smc_job()
 
     return {
         "orderbook_saved": bool(orderbook_saved),
         "ohlcv_saved": bool(ohlcv_saved),
         "smc_saved": bool(smc_saved),
+    }
+
+
+def refresh_smc_sources():
+    return {
+        "ok": bool(run_smc_job(save_volume=False)),
+    }
+
+
+def refresh_volume_profile_sources():
+    return {
+        "ok": bool(run_smc_job(save_events=False, save_zones=False, save_volume=True)),
+    }
+
+
+def cleanup_retained_snapshots():
+    now = datetime.now(timezone.utc)
+
+    retention_rules = [
+        ("option_chain_snapshots", "snapshot_time", now - timedelta(days=3)),
+        ("premium_decay_snapshots", "snapshot_time", now - timedelta(days=3)),
+        ("analytics_snapshots", "snapshot_time", now - timedelta(days=7)),
+        ("orderbook_insights", "timestamp", now - timedelta(days=2)),
+    ]
+
+    results = []
+
+    for table_name, timestamp_column, cutoff in retention_rules:
+        ok = delete_from_supabase(
+            table_name,
+            {timestamp_column: f"lt.{cutoff.isoformat()}"},
+        )
+        results.append(
+            {
+                "table": table_name,
+                "cutoff": cutoff.isoformat(),
+                "ok": bool(ok),
+            }
+        )
+
+    return {
+        "ok": all(item["ok"] for item in results),
+        "results": results,
     }

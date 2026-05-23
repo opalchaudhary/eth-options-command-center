@@ -3,7 +3,7 @@ from smc_engine import run_smc_analysis
 from storage import save_market_events, save_smc_zones, save_volume_profile
 
 
-def run_smc_job():
+def run_smc_job(save_events=True, save_zones=True, save_volume=True):
     df = get_latest_ohlcv_data(
         symbol="ETHUSD",
         resolution="5m",
@@ -16,9 +16,14 @@ def run_smc_job():
 
     events, zones, volume_profile = run_smc_analysis(df)
 
-    save_market_events(events, symbol="ETHUSD", resolution="5m")
-    save_smc_zones(zones, symbol="ETHUSD", resolution="5m")
-    save_volume_profile(volume_profile, symbol="ETHUSD", resolution="5m")
+    if save_events:
+        save_market_events(events, symbol="ETHUSD", resolution="5m")
+
+    if save_zones:
+        save_smc_zones(zones, symbol="ETHUSD", resolution="5m")
+
+    if save_volume:
+        save_volume_profile(volume_profile, symbol="ETHUSD", resolution="5m")
 
     print("SMC analysis completed.")
     return True

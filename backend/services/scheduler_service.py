@@ -3,63 +3,49 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from backend import config
 from backend.services import futures_trading_service, market_data_service, paper_trading_service
+from data_refresh import cleanup_retained_snapshots, refresh_smc_sources, refresh_volume_profile_sources
 
 
 logger = logging.getLogger(__name__)
 
-MARKET_REFRESH_INTERVAL_SECONDS = 60
-PAPER_TRADING_INTERVAL_SECONDS = 60
-FUTURES_SIMULATION_INTERVAL_SECONDS = 60
+BUSY_REFRESH_ERROR = "Backend is refreshing data. Please retry shortly."
 
 _scheduler = None
-_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="backend-cycle")
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="backend-cycle")
 _state_lock = threading.Lock()
 _job_locks = {
     "market_refresh": threading.Lock(),
+    "option_chain_refresh": threading.Lock(),
     "paper_trading": threading.Lock(),
-    "futures_simulation": threading.Lock(),
+    "futures_trading": threading.Lock(),
+    "smc_refresh": threading.Lock(),
+    "volume_profile_refresh": threading.Lock(),
+    "retention_cleanup": threading.Lock(),
 }
-_job_state = {
-    "market_refresh": {
+
+
+def _initial_job_state():
+    return {
         "status": "not_started",
         "last_started_at": None,
         "last_finished_at": None,
+        "last_success_at": None,
         "last_duration_seconds": None,
         "last_error": None,
         "last_result": None,
         "run_count": 0,
         "skipped_count": 0,
         "timeout_count": 0,
-    },
-    "paper_trading": {
-        "status": "not_started",
-        "last_started_at": None,
-        "last_finished_at": None,
-        "last_duration_seconds": None,
-        "last_error": None,
-        "last_result": None,
-        "run_count": 0,
-        "skipped_count": 0,
-        "timeout_count": 0,
-    },
-    "futures_simulation": {
-        "status": "not_started",
-        "last_started_at": None,
-        "last_finished_at": None,
-        "last_duration_seconds": None,
-        "last_error": None,
-        "last_result": None,
-        "run_count": 0,
-        "skipped_count": 0,
-        "timeout_count": 0,
-    },
-}
+    }
+
+
+_job_state = {job_name: _initial_job_state() for job_name in _job_locks}
 
 
 def _now_iso():
@@ -135,11 +121,13 @@ def _run_with_lock(job_name, callback):
     try:
         result = callback()
         duration = round(time.monotonic() - started, 3)
+        finished_at = _now_iso()
         _increment_state(job_name, "run_count")
         _set_state(
             job_name,
             status="ok",
-            last_finished_at=_now_iso(),
+            last_finished_at=finished_at,
+            last_success_at=finished_at,
             last_duration_seconds=duration,
             last_error=None,
             last_result=_summarize_result(result),
@@ -175,18 +163,46 @@ def _schedule_job(job_name, callback):
 
 
 def _market_refresh_cycle():
-    options = market_data_service.refresh_options()
-    market_sources = market_data_service.refresh_market_sources()
+    market_sources = market_data_service.refresh_market_sources(include_smc=False)
 
     return {
-        "ok": bool(options.get("ok")) and bool(market_sources.get("ohlcv_saved")),
+        "ok": bool(market_sources.get("ohlcv_saved")) or bool(market_sources.get("orderbook_saved")),
+        "refresh": {
+            "market_sources": market_sources,
+        },
+    }
+
+
+def _option_chain_refresh_cycle():
+    options = market_data_service.refresh_options()
+
+    return {
+        "ok": bool(options.get("ok")),
         "row_count": options.get("row_count"),
         "expiry_count": options.get("expiry_count"),
         "refresh": {
             "options": options,
-            "market_sources": market_sources,
         },
     }
+
+
+def _add_interval_job(job_name, callback, seconds, start_immediately=False, start_delay_seconds=None):
+    job_kwargs = {}
+
+    if start_immediately:
+        job_kwargs["next_run_time"] = datetime.now(timezone.utc)
+    elif start_delay_seconds is not None:
+        job_kwargs["next_run_time"] = datetime.now(timezone.utc) + timedelta(seconds=start_delay_seconds)
+
+    _scheduler.add_job(
+        lambda: _schedule_job(job_name, callback),
+        "interval",
+        seconds=seconds,
+        id=job_name,
+        max_instances=1,
+        coalesce=True,
+        **job_kwargs,
+    )
 
 
 def start_scheduler():
@@ -201,35 +217,35 @@ def start_scheduler():
         return _scheduler
 
     _scheduler = BackgroundScheduler(timezone="UTC")
-    _scheduler.add_job(
-        lambda: _schedule_job("market_refresh", _market_refresh_cycle),
-        "interval",
-        seconds=MARKET_REFRESH_INTERVAL_SECONDS,
-        id="market_refresh",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.now(timezone.utc),
+    _add_interval_job("market_refresh", _market_refresh_cycle, config.MARKET_REFRESH_INTERVAL_SECONDS, True)
+    _add_interval_job(
+        "option_chain_refresh",
+        _option_chain_refresh_cycle,
+        config.OPTION_CHAIN_REFRESH_INTERVAL_SECONDS,
+        True,
     )
-    _scheduler.add_job(
-        lambda: _schedule_job("paper_trading", paper_trading_service.run_cycle),
-        "interval",
-        seconds=PAPER_TRADING_INTERVAL_SECONDS,
-        id="paper_trading",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.now(timezone.utc),
+    _add_interval_job(
+        "paper_trading",
+        paper_trading_service.run_cycle,
+        config.PAPER_TRADING_INTERVAL_SECONDS,
+        start_delay_seconds=60,
     )
-    _scheduler.add_job(
-        lambda: _schedule_job("futures_simulation", futures_trading_service.run_cycle),
-        "interval",
-        seconds=FUTURES_SIMULATION_INTERVAL_SECONDS,
-        id="futures_simulation",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.now(timezone.utc),
+    _add_interval_job(
+        "futures_trading",
+        futures_trading_service.run_cycle,
+        config.FUTURES_TRADING_INTERVAL_SECONDS,
+        start_delay_seconds=120,
     )
+    _add_interval_job("smc_refresh", refresh_smc_sources, config.SMC_REFRESH_INTERVAL_SECONDS)
+    _add_interval_job(
+        "volume_profile_refresh",
+        refresh_volume_profile_sources,
+        config.VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS,
+        start_delay_seconds=max(60, config.VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS // 2),
+    )
+    _add_interval_job("retention_cleanup", cleanup_retained_snapshots, config.RETENTION_CLEANUP_INTERVAL_SECONDS)
     _scheduler.start()
-    logger.info("Backend scheduler started with 60s market, paper, and futures jobs.")
+    logger.info("Backend scheduler started with production interval configuration.")
     return _scheduler
 
 
@@ -257,11 +273,41 @@ def scheduler_status():
     with _state_lock:
         job_state = deepcopy(_job_state)
 
+    running_jobs = [
+        job_name
+        for job_name, state in job_state.items()
+        if state.get("status") == "running" or _job_locks[job_name].locked()
+    ]
+    skipped_cycles = {
+        job_name: state.get("skipped_count", 0)
+        for job_name, state in job_state.items()
+    }
+
     return {
         "ok": True,
         "scheduler_enabled": config.BACKEND_SCHEDULER_ENABLED,
         "scheduler_running": bool(_scheduler and _scheduler.running),
         "job_timeout_seconds": config.BACKEND_JOB_TIMEOUT_SECONDS,
+        "last_successful_market_refresh": job_state["market_refresh"].get("last_success_at"),
+        "last_option_chain_refresh": job_state["option_chain_refresh"].get("last_success_at"),
+        "last_paper_trading_cycle": job_state["paper_trading"].get("last_success_at"),
+        "last_futures_cycle": job_state["futures_trading"].get("last_success_at"),
+        "skipped_cycles": skipped_cycles,
+        "running_jobs": running_jobs,
         "jobs": jobs,
         "job_state": job_state,
     }
+
+
+def data_refresh_jobs_running():
+    with _state_lock:
+        return [
+            job_name
+            for job_name in [
+                "market_refresh",
+                "option_chain_refresh",
+                "smc_refresh",
+                "volume_profile_refresh",
+            ]
+            if _job_state.get(job_name, {}).get("status") == "running" or _job_locks[job_name].locked()
+        ]

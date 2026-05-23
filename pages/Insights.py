@@ -19,15 +19,26 @@ st.caption("Single rule-based market read, strategy selection, risk/reward, and 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_available_expiries():
     response = api_get("/insights")
-    return response.get("expiries") or []
+    return {
+        "ok": response.get("ok"),
+        "error": response.get("error"),
+        "expiries": response.get("expiries") or [],
+    }
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_rule_insights(expiry):
     response = api_get("/insights", params={"expiry": expiry})
     if not response.get("ok"):
-        raise RuntimeError(response.get("error") or "Insights unavailable.")
-    return response.get("insights") or {}
+        return {
+            "ok": False,
+            "error": response.get("error") or "Insights unavailable.",
+            "insights": response.get("insights") or {},
+        }
+    return {
+        "ok": True,
+        "insights": response.get("insights") or {},
+    }
 
 
 def _fmt_price(value, digits=2):
@@ -72,102 +83,38 @@ def _show_strategy_legs(legs):
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-def _refresh_options(expiry=None):
-    with st.spinner("Refreshing option chain, analytics, and premium snapshots..."):
-        params = {"refresh": "true"}
-        if expiry:
-            params["expiry"] = expiry
-        result = api_get("/insights", params=params, timeout=120)
-        st.cache_data.clear()
-
-    return result
-
-
-def _refresh_error(result):
-    results = result.get("results") or []
-
-    for item in results:
-        if item.get("error"):
-            return item.get("error")
-
-    sample = result.get("available_expiry_sample")
-    if sample:
-        return "Available Delta expiries include: " + ", ".join(sample)
-
-    return "No detailed refresh error was returned."
-
-
-expiry_list = _cached_available_expiries()
+expiry_response = _cached_available_expiries()
+expiry_list = expiry_response.get("expiries") or []
 st.sidebar.caption(f"Backend: {backend_url()}")
 
-if st.sidebar.button("Refresh Options Chain"):
-    refresh_result = _refresh_options()
+if not expiry_response.get("ok") and expiry_response.get("error"):
+    st.sidebar.warning(expiry_response.get("error"))
 
-    if refresh_result.get("ok"):
-        st.sidebar.success(
-            f"Options refreshed: {refresh_result.get('expiry_count')} expiries, "
-            f"{refresh_result.get('row_count')} rows"
-        )
-        st.rerun()
-    else:
-        st.sidebar.warning("Options refresh did not save a complete snapshot")
-        st.sidebar.caption(_refresh_error(refresh_result))
+if st.sidebar.button("Reload Saved Insights"):
+    st.cache_data.clear()
+    st.rerun()
 
 if not expiry_list:
-    st.info("No option snapshots found yet. Pulling fresh Delta option data for Insights...")
-    refresh_result = _refresh_options()
-
-    if refresh_result.get("ok"):
-        st.rerun()
-
-    st.warning("No analytics snapshots found in Supabase yet, and automatic options refresh failed.")
+    st.warning(
+        "No saved Insights snapshot is available yet. The backend scheduler refreshes Delta data in the background; please retry shortly."
+    )
     st.stop()
 
 selected_expiry = st.sidebar.selectbox("Select Expiry", expiry_list, index=0, format_func=_fmt_ist)
 
-if st.sidebar.button("Refresh Selected Expiry"):
-    refresh_result = _refresh_options(selected_expiry)
 
-    if refresh_result.get("ok"):
-        st.sidebar.success(
-            f"{_fmt_ist(selected_expiry)} refreshed with {refresh_result.get('row_count')} option rows"
-        )
-        st.rerun()
-    else:
-        st.sidebar.warning("Selected expiry refresh failed")
-        st.sidebar.caption(_refresh_error(refresh_result))
+with st.spinner("Loading saved insights..."):
+    insights_response = _cached_rule_insights(selected_expiry)
 
-if st.sidebar.button("Refresh Market Sources"):
-    with st.spinner("Refreshing orderbook, OHLCV, SMC zones, events, and volume profile..."):
-        refresh_result = api_get(
-            "/insights",
-            params={"expiry": selected_expiry, "refresh": "true"},
-            timeout=120,
-        )
+if not insights_response.get("ok"):
+    st.warning(insights_response.get("error") or "Saved insights are not available yet.")
+    st.stop()
 
-    if refresh_result.get("ok"):
-        st.cache_data.clear()
-        st.sidebar.success("Market sources refreshed")
-        st.rerun()
-    else:
-        st.sidebar.warning(refresh_result.get("error") or "Market source refresh failed")
-
-
-with st.spinner("Building insights..."):
-    insights = _cached_rule_insights(selected_expiry)
+insights = insights_response.get("insights") or {}
 
 missing_option_chain = not insights.get("data_flags", {}).get("option_chain")
-auto_refresh_key = f"auto_option_refresh_{selected_expiry}"
-
-if missing_option_chain and not st.session_state.get(auto_refresh_key):
-    st.session_state[auto_refresh_key] = True
-    st.warning("Option-chain snapshot is missing for this expiry. Refreshing it now...")
-    refresh_result = _refresh_options(selected_expiry)
-
-    if refresh_result.get("ok"):
-        st.rerun()
-
-    st.warning("Option-chain refresh failed; recommendation quality may be limited.")
+if missing_option_chain:
+    st.warning("Saved option-chain snapshot is missing for this expiry. The background scheduler will refresh it shortly.")
 
 with st.container(key="insights_market_read"):
     st.subheader(f"Market Read - {_fmt_ist(selected_expiry)}")

@@ -55,9 +55,13 @@ FastAPI starts APScheduler automatically when the API process starts.
 
 Default background jobs:
 
-- market refresh every 60 seconds
-- paper trading cycle every 60 seconds
-- futures simulation cycle every 60 seconds
+- market refresh every 300 seconds
+- option chain refresh every 300 seconds
+- paper trading cycle every 300 seconds
+- futures simulation cycle every 300 seconds
+- SMC refresh every 900 seconds
+- volume profile refresh every 900 seconds
+- retention cleanup every 3600 seconds
 
 Each job has an execution lock, APScheduler `max_instances=1`, coalescing, timeout status tracking, and structured logs. Check scheduler state here:
 
@@ -70,7 +74,15 @@ Scheduler controls:
 ```bash
 BACKEND_SCHEDULER_ENABLED=true
 BACKEND_JOB_TIMEOUT_SECONDS=50
+MARKET_REFRESH_INTERVAL_SECONDS=300
+PAPER_TRADING_INTERVAL_SECONDS=300
+FUTURES_TRADING_INTERVAL_SECONDS=300
+OPTION_CHAIN_REFRESH_INTERVAL_SECONDS=300
+SMC_REFRESH_INTERVAL_SECONDS=900
+VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS=900
 ```
+
+Insights is cache-only from Supabase/FastAPI. Streamlit does not trigger a synchronous Delta refresh from `/insights`.
 
 ## Streamlit Connection
 

@@ -2195,7 +2195,12 @@ def _select_best_strategy_package(
     return (*best["package"], evaluated, notes)
 
 
-def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION):
+def build_rule_based_insights(
+    expiry_label,
+    symbol=DEFAULT_SYMBOL,
+    resolution=DEFAULT_RESOLUTION,
+    allow_live_delta_fallback=True,
+):
     generated_at = _utc_now().isoformat()
     expiry_profile = _expiry_profile(expiry_label)
     analytics = _latest_analytics(expiry_label)
@@ -2210,7 +2215,7 @@ def build_rule_based_insights(expiry_label, symbol=DEFAULT_SYMBOL, resolution=DE
     live_option_context = {}
     option_chain_source = "supabase"
 
-    if option_df.empty:
+    if option_df.empty and allow_live_delta_fallback:
         live_option_context = _live_option_context(expiry_label)
 
         if not live_option_context.get("option_df", pd.DataFrame()).empty:

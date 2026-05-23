@@ -78,6 +78,42 @@ def post_to_supabase(table_name, payload):
         return False
 
 
+def delete_from_supabase(table_name, params, timeout=15):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Supabase not configured.")
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    try:
+        response = requests.delete(
+            url,
+            headers=HEADERS,
+            params=params,
+            timeout=timeout,
+        )
+
+        if response.status_code in [200, 202, 204]:
+            return True
+
+        print(f"Supabase delete failed: {table_name}")
+        print("Status:", response.status_code)
+        print("Response:", response.text)
+        return False
+
+    except requests.exceptions.Timeout:
+        print(f"Supabase timeout while deleting from {table_name}")
+        return False
+
+    except requests.exceptions.RequestException as e:
+        print(f"Supabase request error deleting from {table_name}:", str(e))
+        return False
+
+    except Exception as e:
+        print(f"Unexpected Supabase delete error in {table_name}:", str(e))
+        return False
+
+
 def _json_safe_value(value):
     if value is None:
         return None
