@@ -13,8 +13,8 @@ from book_optimizer import (
     save_book_optimization_snapshot,
     suggest_book_adjustments,
 )
-from delta_api import get_eth_options, get_eth_spot_price
-from rule_insights import build_rule_based_insights, get_available_expiries
+from api_client import api_get, backend_url
+from rule_insights import get_available_expiries
 from ui_styles import load_css
 
 
@@ -27,6 +27,7 @@ load_css()
 
 st.title("Book Optimization")
 st.caption("Greek-aware optimizer for your current ETH options and futures book.")
+st.sidebar.caption(f"Backend: {backend_url()}")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -37,7 +38,8 @@ def _cached_expiries():
         return expiries, "analytics_snapshots"
 
     try:
-        live_options = get_eth_options()
+        live_response = api_get("/option-chain")
+        live_options = pd.DataFrame(live_response.get("rows") or [])
         live_expiries = sorted(live_options["expiry"].dropna().unique()) if not live_options.empty else []
     except Exception:
         live_expiries = []
@@ -53,7 +55,8 @@ def _cached_expiries():
 def _cached_insights(expiry):
     if not expiry:
         return {}
-    return build_rule_based_insights(expiry)
+    response = api_get("/insights", params={"expiry": expiry})
+    return response.get("insights") or {}
 
 
 @st.cache_data(ttl=45, show_spinner=False)
@@ -249,7 +252,7 @@ with st.sidebar:
 
 spot_price = None
 try:
-    spot_data = get_eth_spot_price()
+    spot_data = api_get("/market/eth")
     spot_price = spot_data.get("spot_price") or spot_data.get("mark_price")
 except Exception:
     spot_data = {}

@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from delta_api import get_eth_options, get_eth_spot_price
+from api_client import api_get, backend_url
 from ui_styles import load_css
 
 
@@ -15,8 +15,14 @@ load_css()
 st.title("Option Chain")
 st.caption("Live ETH option-chain table with expiry and strike filters.")
 
-df = get_eth_options()
-eth_price_data = get_eth_spot_price()
+try:
+    option_chain_response = api_get("/option-chain")
+    eth_price_data = api_get("/market/eth")
+except Exception as exc:
+    st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")
+    st.stop()
+
+df = pd.DataFrame(option_chain_response.get("rows") or [])
 
 if df.empty:
     st.warning("No ETH option data found.")

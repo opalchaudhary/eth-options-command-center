@@ -2,8 +2,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-import futures_engine
-from futures_trading_runtime import start_streamlit_futures_trading_worker
+from api_client import api_get, backend_url
 from ui_styles import load_css
 from validation_config import INR_PER_USDT, ETH_LOT_SIZE
 
@@ -14,7 +13,6 @@ st.set_page_config(
 )
 
 load_css()
-start_streamlit_futures_trading_worker()
 st_autorefresh(interval=60 * 1000, key="futures_trading_refresh")
 
 st.title("Futures Trading")
@@ -192,20 +190,25 @@ def _options_summary(options):
     return _join_parts(parts)
 
 
-st.sidebar.caption("Futures worker runs automatically while the Streamlit process is awake.")
+st.sidebar.caption(f"Backend: {backend_url()}")
 st.sidebar.metric("Contract Size", f"{ETH_LOT_SIZE} ETH")
 st.sidebar.metric("USDT/INR", f"Rs {INR_PER_USDT}")
 
 with st.spinner("Loading futures paper trading book..."):
-    dashboard = futures_engine.futures_dashboard_data(run_cycle=False)
+    try:
+        status_response = api_get("/futures-trading/status")
+        dashboard = status_response.get("dashboard") or {}
+    except Exception as exc:
+        st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")
+        st.stop()
 
 wallet = dashboard.get("wallet") or {}
 context = dashboard.get("context") or {}
 decision = dashboard.get("decision") or {}
-open_positions = dashboard.get("open_positions")
-closed_trades = dashboard.get("closed_trades")
-journal = dashboard.get("journal")
-training_dataset = dashboard.get("training_dataset")
+open_positions = pd.DataFrame(dashboard.get("open_positions") or [])
+closed_trades = pd.DataFrame(dashboard.get("closed_trades") or [])
+journal = pd.DataFrame(dashboard.get("journal") or [])
+training_dataset = pd.DataFrame(dashboard.get("training_dataset") or [])
 engine_status = dashboard.get("engine_status") or {}
 
 

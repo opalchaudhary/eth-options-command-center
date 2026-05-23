@@ -29,7 +29,7 @@ from database_reader import (
     get_smc_zones,
     get_volume_profile,
 )
-from delta_api import get_eth_options, get_eth_spot_price
+from api_client import api_get, backend_url
 from liquidation_engine import build_composite_liquidation_heatmap
 from ui_styles import load_css
 
@@ -44,7 +44,9 @@ load_css()
 
 @st.cache_data(ttl=60)
 def load_options_data():
-    return get_eth_options(), get_eth_spot_price()
+    option_chain = api_get("/option-chain")
+    market = api_get("/market/eth")
+    return pd.DataFrame(option_chain.get("rows") or []), market
 
 
 @st.cache_data(ttl=60)
@@ -277,7 +279,11 @@ def top_zone_warning_cards(heatmap_df):
 st.title("Charts")
 st.caption("Unified ETH options, volatility, market structure, expiry, and liquidation dashboard.")
 
-df, eth_price_data = load_options_data()
+try:
+    df, eth_price_data = load_options_data()
+except Exception as exc:
+    st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")
+    st.stop()
 
 if df.empty:
     st.warning("No ETH option data found.")

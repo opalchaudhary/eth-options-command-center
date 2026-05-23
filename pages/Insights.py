@@ -1,8 +1,7 @@
 import pandas as pd
 import streamlit as st
 
-from data_refresh import refresh_market_structure_sources, refresh_options_sources
-from rule_insights import build_rule_based_insights, get_available_expiries
+from api_client import api_get, backend_url
 from ui_styles import load_css
 
 
@@ -19,12 +18,16 @@ st.caption("Single rule-based market read, strategy selection, risk/reward, and 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_available_expiries():
-    return get_available_expiries()
+    response = api_get("/insights")
+    return response.get("expiries") or []
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_rule_insights(expiry):
-    return build_rule_based_insights(expiry)
+    response = api_get("/insights", params={"expiry": expiry})
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error") or "Insights unavailable.")
+    return response.get("insights") or {}
 
 
 def _fmt_price(value, digits=2):
@@ -71,7 +74,10 @@ def _show_strategy_legs(legs):
 
 def _refresh_options(expiry=None):
     with st.spinner("Refreshing option chain, analytics, and premium snapshots..."):
-        result = refresh_options_sources(expiry_label=expiry)
+        params = {"refresh": "true"}
+        if expiry:
+            params["expiry"] = expiry
+        result = api_get("/insights", params=params, timeout=120)
         st.cache_data.clear()
 
     return result
@@ -92,6 +98,7 @@ def _refresh_error(result):
 
 
 expiry_list = _cached_available_expiries()
+st.sidebar.caption(f"Backend: {backend_url()}")
 
 if st.sidebar.button("Refresh Options Chain"):
     refresh_result = _refresh_options()
@@ -132,20 +139,18 @@ if st.sidebar.button("Refresh Selected Expiry"):
 
 if st.sidebar.button("Refresh Market Sources"):
     with st.spinner("Refreshing orderbook, OHLCV, SMC zones, events, and volume profile..."):
-        refresh_result = refresh_market_structure_sources()
+        refresh_result = api_get(
+            "/insights",
+            params={"expiry": selected_expiry, "refresh": "true"},
+            timeout=120,
+        )
 
-    if (
-        refresh_result.get("orderbook_saved")
-        and refresh_result.get("ohlcv_saved")
-        and refresh_result.get("smc_saved")
-    ):
+    if refresh_result.get("ok"):
         st.cache_data.clear()
         st.sidebar.success("Market sources refreshed")
         st.rerun()
-    elif refresh_result.get("ohlcv_saved"):
-        st.sidebar.warning("OHLCV saved, but one or more downstream sources did not refresh")
     else:
-        st.sidebar.warning("OHLCV refresh failed")
+        st.sidebar.warning(refresh_result.get("error") or "Market source refresh failed")
 
 
 with st.spinner("Building insights..."):

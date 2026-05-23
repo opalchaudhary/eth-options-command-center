@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 .env
+backend/.env
 .streamlit/
-.env
+logs/*
+!logs/.gitkeep

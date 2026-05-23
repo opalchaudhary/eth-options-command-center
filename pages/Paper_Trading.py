@@ -2,8 +2,8 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from api_client import api_get, backend_url
 import paper_trading as paper_engine
-from paper_trading_runtime import start_streamlit_paper_trading_worker
 from ui_styles import load_css
 
 
@@ -12,7 +12,6 @@ PAPER_WALLET_CAPITAL_INR = paper_engine.PAPER_WALLET_CAPITAL_INR
 PAPER_WALLET_CAPITAL_USDT = paper_engine.PAPER_WALLET_CAPITAL_USDT
 ETH_LOT_SIZE = paper_engine.ETH_LOT_SIZE
 classify_greek_health = paper_engine.classify_greek_health
-paper_trading_dashboard_data = paper_engine.paper_trading_dashboard_data
 
 
 st.set_page_config(
@@ -21,7 +20,6 @@ st.set_page_config(
 )
 
 load_css()
-start_streamlit_paper_trading_worker()
 st_autorefresh(interval=60 * 1000, key="paper_trading_observer_refresh")
 
 st.title("Paper Trading")
@@ -223,17 +221,22 @@ def _position_leg_rows(trade):
 
 
 with st.spinner("Loading paper trading book..."):
-    dashboard = paper_trading_dashboard_data()
+    try:
+        status_response = api_get("/paper-trading/status")
+        dashboard = status_response.get("dashboard") or {}
+    except Exception as exc:
+        st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")
+        st.stop()
 
 wallet = dashboard["wallet"]
-open_trades = dashboard["open_trades"]
-closed_trades = dashboard["closed_trades"]
+open_trades = pd.DataFrame(dashboard.get("open_trades") or [])
+closed_trades = pd.DataFrame(dashboard.get("closed_trades") or [])
 candidates = dashboard.get("candidates") or []
 selected = dashboard.get("selected")
 engine_status = dashboard.get("engine_status") or {}
 engine_display = _engine_display(engine_status)
 
-st.sidebar.caption("Paper trading engine runs in the Streamlit Cloud process while the app is awake.")
+st.sidebar.caption(f"Backend: {backend_url()}")
 st.sidebar.metric("Engine", engine_display)
 st.sidebar.metric("Cycle Interval", _engine_interval_display(engine_status))
 st.sidebar.metric("Expiries Evaluated", _engine_limit_display(engine_status))

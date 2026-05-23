@@ -1,12 +1,7 @@
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from futures_trading_runtime import start_streamlit_futures_trading_worker
-from alt_futures_trading_runtime import start_streamlit_alt_futures_worker
-from paper_trading_runtime import start_streamlit_paper_trading_worker
-from orderbook_engine import get_eth_orderbook_insights
-
-from delta_api import get_eth_options, get_eth_spot_price
+import pandas as pd
 
 from analytics import (
     basic_expiry_analytics,
@@ -14,12 +9,7 @@ from analytics import (
     calculate_atm_and_expected_move
 )
 
-from storage import (
-    save_analytics_snapshot,
-    save_premium_decay_snapshot,
-    save_option_chain_snapshot,
-    save_orderbook_insights
-)
+from api_client import api_get, backend_url
 from ui_styles import load_css
 
 
@@ -29,22 +19,25 @@ st.set_page_config(
 )
 
 load_css()
-start_streamlit_paper_trading_worker()
-start_streamlit_futures_trading_worker()
-start_streamlit_alt_futures_worker()
 
 st.title("ETH Options Command Center")
-st.caption("Clean ETH options dashboard powered by Delta Exchange + Supabase")
+st.caption("Clean ETH options dashboard powered by Delta Exchange -> FastAPI -> Supabase")
 
 st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 
 
 # --------------------------------------------------
-# FETCH OPTIONS + SPOT DATA
+# FETCH OPTIONS + SPOT DATA FROM FASTAPI
 # --------------------------------------------------
 
-df = get_eth_options()
-eth_price_data = get_eth_spot_price()
+try:
+    option_chain_response = api_get("/option-chain")
+    eth_price_data = api_get("/market/eth")
+except Exception as exc:
+    st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")
+    st.stop()
+
+df = pd.DataFrame(option_chain_response.get("rows") or [])
 
 if df.empty:
     st.warning("No ETH option data found.")
@@ -66,6 +59,7 @@ selected_expiry = st.sidebar.selectbox(
 )
 
 st.sidebar.caption("Auto-refresh: every 60 seconds")
+st.sidebar.caption(f"Backend: {backend_url()}")
 
 
 # --------------------------------------------------
@@ -90,43 +84,6 @@ if eth_spot_price and expected_move:
     expected_move_pct = (expected_move / eth_spot_price) * 100
     expected_move_upper = eth_spot_price + expected_move
     expected_move_lower = eth_spot_price - expected_move
-
-
-# --------------------------------------------------
-# SAVE OPTIONS SNAPSHOTS
-# --------------------------------------------------
-
-snapshot_analytics = {
-    "spot_price": eth_spot_price,
-    "max_pain": max_pain,
-    "atm_strike": atm_strike,
-    "pcr": analytics.get("pcr"),
-    "atm_straddle_price": expected_move,
-    "expected_move_pct": expected_move_pct,
-    "expected_move_upper": expected_move_upper,
-    "expected_move_lower": expected_move_lower
-}
-
-try:
-    save_analytics_snapshot(snapshot_analytics, selected_expiry)
-
-    save_premium_decay_snapshot(
-        selected_expiry,
-        atm_strike,
-        atm_ce_price,
-        atm_pe_price,
-        expected_move
-    )
-
-    save_option_chain_snapshot(
-        expiry_df,
-        selected_expiry
-    )
-
-    st.sidebar.success("Options database updated")
-
-except Exception as e:
-    st.sidebar.warning(f"Supabase options snapshot not saved: {e}")
 
 
 # --------------------------------------------------
@@ -250,22 +207,10 @@ st.subheader("ETH Perpetual Order Book Intelligence")
 st.caption("Execution confirmation layer for strike selection, liquidity walls, spread quality, and trap risk.")
 
 try:
-    orderbook_data = get_eth_orderbook_insights(depth=20)
+    orderbook = eth_price_data.get("orderbook") or {}
+    orderbook_insights = eth_price_data.get("orderbook_insights") or {}
+    text_insights = eth_price_data.get("text_insights") or []
 
-    orderbook = orderbook_data["orderbook"]
-    orderbook_insights = orderbook_data["insights"]
-    text_insights = orderbook_data["text_insights"]
-
-    try:
-        saved = save_orderbook_insights(orderbook_insights)
-
-        if saved:
-            st.sidebar.success("Order book database updated")
-        else:
-            st.sidebar.warning("Order book database NOT saved")
-
-    except Exception as e:
-        st.sidebar.warning(f"Order book snapshot not saved: {e}")
     if orderbook_insights.get("status") == "ok":
 
         ob1, ob2, ob3, ob4 = st.columns(4)
@@ -354,9 +299,10 @@ try:
 
             with bid_col:
                 st.markdown("#### Top Bids")
-                if not orderbook["bids"].empty:
+                bids_df = pd.DataFrame(orderbook.get("bids") or [])
+                if not bids_df.empty:
                     st.dataframe(
-                        orderbook["bids"][["price", "size"]].head(10),
+                        bids_df[["price", "size"]].head(10),
                         use_container_width=True,
                         hide_index=True
                     )
@@ -365,9 +311,10 @@ try:
 
             with ask_col:
                 st.markdown("#### Top Asks")
-                if not orderbook["asks"].empty:
+                asks_df = pd.DataFrame(orderbook.get("asks") or [])
+                if not asks_df.empty:
                     st.dataframe(
-                        orderbook["asks"][["price", "size"]].head(10),
+                        asks_df[["price", "size"]].head(10),
                         use_container_width=True,
                         hide_index=True
                     )

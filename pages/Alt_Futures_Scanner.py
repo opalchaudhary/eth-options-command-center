@@ -5,7 +5,6 @@ from streamlit_autorefresh import st_autorefresh
 import alt_futures_engine
 from alt_futures_risk import DEFAULT_RISK_PCT, MAX_RISK_PCT
 from alt_futures_scanner import ALT_FUTURES_SYMBOLS
-from alt_futures_trading_runtime import start_streamlit_alt_futures_worker
 from ui_styles import load_css
 from validation_config import INR_PER_USDT
 
@@ -16,7 +15,6 @@ st.set_page_config(
 )
 
 load_css()
-start_streamlit_alt_futures_worker()
 st_autorefresh(interval=60 * 1000, key="alt_futures_scanner_refresh")
 
 st.title("Alt Futures Scanner")
@@ -122,7 +120,7 @@ def _trade_rows(trades, active=False):
     return rows
 
 
-st.sidebar.caption("Alt futures worker runs automatically while the Streamlit process is awake.")
+st.sidebar.caption("Read-only scanner state. Run execution cycles from the backend process.")
 st.sidebar.metric("Wallet", "Rs 10,000")
 st.sidebar.metric("USDT/INR", f"Rs {INR_PER_USDT}")
 st.sidebar.metric("Universe", f"{len(ALT_FUTURES_SYMBOLS)} symbols")
