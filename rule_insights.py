@@ -1,3 +1,4 @@
+import os
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -30,6 +31,23 @@ DATA_SOURCE_LABELS = {
     "smc_zones": "eth_smc_zones",
     "volume_profile": "eth_volume_profile",
 }
+
+
+def _int_env(key, default):
+    try:
+        return int(os.getenv(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _history_limit(limit, default=None, hard_max=None):
+    default = default or _int_env("SUPABASE_HISTORY_READ_LIMIT", 150)
+    hard_max = hard_max or max(default, 500)
+    try:
+        requested = int(limit or default)
+    except (TypeError, ValueError):
+        requested = default
+    return max(1, min(requested, hard_max))
 
 
 def _safe_float(value, default=None):
@@ -89,7 +107,8 @@ def _read_table(table_name, params):
         return pd.DataFrame()
 
 
-def get_available_expiries(limit=500):
+def get_available_expiries(limit=100):
+    limit = _history_limit(limit, default=100, hard_max=250)
     df = _read_table(
         "analytics_snapshots",
         {
@@ -111,7 +130,8 @@ def get_available_expiries(limit=500):
     return expiries
 
 
-def _latest_rows_for_expiry(table_name, expiry_label, order_col="snapshot_time", limit=1000):
+def _latest_rows_for_expiry(table_name, expiry_label, order_col="snapshot_time", limit=150):
+    limit = _history_limit(limit)
     select_columns = {
         "analytics_snapshots": "snapshot_time,expiry_label,spot_price,max_pain,atm_strike,pcr,atm_straddle_price,expected_move_pct,expected_move_upper,expected_move_lower",
         "premium_decay_snapshots": "snapshot_time,expiry_label,atm_strike,atm_ce_price,atm_pe_price,atm_straddle_price",
@@ -138,8 +158,9 @@ def _latest_snapshot_pair_for_expiry(
     table_name,
     expiry_label,
     order_col="snapshot_time",
-    limit=2500,
+    limit=600,
 ):
+    limit = _history_limit(limit, default=600, hard_max=1200)
     select_columns = {
         "option_chain_snapshots": "snapshot_time,expiry_label,expiry_date,strike,option_type,mark_price,oi,volume,iv,delta,gamma,theta,vega",
         "premium_decay_snapshots": "snapshot_time,expiry_label,atm_strike,atm_ce_price,atm_pe_price,atm_straddle_price",

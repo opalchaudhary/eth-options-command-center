@@ -134,8 +134,8 @@ def get_insights(expiry=None, compact=True, include_raw=False):
     }
 
 
-def get_charts(expiry=None, symbol="ETHUSD", limit=300):
-    limit = min(int(limit or 300), 500)
+def get_charts(expiry=None, symbol="ETHUSD", limit=150):
+    limit = min(int(limit or 150), 300)
     return {
         "ok": True,
         "analytics": to_jsonable(database_reader.get_analytics_snapshots(expiry_label=expiry, limit=limit)),

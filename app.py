@@ -23,7 +23,7 @@ load_css()
 st.title("ETH Options Command Center")
 st.caption("Clean ETH options dashboard powered by Delta Exchange -> FastAPI -> Supabase")
 
-st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
+st_autorefresh(interval=5 * 60 * 1000, key="eth_options_refresh")
 
 
 # --------------------------------------------------
@@ -58,7 +58,7 @@ selected_expiry = st.sidebar.selectbox(
     expiry_list
 )
 
-st.sidebar.caption("Auto-refresh: every 60 seconds")
+st.sidebar.caption("Auto-refresh: every 5 minutes")
 st.sidebar.caption(f"Backend: {backend_url()}")
 
 

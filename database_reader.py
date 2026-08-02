@@ -34,6 +34,23 @@ SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_KEY = get_secret("SUPABASE_KEY")
 
 
+def _int_env(key, default):
+    try:
+        return int(os.getenv(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_history_limit(limit, default=None, hard_max=None):
+    default = default or _int_env("SUPABASE_HISTORY_READ_LIMIT", 150)
+    hard_max = hard_max or default
+    try:
+        requested = int(limit or default)
+    except (TypeError, ValueError):
+        requested = default
+    return max(1, min(requested, hard_max))
+
+
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -274,8 +291,8 @@ def read_supabase_table(table_name, params=None, timeout=15):
         return pd.DataFrame()
 
 
-def get_analytics_snapshots(expiry_label=None, limit=500):
-    limit = min(int(limit or 500), 500)
+def get_analytics_snapshots(expiry_label=None, limit=150):
+    limit = _bounded_history_limit(limit)
     params = {
         "select": "snapshot_time,expiry_label,spot_price,max_pain,atm_strike,pcr,atm_straddle_price,expected_move_pct,expected_move_upper,expected_move_lower",
         "order": "snapshot_time.asc",
@@ -311,8 +328,8 @@ def get_analytics_snapshots(expiry_label=None, limit=500):
     return df.sort_values("snapshot_time").reset_index(drop=True)
 
 
-def get_premium_decay_snapshots(expiry_label=None, limit=500):
-    limit = min(int(limit or 500), 500)
+def get_premium_decay_snapshots(expiry_label=None, limit=150):
+    limit = _bounded_history_limit(limit)
     params = {
         "select": "snapshot_time,expiry_label,atm_strike,atm_ce_price,atm_pe_price,atm_straddle_price",
         "order": "snapshot_time.asc",
@@ -344,8 +361,8 @@ def get_premium_decay_snapshots(expiry_label=None, limit=500):
     return df.sort_values("snapshot_time").reset_index(drop=True)
 
 
-def get_option_chain_snapshots(expiry_label=None, limit=2000):
-    limit = min(int(limit or 500), 500)
+def get_option_chain_snapshots(expiry_label=None, limit=150):
+    limit = _bounded_history_limit(limit)
     params = {
         "select": "snapshot_time,expiry_label,expiry_date,strike,option_type,mark_price,oi,volume,iv,delta,gamma,theta,vega",
         "order": "snapshot_time.asc",
@@ -382,8 +399,8 @@ def get_option_chain_snapshots(expiry_label=None, limit=2000):
     return df.sort_values("snapshot_time").reset_index(drop=True)
 
 
-def get_orderbook_insight_snapshots(symbol="ETHUSD", limit=500):
-    limit = min(int(limit or 500), 500)
+def get_orderbook_insight_snapshots(symbol="ETHUSD", limit=150):
+    limit = _bounded_history_limit(limit)
     params = {
         "select": "timestamp,symbol,eth_price,best_bid,best_ask,spread,spread_pct,bid_depth,ask_depth,imbalance_ratio,bias,nearest_bid_wall_price,nearest_bid_wall_size,nearest_ask_wall_price,nearest_ask_wall_size,trap_risk,execution_signal",
         "symbol": f"eq.{symbol}",

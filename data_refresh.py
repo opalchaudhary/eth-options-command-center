@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 from ohlcv_job import run_ohlcv_job
@@ -18,6 +19,13 @@ from storage import (
     save_premium_decay_snapshot,
     delete_from_supabase,
 )
+
+
+def _int_env(key, default):
+    try:
+        return int(os.getenv(key, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _expiry_key(expiry_label):
@@ -135,7 +143,8 @@ def refresh_options_sources(expiry_label=None):
         matched_expiry = _matching_expiry_label(available_expiries, expiry_label)
         expiries = [matched_expiry] if matched_expiry else []
     else:
-        expiries = available_expiries
+        max_expiries = max(1, _int_env("OPTION_CHAIN_REFRESH_MAX_EXPIRIES", 2))
+        expiries = available_expiries[:max_expiries]
 
     if requested_expiry:
         results = [
@@ -232,10 +241,10 @@ def cleanup_retained_snapshots():
     now = datetime.now(timezone.utc)
 
     retention_rules = [
-        ("option_chain_snapshots", "snapshot_time", now - timedelta(days=3)),
-        ("premium_decay_snapshots", "snapshot_time", now - timedelta(days=3)),
-        ("analytics_snapshots", "snapshot_time", now - timedelta(days=7)),
-        ("orderbook_insights", "timestamp", now - timedelta(days=2)),
+        ("option_chain_snapshots", "snapshot_time", now - timedelta(hours=6)),
+        ("premium_decay_snapshots", "snapshot_time", now - timedelta(hours=12)),
+        ("analytics_snapshots", "snapshot_time", now - timedelta(days=2)),
+        ("orderbook_insights", "timestamp", now - timedelta(hours=12)),
     ]
 
     results = []

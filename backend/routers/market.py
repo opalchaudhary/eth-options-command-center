@@ -64,7 +64,7 @@ def insights(
 def charts(
     expiry: str | None = Query(default=None),
     symbol: str = Query(default="ETHUSD"),
-    limit: int = Query(default=300, ge=50, le=500),
+    limit: int = Query(default=150, ge=25, le=300),
     compact: bool = Query(default=True),
     include_raw: bool = Query(default=False),
 ):
@@ -79,7 +79,7 @@ def charts(
 def analytics(
     expiry: str | None = Query(default=None),
     symbol: str = Query(default="ETHUSD"),
-    limit: int = Query(default=200, ge=50, le=500),
+    limit: int = Query(default=150, ge=25, le=300),
     compact: bool = Query(default=True),
     include_raw: bool = Query(default=False),
 ):
