@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import log_startup_config
-from backend.routers import futures_trading, health, market, paper_trading, system
+from backend.routers import futures_trading, health, market, paper_trading, scanner, system
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
 
 
@@ -42,6 +42,7 @@ app.include_router(health.router)
 app.include_router(market.router)
 app.include_router(paper_trading.router)
 app.include_router(futures_trading.router)
+app.include_router(scanner.router)
 app.include_router(system.router)
 
 

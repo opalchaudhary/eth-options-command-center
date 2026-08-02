@@ -19,16 +19,7 @@ from chart_components import (
     render_volume_profile_chart,
     render_volume_vs_strike_chart,
 )
-from database_reader import (
-    get_analytics_snapshots,
-    get_latest_ohlcv_data,
-    get_market_events,
-    get_option_chain_snapshots,
-    get_orderbook_insight_snapshots,
-    get_premium_decay_snapshots,
-    get_smc_zones,
-    get_volume_profile,
-)
+from database_reader import get_latest_ohlcv_data, get_market_events, get_smc_zones, get_volume_profile
 from api_client import api_get, backend_url
 from liquidation_engine import build_composite_liquidation_heatmap
 from ui_styles import load_css
@@ -44,7 +35,7 @@ load_css()
 
 @st.cache_data(ttl=60)
 def load_options_data():
-    option_chain = api_get("/option-chain")
+    option_chain = api_get("/option-chain", params={"limit": 500, "compact": True})
     market = api_get("/market/eth")
     return pd.DataFrame(option_chain.get("rows") or []), market
 
@@ -61,11 +52,15 @@ def load_market_structure_data(symbol, resolution, candle_limit, zone_limit):
 
 @st.cache_data(ttl=60)
 def load_history_data(expiry_label, symbol):
+    response = api_get(
+        "/charts",
+        params={"expiry": expiry_label, "symbol": symbol, "limit": 300, "compact": True},
+    )
     return (
-        get_analytics_snapshots(expiry_label=expiry_label, limit=500),
-        get_premium_decay_snapshots(expiry_label=expiry_label, limit=500),
-        get_option_chain_snapshots(expiry_label=expiry_label, limit=2500),
-        get_orderbook_insight_snapshots(symbol=symbol, limit=500),
+        pd.DataFrame(response.get("analytics") or []),
+        pd.DataFrame(response.get("premium_decay") or []),
+        pd.DataFrame(response.get("option_chain") or []),
+        pd.DataFrame(response.get("orderbook") or []),
     )
 
 

@@ -220,9 +220,14 @@ def _position_leg_rows(trade):
     return rows
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_paper_status():
+    return api_get("/paper-trading/status", params={"limit": 50, "compact": True})
+
+
 with st.spinner("Loading paper trading book..."):
     try:
-        status_response = api_get("/paper-trading/status")
+        status_response = _cached_paper_status()
         dashboard = status_response.get("dashboard") or {}
     except Exception as exc:
         st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")

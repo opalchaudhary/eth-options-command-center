@@ -112,8 +112,12 @@ def get_available_expiries(limit=500):
 
 
 def _latest_rows_for_expiry(table_name, expiry_label, order_col="snapshot_time", limit=1000):
+    select_columns = {
+        "analytics_snapshots": "snapshot_time,expiry_label,spot_price,max_pain,atm_strike,pcr,atm_straddle_price,expected_move_pct,expected_move_upper,expected_move_lower",
+        "premium_decay_snapshots": "snapshot_time,expiry_label,atm_strike,atm_ce_price,atm_pe_price,atm_straddle_price",
+    }.get(table_name, "*")
     params = {
-        "select": "*",
+        "select": select_columns,
         "expiry_label": f"eq.{expiry_label}",
         "order": f"{order_col}.desc",
         "limit": limit,
@@ -136,8 +140,12 @@ def _latest_snapshot_pair_for_expiry(
     order_col="snapshot_time",
     limit=2500,
 ):
+    select_columns = {
+        "option_chain_snapshots": "snapshot_time,expiry_label,expiry_date,strike,option_type,mark_price,oi,volume,iv,delta,gamma,theta,vega",
+        "premium_decay_snapshots": "snapshot_time,expiry_label,atm_strike,atm_ce_price,atm_pe_price,atm_straddle_price",
+    }.get(table_name, "*")
     params = {
-        "select": "*",
+        "select": select_columns,
         "expiry_label": f"eq.{expiry_label}",
         "order": f"{order_col}.desc",
         "limit": limit,
@@ -167,7 +175,7 @@ def _latest_orderbook(symbol=DEFAULT_SYMBOL):
     df = _read_table(
         "orderbook_insights",
         {
-            "select": "*",
+            "select": "timestamp,symbol,eth_price,best_bid,best_ask,spread,spread_pct,bid_depth,ask_depth,imbalance_ratio,bias,nearest_bid_wall_price,nearest_bid_wall_size,nearest_ask_wall_price,nearest_ask_wall_size,trap_risk,execution_signal",
             "symbol": f"eq.{symbol}",
             "order": "timestamp.desc",
             "limit": 1,

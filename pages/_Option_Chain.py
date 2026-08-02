@@ -16,7 +16,7 @@ st.title("Option Chain")
 st.caption("Live ETH option-chain table with expiry and strike filters.")
 
 try:
-    option_chain_response = api_get("/option-chain")
+    option_chain_response = api_get("/option-chain", params={"limit": 500, "compact": True})
     eth_price_data = api_get("/market/eth")
 except Exception as exc:
     st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")

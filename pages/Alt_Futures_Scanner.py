@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-import alt_futures_engine
+from api_client import api_get, backend_url
 from alt_futures_risk import DEFAULT_RISK_PCT, MAX_RISK_PCT
 from alt_futures_scanner import ALT_FUTURES_SYMBOLS
 from ui_styles import load_css
@@ -120,21 +120,32 @@ def _trade_rows(trades, active=False):
     return rows
 
 
+st.sidebar.caption(f"Backend: {backend_url()}")
 st.sidebar.caption("Read-only scanner state. Run execution cycles from the backend process.")
 st.sidebar.metric("Wallet", "Rs 10,000")
 st.sidebar.metric("USDT/INR", f"Rs {INR_PER_USDT}")
 st.sidebar.metric("Universe", f"{len(ALT_FUTURES_SYMBOLS)} symbols")
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_scanner_dashboard():
+    response = api_get("/scanner/alt-futures", params={"limit": 80, "compact": True})
+    return response.get("dashboard") or {}
+
+
 with st.spinner("Loading alt futures scanner state..."):
-    dashboard = alt_futures_engine.alt_futures_dashboard_data(run_cycle=False)
+    try:
+        dashboard = _cached_scanner_dashboard()
+    except Exception as exc:
+        st.warning(f"FastAPI backend is refreshing or unavailable: {exc}")
+        st.stop()
 
 wallet = dashboard.get("wallet") or {}
 candidates = dashboard.get("candidates") or []
 decision = dashboard.get("decision") or {}
-open_trades = dashboard.get("open_trades")
-closed_trades = dashboard.get("closed_trades")
-events = dashboard.get("events")
-scanner_history = dashboard.get("scanner_history")
+open_trades = pd.DataFrame(dashboard.get("open_trades") or [])
+closed_trades = pd.DataFrame(dashboard.get("closed_trades") or [])
+events = pd.DataFrame(dashboard.get("events") or [])
+scanner_history = pd.DataFrame(dashboard.get("scanner_history") or [])
 engine_status = dashboard.get("engine_status") or {}
 engine_display = _engine_display(engine_status)
 

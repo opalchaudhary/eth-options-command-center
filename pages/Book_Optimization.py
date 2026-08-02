@@ -38,7 +38,7 @@ def _cached_expiries():
         return expiries, "analytics_snapshots"
 
     try:
-        live_response = api_get("/option-chain")
+        live_response = api_get("/option-chain", params={"limit": 500, "compact": True})
         live_options = pd.DataFrame(live_response.get("rows") or [])
         live_expiries = sorted(live_options["expiry"].dropna().unique()) if not live_options.empty else []
     except Exception:

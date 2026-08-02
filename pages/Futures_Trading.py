@@ -194,9 +194,14 @@ st.sidebar.caption(f"Backend: {backend_url()}")
 st.sidebar.metric("Contract Size", f"{ETH_LOT_SIZE} ETH")
 st.sidebar.metric("USDT/INR", f"Rs {INR_PER_USDT}")
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_futures_status():
+    return api_get("/futures-trading/status", params={"limit": 50, "compact": True})
+
+
 with st.spinner("Loading futures paper trading book..."):
     try:
-        status_response = api_get("/futures-trading/status")
+        status_response = _cached_futures_status()
         dashboard = status_response.get("dashboard") or {}
     except Exception as exc:
         st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")

@@ -117,7 +117,7 @@ def get_available_option_chain(expiry_labels=None):
         df = read_table(
             "option_chain_snapshots",
             {
-                "select": "*",
+                "select": "snapshot_time,expiry_label,expiry_date,strike,option_type,mark_price,oi,volume,iv,delta,gamma,theta,vega",
                 "expiry_label": f"eq.{expiry}",
                 "order": "snapshot_time.desc",
                 "limit": 1600,
@@ -785,7 +785,7 @@ def get_recent_book_optimization_snapshots(limit=25):
     return read_table(
         "book_optimization_journal",
         {
-            "select": "*",
+            "select": "id,created_at,spot_price,market_regime,health_status,risk_score,book_greeks,ideal_greeks,comparison_json,final_verdict",
             "order": "created_at.desc",
             "limit": limit,
         },

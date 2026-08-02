@@ -3,6 +3,13 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from alt_futures_risk import ALT_FUTURES_STARTING_BALANCE_INR, ALT_FUTURES_STARTING_BALANCE_USDT, safe_float
+from engine_persistence import (
+    build_decision_hash,
+    compact_decision_reason,
+    safe_engine_payload,
+    should_persist_engine_snapshot,
+    top_candidates_summary,
+)
 from recommendation_journal import _request, read_table
 from validation_config import INR_PER_USDT, usdt_to_inr
 
@@ -34,7 +41,7 @@ def get_open_alt_trades(limit=10):
     return read_table(
         "alt_futures_trade_journal",
         {
-            "select": "*",
+            "select": "id,trade_id,created_at,updated_at,status,symbol,direction,entry_price,current_price,stop_loss,take_profit_1,take_profit_2,trailing_stop,liquidation_price_estimate,leverage,position_size,margin_used_usdt,risk_usdt,expected_reward_usdt,rr_ratio,unrealized_pnl_usdt,pnl_usdt,reason_for_entry,market_regime_at_entry,scanner_score_at_entry,trade_confidence",
             "status": "eq.OPEN",
             "order": "created_at.desc",
             "limit": limit,
@@ -46,7 +53,7 @@ def get_closed_alt_trades(limit=200):
     return read_table(
         "alt_futures_trade_journal",
         {
-            "select": "*",
+            "select": "id,trade_id,created_at,updated_at,closed_at,status,symbol,direction,entry_price,exit_price,stop_loss,take_profit_1,take_profit_2,leverage,position_size,margin_used_usdt,pnl_usdt,reason_for_entry,reason_for_exit,scanner_score_at_entry,trade_confidence",
             "status": "neq.OPEN",
             "order": "created_at.desc",
             "limit": limit,
@@ -58,7 +65,7 @@ def get_alt_trade_events(limit=300):
     return read_table(
         "alt_futures_trade_events",
         {
-            "select": "*",
+            "select": "id,created_at,trade_id,event_type,price,pnl_usdt,wallet_equity_usdt,reason",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -69,7 +76,7 @@ def get_latest_scanner_snapshots(limit=250):
     return read_table(
         "alt_futures_scanner_snapshots",
         {
-            "select": "*",
+            "select": "id,created_at,symbol,price,score,classification,direction,funding_rate,open_interest,oi_change_pct,volume,volume_change_pct,spread,spread_pct,liquidity_score,trend_score,smc_score,final_reason,selected,decision_hash,payload_truncated",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -80,7 +87,7 @@ def get_latest_engine_run():
     runs = read_table(
         "alt_futures_engine_runs",
         {
-            "select": "*",
+            "select": "id,created_at,cycle_started_at,cycle_finished_at,status,run_status,action,error,interval_seconds,opened_trade_id,selected_symbol,selected_direction,selected_score,open_position_count,scanned_symbol_count,decision_hash,payload_truncated,decision_reason",
             "order": "created_at.desc",
             "limit": 1,
         },
@@ -96,7 +103,7 @@ def get_latest_wallet_row():
     wallet = read_table(
         "alt_futures_wallet_ledger",
         {
-            "select": "*",
+            "select": "id,created_at,wallet_balance_inr,wallet_balance_usdt,equity_inr,equity_usdt,available_balance_usdt,used_margin_usdt,realized_pnl_usdt,unrealized_pnl_usdt,max_drawdown_pct,event_type,trade_id,notes",
             "order": "created_at.desc",
             "limit": 1,
         },
@@ -181,11 +188,30 @@ def wallet_state(open_trades=None, closed_trades=None):
 
 def persist_scanner_snapshots(candidates):
     rows = []
+    top_symbols = {item.get("symbol") for item in top_candidates_summary(candidates, limit=5)}
 
     for candidate in candidates:
+        selected = bool(candidate.get("selected"))
+        if not selected and candidate.get("symbol") not in top_symbols:
+            continue
+
+        decision_hash = build_decision_hash(
+            "alt_futures_scanner",
+            candidate.get("symbol"),
+            "scan_selected" if selected else "scan_watch",
+            candidate.get("direction") or candidate.get("classification"),
+            None,
+            [candidate.get("price")],
+            candidate.get("market_regime"),
+            candidate.get("score"),
+            candidate.get("spread_pct"),
+        )
+        compact_candidate, truncated = safe_engine_payload(candidate, "alt_futures_scanner_snapshots")
         rows.append(
             {
                 "created_at": now_iso(),
+                "engine_name": "alt_futures_scanner",
+                "action": "scan_selected" if selected else "scan_watch",
                 "symbol": candidate.get("symbol"),
                 "price": candidate.get("price"),
                 "score": candidate.get("score"),
@@ -203,8 +229,10 @@ def persist_scanner_snapshots(candidates):
                 "trend_score": candidate.get("scores", {}).get("trend"),
                 "smc_score": candidate.get("scores", {}).get("smc"),
                 "final_reason": candidate.get("reason"),
-                "selected": bool(candidate.get("selected")),
-                "raw_snapshot_json": json_safe(candidate),
+                "selected": selected,
+                "decision_hash": decision_hash,
+                "payload_truncated": truncated,
+                "raw_snapshot_json": json_safe(compact_candidate),
             }
         )
 
@@ -320,30 +348,93 @@ def record_engine_run(status, cycle_started_at=None, action=None, error=None, in
     opened_trade = evaluation.get("opened_trade") or {}
     open_trades = evaluation.get("open_trades")
     candidates = evaluation.get("candidates") or []
+    normalized_action = action or evaluation.get("action") or decision.get("direction") or "no_trade"
+    decision_hash = build_decision_hash(
+        "alt_futures",
+        decision.get("symbol") or "MULTI",
+        normalized_action,
+        decision.get("direction"),
+        None,
+        [decision.get("entry_price"), decision.get("stop_loss"), decision.get("take_profit_1"), decision.get("take_profit_2")],
+        (decision.get("candidate") or {}).get("market_regime") if isinstance(decision.get("candidate"), dict) else None,
+        decision.get("trade_confidence") or decision.get("candidate_score"),
+        (decision.get("risk") or {}).get("risk_amount_usdt") if isinstance(decision.get("risk"), dict) else None,
+    )
+
+    if not should_persist_engine_snapshot(
+        "alt_futures_engine_runs",
+        decision.get("symbol") or "MULTI",
+        decision_hash,
+        normalized_action,
+        decision.get("direction"),
+        None,
+        [decision.get("entry_price"), decision.get("stop_loss"), decision.get("take_profit_1"), decision.get("take_profit_2")],
+    ):
+        return {
+            "created_at": now_iso(),
+            "status": status,
+            "action": normalized_action,
+            "decision_hash": decision_hash,
+            "skipped_persistence": True,
+        }
+
+    cycle_json, truncated = safe_engine_payload(
+        {
+            "action": normalized_action,
+            "error": error,
+            "decision": {
+                "symbol": decision.get("symbol"),
+                "direction": decision.get("direction"),
+                "reason": decision.get("reason"),
+                "candidate_score": decision.get("candidate_score"),
+                "entry_price": decision.get("entry_price"),
+                "stop_loss": decision.get("stop_loss"),
+                "take_profit_1": decision.get("take_profit_1"),
+                "take_profit_2": decision.get("take_profit_2"),
+            },
+            "top_candidates": top_candidates_summary(candidates, limit=3),
+            "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
+            "position_updates": evaluation.get("position_updates") or [],
+        },
+        table_name="alt_futures_engine_runs",
+    )
 
     payload = {
         "created_at": now_iso(),
         "cycle_started_at": cycle_started_at,
         "cycle_finished_at": now_iso(),
         "status": status,
-        "action": action or evaluation.get("action"),
+        "run_status": status,
+        "action": normalized_action,
         "error": error,
         "interval_seconds": interval_seconds,
         "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
+        "symbol": decision.get("symbol") or "MULTI",
+        "engine_name": "alt_futures",
+        "market_regime": (decision.get("candidate") or {}).get("market_regime") if isinstance(decision.get("candidate"), dict) else None,
+        "selected_strategy": decision.get("direction"),
+        "selected_strikes": json_safe(
+            {
+                "entry_price": decision.get("entry_price"),
+                "stop_loss": decision.get("stop_loss"),
+                "take_profit_1": decision.get("take_profit_1"),
+                "take_profit_2": decision.get("take_profit_2"),
+            }
+        ),
+        "top_candidates_summary": json_safe(top_candidates_summary(candidates, limit=3)),
+        "confidence_score": decision.get("trade_confidence") or decision.get("candidate_score"),
+        "risk_score": (decision.get("risk") or {}).get("risk_amount_usdt") if isinstance(decision.get("risk"), dict) else None,
+        "margin_used": (decision.get("risk") or {}).get("margin_required_usdt") if isinstance(decision.get("risk"), dict) else None,
+        "decision_reason": compact_decision_reason(decision.get("reason") or normalized_action),
+        "decision_hash": decision_hash,
+        "snapshot_refs": json_safe({"opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None}),
+        "payload_truncated": truncated,
         "selected_symbol": decision.get("symbol"),
         "selected_direction": decision.get("direction"),
         "selected_score": decision.get("candidate_score"),
         "open_position_count": 0 if open_trades is None or open_trades.empty else len(open_trades),
         "scanned_symbol_count": len(candidates),
-        "cycle_json": json_safe(
-            {
-                "action": action or evaluation.get("action"),
-                "error": error,
-                "decision": decision,
-                "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
-                "position_updates": evaluation.get("position_updates") or [],
-            }
-        ),
+        "cycle_json": json_safe(cycle_json),
     }
     result = _request("POST", "alt_futures_engine_runs", payload=payload, prefer="return=representation")
     return result[0] if isinstance(result, list) and result else payload

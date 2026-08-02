@@ -2,6 +2,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from engine_persistence import (
+    build_decision_hash,
+    compact_decision_reason,
+    safe_engine_payload,
+    should_persist_engine_snapshot,
+)
 from recommendation_journal import _request, read_table
 from validation_config import INR_PER_USDT, usdt_to_inr
 from futures_risk import FUTURES_STARTING_BALANCE_INR, FUTURES_STARTING_BALANCE_USDT
@@ -43,7 +49,7 @@ def get_open_futures_positions(limit=20):
     return read_table(
         "futures_paper_trades",
         {
-            "select": "*",
+            "select": "id,trade_id,created_at,updated_at,status,direction,entry_price,current_price,stop_loss,take_profit,liquidation_price_estimate,leverage,position_size,margin_used_usdt,risk_usdt,expected_reward_usdt,rr_ratio,unrealized_pnl_usdt,realized_pnl_usdt,reason_for_entry,exit_reason,confidence_score,market_regime_at_entry",
             "status": "eq.OPEN",
             "order": "created_at.desc",
             "limit": limit,
@@ -55,7 +61,7 @@ def get_closed_futures_trades(limit=200):
     return read_table(
         "futures_paper_trades",
         {
-            "select": "*",
+            "select": "id,trade_id,created_at,updated_at,closed_at,status,direction,entry_price,exit_price,stop_loss,take_profit,leverage,position_size,margin_used_usdt,realized_pnl_usdt,reason_for_entry,exit_reason,confidence_score",
             "status": "neq.OPEN",
             "order": "updated_at.desc",
             "limit": limit,
@@ -67,7 +73,7 @@ def get_futures_journal(limit=200):
     return read_table(
         "futures_trade_journal",
         {
-            "select": "*",
+            "select": "id,created_at,trade_id,event_type,price,pnl_usdt,wallet_equity_usdt,reason",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -78,7 +84,7 @@ def get_futures_training_dataset(limit=200):
     return read_table(
         "futures_model_training_dataset",
         {
-            "select": "*",
+            "select": "id,created_at,updated_at,trade_id,label,final_outcome,max_favorable_excursion,max_adverse_excursion,model_ready",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -89,7 +95,7 @@ def get_latest_futures_engine_run():
     runs = read_table(
         "futures_trading_engine_runs",
         {
-            "select": "*",
+            "select": "id,created_at,cycle_started_at,cycle_finished_at,status,run_status,action,error,interval_seconds,opened_trade_id,selected_direction,selected_score,open_position_count,closed_trade_count,symbol,engine_name,market_regime,selected_strategy,selected_expiry,selected_strikes,confidence_score,risk_score,margin_used,pnl,unrealized_pnl,realized_pnl,decision_reason,decision_hash,payload_truncated",
             "order": "created_at.desc",
             "limit": 1,
         },
@@ -105,7 +111,7 @@ def get_latest_wallet_row():
     wallet = read_table(
         "futures_paper_wallet",
         {
-            "select": "*",
+            "select": "id,created_at,starting_capital_inr,starting_capital_usdt,available_balance_usdt,used_margin_usdt,realized_pnl_usdt,unrealized_pnl_usdt,current_equity_usdt,margin_health_pct,book_greeks",
             "order": "created_at.desc",
             "limit": 1,
         },
@@ -364,37 +370,89 @@ def record_futures_engine_run(
     opened_trade = evaluation.get("opened_trade") or {}
     open_positions = evaluation.get("open_positions")
     closed_trades = evaluation.get("closed_trades")
+    normalized_action = action or evaluation.get("action") or decision.get("direction") or "no_trade"
+    decision_hash = build_decision_hash(
+        "futures_directional",
+        "ETHUSD",
+        normalized_action,
+        decision.get("direction"),
+        None,
+        [decision.get("entry_price"), decision.get("stop_loss"), decision.get("take_profit")],
+        decision.get("market_regime"),
+        decision.get("confidence_score"),
+        (decision.get("risk") or {}).get("risk_amount_usdt") if isinstance(decision.get("risk"), dict) else None,
+    )
+
+    if not should_persist_engine_snapshot(
+        "futures_trading_engine_runs",
+        "ETHUSD",
+        decision_hash,
+        normalized_action,
+        decision.get("direction"),
+        None,
+        [decision.get("entry_price"), decision.get("stop_loss"), decision.get("take_profit")],
+    ):
+        return {
+            "created_at": now_iso(),
+            "status": status,
+            "action": normalized_action,
+            "decision_hash": decision_hash,
+            "skipped_persistence": True,
+        }
+
+    cycle_json, truncated = safe_engine_payload(
+        {
+            "action": normalized_action,
+            "error": error,
+            "decision": {
+                "direction": decision.get("direction"),
+                "reason": decision.get("reason"),
+                "confidence_score": decision.get("confidence_score"),
+                "entry_price": decision.get("entry_price"),
+                "stop_loss": decision.get("stop_loss"),
+                "take_profit": decision.get("take_profit"),
+            },
+            "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
+            "position_updates": evaluation.get("position_updates") or [],
+        },
+        table_name="futures_trading_engine_runs",
+    )
 
     payload = {
         "created_at": now_iso(),
         "cycle_started_at": cycle_started_at,
         "cycle_finished_at": now_iso(),
         "status": status,
-        "action": action or evaluation.get("action"),
+        "run_status": status,
+        "action": normalized_action,
         "error": error,
         "interval_seconds": interval_seconds,
         "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
-        "selected_direction": decision.get("direction"),
-        "selected_score": decision.get("confidence_score"),
-        "open_position_count": 0 if open_positions is None or open_positions.empty else len(open_positions),
-        "closed_trade_count": 0 if closed_trades is None or closed_trades.empty else len(closed_trades),
-        "cycle_json": json_safe(
+        "symbol": "ETHUSD",
+        "engine_name": "futures_directional",
+        "market_regime": decision.get("market_regime"),
+        "selected_strategy": decision.get("direction"),
+        "selected_expiry": None,
+        "selected_strikes": json_safe(
             {
-                "action": action or evaluation.get("action"),
-                "error": error,
-                "decision": {
-                    "direction": decision.get("direction"),
-                    "reason": decision.get("reason"),
-                    "confidence_score": decision.get("confidence_score"),
-                    "entry_price": decision.get("entry_price"),
-                    "stop_loss": decision.get("stop_loss"),
-                    "take_profit": decision.get("take_profit"),
-                    "risk": decision.get("risk"),
-                },
-                "opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None,
-                "position_updates": evaluation.get("position_updates") or [],
+                "entry_price": decision.get("entry_price"),
+                "stop_loss": decision.get("stop_loss"),
+                "take_profit": decision.get("take_profit"),
             }
         ),
+        "selected_direction": decision.get("direction"),
+        "selected_score": decision.get("confidence_score"),
+        "confidence_score": decision.get("confidence_score"),
+        "risk_score": (decision.get("risk") or {}).get("risk_amount_usdt") if isinstance(decision.get("risk"), dict) else None,
+        "margin_used": (decision.get("risk") or {}).get("margin_required_usdt") if isinstance(decision.get("risk"), dict) else None,
+        "pnl": (opened_trade or {}).get("realized_pnl_usdt") if isinstance(opened_trade, dict) else None,
+        "decision_reason": compact_decision_reason(decision.get("reason") or normalized_action),
+        "decision_hash": decision_hash,
+        "snapshot_refs": json_safe({"opened_trade_id": opened_trade.get("id") if isinstance(opened_trade, dict) else None}),
+        "payload_truncated": truncated,
+        "open_position_count": 0 if open_positions is None or open_positions.empty else len(open_positions),
+        "closed_trade_count": 0 if closed_trades is None or closed_trades.empty else len(closed_trades),
+        "cycle_json": json_safe(cycle_json),
     }
     result = _request("POST", "futures_trading_engine_runs", payload=payload, prefer="return=representation")
 

@@ -2,6 +2,14 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from engine_persistence import (
+    build_decision_hash,
+    compact_decision_reason,
+    extract_strategy_strikes,
+    safe_engine_payload,
+    should_persist_engine_snapshot,
+    top_candidates_summary,
+)
 from recommendation_journal import _request, read_table, save_recommendation_snapshot
 from rule_insights import build_rule_based_insights, get_available_expiries, price_strategy_legs
 from validation_config import (
@@ -215,7 +223,7 @@ def get_open_paper_trades(limit=50):
     return read_table(
         "paper_trades",
         {
-            "select": "*",
+            "select": "id,recommendation_id,created_at,updated_at,status,strategy,side,expiry_label,entry_spot,current_spot,lots,eth_quantity,entry_premium_usdt,margin_used_usdt,margin_used_inr,max_risk_usdt,max_risk_inr,unrealized_pnl_usdt,unrealized_pnl_inr,realized_pnl_usdt,realized_pnl_inr,exit_reason,selection_score,entry_reason,entry_greeks,current_greeks,trade_json",
             "status": "eq.OPEN",
             "order": "created_at.desc",
             "limit": limit,
@@ -227,7 +235,7 @@ def get_closed_paper_trades(limit=100):
     return read_table(
         "paper_trades",
         {
-            "select": "*",
+            "select": "id,recommendation_id,created_at,updated_at,closed_at,status,strategy,side,expiry_label,entry_spot,exit_spot,lots,entry_premium_usdt,margin_used_usdt,max_risk_usdt,realized_pnl_usdt,realized_pnl_inr,exit_reason,exit_reason_label,entry_reason,selection_score,trade_json",
             "status": "neq.OPEN",
             "order": "updated_at.desc",
             "limit": limit,
@@ -239,7 +247,7 @@ def get_all_paper_trades(limit=500):
     return read_table(
         "paper_trades",
         {
-            "select": "*",
+            "select": "id,recommendation_id,created_at,updated_at,status,strategy,side,expiry_label,entry_spot,current_spot,lots,margin_used_usdt,unrealized_pnl_usdt,realized_pnl_usdt,exit_reason,selection_score,entry_reason",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -733,31 +741,93 @@ def evaluate_paper_trade_candidates(limit_expiries=6, persist=True, update_posit
 
 
 def _record_evaluation_cycle(candidates, selected, wallet):
-    selected_key = (
-        selected.get("expiry_label"),
-        selected.get("strategy"),
-    ) if selected else None
     cycle_created_at = _now_iso()
+    selected = selected or {}
+    recommendation = selected.get("recommendation") or {}
+    insights = selected.get("insights") or {}
+    risk = selected.get("risk") or {}
+    action = "open" if selected else "no_trade"
+    selected_strikes = extract_strategy_strikes(recommendation)
+    decision_hash = build_decision_hash(
+        "paper_options",
+        "ETHUSD",
+        action,
+        selected.get("strategy"),
+        selected.get("expiry_label"),
+        selected_strikes,
+        insights.get("market_regime"),
+        selected.get("selection_score") or insights.get("confidence_score"),
+        risk.get("max_risk_usdt") or risk.get("margin_used_usdt"),
+    )
 
-    for candidate in candidates:
-        recommendation = candidate.get("recommendation") or {}
-        candidate_key = (candidate.get("expiry_label"), candidate.get("strategy"))
-        payload = {
-            "created_at": cycle_created_at,
-            "expiry_label": candidate.get("expiry_label"),
-            "strategy": candidate.get("strategy"),
-            "recommendation_id": recommendation.get("id"),
-            "selected": bool(selected_key and candidate_key == selected_key),
-            "selection_score": candidate.get("selection_score"),
-            "rejection_reasons": _json_safe(candidate.get("rejection_reasons") or []),
-            "wallet_state": _json_safe(wallet),
-            "risk_json": _json_safe(candidate.get("risk") or {}),
-            "insight_json": _json_safe(candidate.get("insights") or {}),
-            "candidate_json": _json_safe(
-                {key: value for key, value in candidate.items() if key not in ["insights", "recommendation", "risk"]}
-            ),
-        }
-        _request("POST", "paper_recommendation_evaluations", payload=payload, prefer="return=minimal")
+    if not should_persist_engine_snapshot(
+        "paper_recommendation_evaluations",
+        "ETHUSD",
+        decision_hash,
+        action,
+        selected.get("strategy"),
+        selected.get("expiry_label"),
+        selected_strikes,
+    ):
+        return
+
+    top_summary = top_candidates_summary(candidates, limit=3)
+    compact_payload, truncated = safe_engine_payload(
+        {
+            "selected": {
+                key: selected.get(key)
+                for key in ["expiry_label", "strategy", "selection_score", "status", "entry_reason"]
+            },
+            "top_candidates": top_summary,
+            "wallet": wallet,
+        },
+        table_name="paper_recommendation_evaluations",
+    )
+    payload = {
+        "created_at": cycle_created_at,
+        "symbol": "ETHUSD",
+        "engine_name": "paper_options",
+        "run_status": "ok",
+        "action": action,
+        "market_regime": insights.get("market_regime"),
+        "selected_strategy": selected.get("strategy"),
+        "selected_expiry": selected.get("expiry_label"),
+        "selected_strikes": _json_safe(selected_strikes),
+        "top_candidates_summary": _json_safe(top_summary),
+        "greeks_summary": _json_safe(risk.get("post_trade_book_greeks") or {}),
+        "confidence_score": selected.get("selection_score") or insights.get("confidence_score"),
+        "risk_score": risk.get("max_risk_usdt") or risk.get("margin_used_usdt"),
+        "margin_used": risk.get("margin_used_usdt"),
+        "lot_size": risk.get("lots"),
+        "decision_reason": compact_decision_reason(selected.get("entry_reason") or "No trade: no candidate passed safety rules"),
+        "decision_hash": decision_hash,
+        "snapshot_refs": _json_safe({"recommendation_id": recommendation.get("id")}),
+        "payload_truncated": truncated,
+        "expiry_label": selected.get("expiry_label"),
+        "strategy": selected.get("strategy"),
+        "recommendation_id": recommendation.get("id"),
+        "selected": bool(selected),
+        "selection_score": selected.get("selection_score"),
+        "rejection_reasons": _json_safe(selected.get("rejection_reasons") or []),
+        "wallet_state": _json_safe(compact_payload.get("wallet") or {}),
+        "risk_json": _json_safe(safe_engine_payload(risk, "paper_recommendation_evaluations.risk")[0]),
+        "insight_json": _json_safe(
+            {
+                key: insights.get(key)
+                for key in [
+                    "market_regime",
+                    "directional_bias",
+                    "volatility_regime",
+                    "confidence_score",
+                    "signal_conflict_score",
+                    "best_strategy",
+                    "risk_warnings",
+                ]
+            }
+        ),
+        "candidate_json": _json_safe(compact_payload),
+    }
+    _request("POST", "paper_recommendation_evaluations", payload=payload, prefer="return=minimal")
 
 
 def _record_wallet_snapshot(wallet):
@@ -793,33 +863,87 @@ def record_paper_engine_run(
     evaluation = evaluation or {}
     selected = evaluation.get("selected") or {}
     opened_trade = evaluation.get("opened_trade") or {}
+    recommendation = selected.get("recommendation") or {}
+    insights = selected.get("insights") or {}
+    risk = selected.get("risk") or {}
+    normalized_action = action or evaluation.get("action") or ("hold" if evaluation.get("open_trades") is not None else "no_trade")
+    selected_strikes = extract_strategy_strikes(recommendation)
+    decision_hash = build_decision_hash(
+        "paper_options",
+        "ETHUSD",
+        normalized_action,
+        selected.get("strategy"),
+        selected.get("expiry_label"),
+        selected_strikes,
+        insights.get("market_regime"),
+        selected.get("selection_score") or insights.get("confidence_score"),
+        risk.get("max_risk_usdt") or risk.get("margin_used_usdt"),
+    )
+
+    if not should_persist_engine_snapshot(
+        "paper_trading_engine_runs",
+        "ETHUSD",
+        decision_hash,
+        normalized_action,
+        selected.get("strategy"),
+        selected.get("expiry_label"),
+        selected_strikes,
+    ):
+        return {
+            "created_at": _now_iso(),
+            "status": status,
+            "action": normalized_action,
+            "decision_hash": decision_hash,
+            "skipped_persistence": True,
+        }
+
+    cycle_json, truncated = safe_engine_payload(
+        {
+            "action": normalized_action,
+            "error": error,
+            "selected": {
+                key: selected.get(key)
+                for key in ["expiry_label", "strategy", "selection_score", "entry_reason"]
+            } if selected else None,
+            "opened_trade_id": opened_trade.get("id"),
+            "position_updates": evaluation.get("position_updates") or [],
+        },
+        table_name="paper_trading_engine_runs",
+    )
     payload = {
         "created_at": _now_iso(),
         "cycle_started_at": cycle_started_at,
         "cycle_finished_at": _now_iso(),
         "status": status,
-        "action": action or evaluation.get("action"),
+        "run_status": status,
+        "action": normalized_action,
         "error": error,
         "interval_seconds": interval_seconds,
         "limit_expiries": limit_expiries,
         "opened_trade_id": opened_trade.get("id"),
+        "symbol": "ETHUSD",
+        "engine_name": "paper_options",
+        "market_regime": insights.get("market_regime"),
         "selected_strategy": selected.get("strategy"),
+        "selected_expiry": selected.get("expiry_label"),
+        "selected_strikes": _json_safe(selected_strikes),
         "selected_expiry_label": selected.get("expiry_label"),
         "selected_score": selected.get("selection_score"),
+        "top_candidates_summary": _json_safe(top_candidates_summary(evaluation.get("candidates") or [], limit=3)),
+        "greeks_summary": _json_safe(risk.get("post_trade_book_greeks") or {}),
+        "confidence_score": selected.get("selection_score") or insights.get("confidence_score"),
+        "risk_score": risk.get("max_risk_usdt") or risk.get("margin_used_usdt"),
+        "margin_used": risk.get("margin_used_usdt"),
+        "lot_size": risk.get("lots"),
+        "unrealized_pnl": (evaluation.get("wallet") or {}).get("unrealized_pnl_usdt"),
+        "realized_pnl": (evaluation.get("wallet") or {}).get("realized_pnl_usdt"),
+        "decision_reason": compact_decision_reason(selected.get("entry_reason") or normalized_action),
+        "decision_hash": decision_hash,
+        "snapshot_refs": _json_safe({"opened_trade_id": opened_trade.get("id"), "recommendation_id": recommendation.get("id")}),
+        "payload_truncated": truncated,
         "open_trade_count": _frame_count(evaluation.get("open_trades")),
         "closed_trade_count": _frame_count(evaluation.get("closed_trades")),
-        "cycle_json": _json_safe(
-            {
-                "action": action or evaluation.get("action"),
-                "error": error,
-                "selected": {
-                    key: selected.get(key)
-                    for key in ["expiry_label", "strategy", "selection_score", "entry_reason"]
-                } if selected else None,
-                "opened_trade_id": opened_trade.get("id"),
-                "position_updates": evaluation.get("position_updates") or [],
-            }
-        ),
+        "cycle_json": _json_safe(cycle_json),
     }
     result = _request("POST", "paper_trading_engine_runs", payload=payload, prefer="return=representation")
 
@@ -833,7 +957,7 @@ def get_latest_paper_engine_run():
     runs = read_table(
         "paper_trading_engine_runs",
         {
-            "select": "*",
+            "select": "id,created_at,cycle_started_at,cycle_finished_at,status,run_status,action,error,interval_seconds,limit_expiries,opened_trade_id,selected_strategy,selected_expiry,selected_expiry_label,selected_score,open_trade_count,closed_trade_count,decision_hash,payload_truncated,decision_reason",
             "order": "created_at.desc",
             "limit": 1,
         },
@@ -849,7 +973,7 @@ def get_latest_paper_evaluations(limit=100):
     evaluations = read_table(
         "paper_recommendation_evaluations",
         {
-            "select": "*",
+            "select": "id,created_at,expiry_label,strategy,recommendation_id,selected,selection_score,rejection_reasons,candidate_json,decision_hash,payload_truncated,decision_reason,top_candidates_summary",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -904,7 +1028,7 @@ def create_paper_trade(recommendation, risk=None, selection=None, wallet_before=
     existing = read_table(
         "paper_trades",
         {
-            "select": "*",
+            "select": "id,recommendation_id,created_at,status,strategy,expiry_label",
             "recommendation_id": f"eq.{recommendation_id}",
             "limit": 1,
         },
@@ -1026,7 +1150,14 @@ def auto_trade_cycle(enabled=True, limit_expiries=6, persist=True):
 
 
 def manual_close_trade(trade_id, reason="MANUAL"):
-    trades = read_table("paper_trades", {"select": "*", "id": f"eq.{trade_id}", "limit": 1})
+    trades = read_table(
+        "paper_trades",
+        {
+            "select": "id,status,current_spot,unrealized_pnl_usdt,trade_json,current_greeks",
+            "id": f"eq.{trade_id}",
+            "limit": 1,
+        },
+    )
 
     if trades.empty:
         return None

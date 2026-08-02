@@ -31,7 +31,7 @@ st_autorefresh(interval=60 * 1000, key="eth_options_refresh")
 # --------------------------------------------------
 
 try:
-    option_chain_response = api_get("/option-chain")
+    option_chain_response = api_get("/option-chain", params={"limit": 500, "compact": True})
     eth_price_data = api_get("/market/eth")
 except Exception as exc:
     st.error(f"FastAPI backend unavailable at {backend_url()}: {exc}")

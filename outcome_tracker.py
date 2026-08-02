@@ -214,7 +214,7 @@ def refresh_recent_outcomes(limit=50):
     recommendations = read_table(
         "recommendation_journal",
         {
-            "select": "*",
+            "select": "id,recommendation_key,created_at,spot_price,expiry_label,market_regime,directional_bias,suggested_strategy,suggested_sell_strike,suggested_hedge_strike,confidence_score,signal_conflict_score,warnings,reasoning_text,recommendation_json",
             "order": "created_at.desc",
             "limit": limit,
         },
@@ -234,7 +234,7 @@ def get_recommendation_outcomes(limit=200):
     return read_table(
         "recommendation_outcomes",
         {
-            "select": "*",
+            "select": "id,recommendation_id,created_at,updated_at,label,final_outcome,max_favorable_excursion,max_adverse_excursion,model_ready",
             "order": "updated_at.desc",
             "limit": limit,
         },
