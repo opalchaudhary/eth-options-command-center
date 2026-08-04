@@ -1,7 +1,7 @@
 import logging
 import time
+from datetime import datetime, timezone
 
-import database_reader
 from data_refresh import refresh_market_structure_sources, refresh_options_sources
 from rule_insights import build_rule_based_insights, get_available_expiries
 
@@ -14,8 +14,15 @@ INSIGHTS_CACHE_TTL_SECONDS = 30
 _insights_cache = {}
 
 
+def _expiry_sort_key(expiry):
+    try:
+        return datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
 def get_eth_market():
-    return eth_market_snapshot(include_orderbook=False)
+    return eth_market_snapshot(include_orderbook=True)
 
 
 def _compact_insights(insights):
@@ -60,8 +67,61 @@ def _compact_insights(insights):
         },
         "data_flags": insights.get("data_flags") or {},
         "missing_sources": insights.get("missing_sources") or [],
+        "option_chain_source": insights.get("option_chain_source"),
+        "analytics_source": insights.get("analytics_source"),
+        "orderbook_source": insights.get("orderbook_source"),
+        "ohlcv_source": insights.get("ohlcv_source"),
         "last_updated": insights.get("generated_at"),
     }
+
+
+def _live_expiries(limit=20):
+    response = eth_option_chain()
+    expiries = response.get("expiries") or []
+    return sorted(expiries, key=_expiry_sort_key)[:limit]
+
+
+def _target_insight_expiries(expiries, limit=20):
+    sorted_expiries = sorted(expiries, key=_expiry_sort_key)
+    target_expiries = []
+
+    for expiry in sorted_expiries:
+        if expiry not in target_expiries:
+            target_expiries.append(expiry)
+
+        if len(target_expiries) >= 4:
+            break
+
+    for expiry in sorted_expiries:
+        if expiry not in target_expiries:
+            target_expiries.append(expiry)
+
+        if len(target_expiries) >= limit:
+            break
+
+    return target_expiries[:limit]
+
+
+def _available_expiries(limit=20):
+    live_expiries = []
+    saved_expiries = []
+
+    try:
+        live_expiries = _live_expiries(limit=limit)
+    except Exception:
+        logger.exception("Live Delta expiry lookup failed")
+
+    try:
+        saved_expiries = get_available_expiries(limit=limit)
+    except Exception:
+        logger.exception("Saved expiry lookup failed")
+
+    expiries = []
+    for expiry in [*live_expiries, *saved_expiries]:
+        if expiry and expiry not in expiries:
+            expiries.append(expiry)
+
+    return _target_insight_expiries(expiries, limit=limit)
 
 
 def get_option_chain(expiry=None, limit=500, compact=True, include_raw=False):
@@ -93,25 +153,25 @@ def get_option_chain(expiry=None, limit=500, compact=True, include_raw=False):
 
 
 def get_insights(expiry=None, compact=True, include_raw=False):
-    expiries = get_available_expiries(limit=20)
+    expiries = _available_expiries(limit=20)
     selected_expiry = expiry or (expiries[0] if expiries else None)
 
     if not selected_expiry:
         return {
             "ok": False,
-            "error": "No option expiries are available in Supabase. Refresh option sources first.",
+            "error": "No option expiries are available from Delta or saved snapshots. Check the Delta API connection and retry.",
             "expiries": [],
             "insights": None,
         }
 
-    cache_key = str(selected_expiry)
+    cache_key = f"{selected_expiry}:{compact}:{include_raw}"
     cached = _insights_cache.get(cache_key)
     now = time.monotonic()
 
     if cached and now - cached["created_at"] <= INSIGHTS_CACHE_TTL_SECONDS:
         insights = cached["insights"]
     else:
-        insights = build_rule_based_insights(selected_expiry, allow_live_delta_fallback=False)
+        insights = build_rule_based_insights(selected_expiry, allow_live_delta_fallback=True)
         _insights_cache[cache_key] = {
             "created_at": now,
             "insights": insights,
@@ -120,7 +180,7 @@ def get_insights(expiry=None, compact=True, include_raw=False):
     if not insights.get("data_flags", {}).get("option_chain"):
         return {
             "ok": False,
-            "error": "No saved option-chain snapshot is available yet. The backend scheduler will refresh data in the background; please retry shortly.",
+            "error": "Option-chain data is unavailable from both live Delta and saved snapshots. Please retry shortly.",
             "expiry": selected_expiry,
             "expiries": expiries,
             "insights": to_jsonable(insights if include_raw else _compact_insights(insights)),
@@ -131,17 +191,6 @@ def get_insights(expiry=None, compact=True, include_raw=False):
         "expiry": selected_expiry,
         "expiries": expiries,
         "insights": to_jsonable(insights if include_raw or not compact else _compact_insights(insights)),
-    }
-
-
-def get_charts(expiry=None, symbol="ETHUSD", limit=150):
-    limit = min(int(limit or 150), 300)
-    return {
-        "ok": True,
-        "analytics": to_jsonable(database_reader.get_analytics_snapshots(expiry_label=expiry, limit=limit)),
-        "premium_decay": to_jsonable(database_reader.get_premium_decay_snapshots(expiry_label=expiry, limit=limit)),
-        "option_chain": to_jsonable(database_reader.get_option_chain_snapshots(expiry_label=expiry, limit=limit)),
-        "orderbook": to_jsonable(database_reader.get_orderbook_insight_snapshots(symbol=symbol, limit=limit)),
     }
 
 

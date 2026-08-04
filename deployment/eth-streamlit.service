@@ -10,7 +10,6 @@ Group=deploy
 WorkingDirectory=/opt/eth-options-command-center
 EnvironmentFile=-/opt/eth-options-command-center/.env
 Environment=PYTHONUNBUFFERED=1
-Environment=FUTURES_LIVE_TRADING_ENABLED=false
 Environment=BACKEND_SCHEDULER_ENABLED=true
 Environment=BACKEND_JOB_TIMEOUT_SECONDS=50
 Environment=FASTAPI_BACKEND_URL=http://127.0.0.1:8000

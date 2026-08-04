@@ -17,6 +17,8 @@ from database_reader import (
     get_volume_profile,
 )
 from delta_api import get_eth_options, get_eth_spot_price
+from market_data import fetch_ohlcv
+from orderbook_engine import get_eth_orderbook_insights
 
 
 DEFAULT_SYMBOL = "ETHUSD"
@@ -204,6 +206,58 @@ def _latest_orderbook(symbol=DEFAULT_SYMBOL):
     )
 
     return df.iloc[0].to_dict() if not df.empty else {}
+
+
+def _live_orderbook(symbol=DEFAULT_SYMBOL):
+    if symbol != DEFAULT_SYMBOL:
+        return {}
+
+    try:
+        response = get_eth_orderbook_insights(depth=20)
+    except Exception as e:
+        print("Live orderbook fetch failed:", e)
+        return {}
+
+    insights = response.get("insights") or {}
+
+    if insights.get("status") != "ok":
+        return {}
+
+    live_orderbook = dict(insights)
+    live_orderbook["eth_price"] = live_orderbook.get("mid_price")
+    return live_orderbook
+
+
+def _current_orderbook(symbol=DEFAULT_SYMBOL, prefer_live=True):
+    if prefer_live:
+        orderbook = _live_orderbook(symbol=symbol)
+
+        if orderbook:
+            return orderbook, "live_delta"
+
+    orderbook = _latest_orderbook(symbol=symbol)
+    return orderbook, "supabase" if orderbook else None
+
+
+def _live_ohlcv(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION, limit=300):
+    minutes_back = max(int(limit or 300) * 5, 120)
+
+    try:
+        return fetch_ohlcv(symbol=symbol, resolution=resolution, minutes_back=minutes_back)
+    except Exception as e:
+        print("Live OHLCV fetch failed:", e)
+        return pd.DataFrame()
+
+
+def _current_ohlcv(symbol=DEFAULT_SYMBOL, resolution=DEFAULT_RESOLUTION, limit=300, prefer_live=True):
+    if prefer_live:
+        ohlcv_df = _live_ohlcv(symbol=symbol, resolution=resolution, limit=limit)
+
+        if not ohlcv_df.empty:
+            return ohlcv_df, "live_delta"
+
+    ohlcv_df = get_latest_ohlcv_data(symbol=symbol, resolution=resolution, limit=limit)
+    return ohlcv_df, "supabase" if not ohlcv_df.empty else None
 
 
 def _prepare_option_chain(df):
@@ -2232,6 +2286,7 @@ def build_rule_based_insights(
 ):
     generated_at = _utc_now().isoformat()
     expiry_profile = _expiry_profile(expiry_label)
+    live_option_context = {}
     analytics = _latest_analytics(expiry_label)
     premium, previous_premium = _latest_premium_pair(expiry_label)
     option_latest_df, option_previous_df = _latest_snapshot_pair_for_expiry(
@@ -2241,32 +2296,32 @@ def build_rule_based_insights(
     )
     option_df = _prepare_option_chain(option_latest_df)
     previous_option_df = _prepare_option_chain(option_previous_df)
-    live_option_context = {}
     option_chain_source = "supabase"
+    analytics_source = "supabase" if analytics else None
 
-    if option_df.empty and allow_live_delta_fallback:
+    if allow_live_delta_fallback:
         live_option_context = _live_option_context(expiry_label)
 
-        if not live_option_context.get("option_df", pd.DataFrame()).empty:
-            option_df = live_option_context.get("option_df")
-            option_chain_source = "live_delta"
+    if not live_option_context.get("option_df", pd.DataFrame()).empty:
+        option_df = live_option_context.get("option_df")
+        option_chain_source = "live_delta"
+        analytics = {
+            **analytics,
+            **(live_option_context.get("analytics") or {}),
+        }
+        premium = {
+            **premium,
+            **(live_option_context.get("premium") or {}),
+        }
+        analytics_source = "live_delta"
 
-            if not analytics:
-                analytics = live_option_context.get("analytics") or {}
-            else:
-                for key, value in (live_option_context.get("analytics") or {}).items():
-                    if analytics.get(key) is None:
-                        analytics[key] = value
-
-            if not premium:
-                premium = live_option_context.get("premium") or {}
-            else:
-                for key, value in (live_option_context.get("premium") or {}).items():
-                    if premium.get(key) is None:
-                        premium[key] = value
-
-    orderbook = _latest_orderbook(symbol=symbol)
-    ohlcv_df = get_latest_ohlcv_data(symbol=symbol, resolution=resolution, limit=300)
+    orderbook, orderbook_source = _current_orderbook(symbol=symbol, prefer_live=allow_live_delta_fallback)
+    ohlcv_df, ohlcv_source = _current_ohlcv(
+        symbol=symbol,
+        resolution=resolution,
+        limit=300,
+        prefer_live=allow_live_delta_fallback,
+    )
     events_df = get_market_events(symbol=symbol, resolution=resolution, limit=200)
     zones_df = get_smc_zones(symbol=symbol, resolution=resolution, status="active", limit=200)
     profile_df = get_volume_profile(symbol=symbol, resolution=resolution, limit=100)
@@ -2515,15 +2570,11 @@ def build_rule_based_insights(
         risk_warnings.append("Signal conflict is high; avoid treating this as a clean setup.")
 
     if no_executable_strategy:
-        risk_warnings.append("Recommended structure has incomplete strikes in the latest option-chain snapshot.")
+        risk_warnings.append("Recommended structure has incomplete strikes in the latest option-chain data.")
 
-    if option_chain_source == "live_delta":
+    if option_chain_source == "supabase" and not option_df.empty and live_option_context.get("error"):
         risk_warnings.append(
-            "Option-chain snapshot was missing in Supabase; live Delta option data was used for this calculation."
-        )
-    elif live_option_context.get("error"):
-        risk_warnings.append(
-            "Option-chain snapshot was missing and live Delta fallback failed: "
+            "Live Delta option data was unavailable; saved option-chain data was used. Delta error: "
             + live_option_context.get("error")
         )
 
@@ -2581,6 +2632,9 @@ def build_rule_based_insights(
         "data_flags": data_flags,
         "missing_sources": missing_sources,
         "option_chain_source": option_chain_source,
+        "analytics_source": analytics_source,
+        "orderbook_source": orderbook_source,
+        "ohlcv_source": ohlcv_source,
         "option_selling_environment": volatility_context.get("option_selling_environment"),
         "momentum": price_action.get("momentum"),
         "call_wall": chain_context.get("call_wall"),

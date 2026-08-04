@@ -2,7 +2,7 @@
 
 This guide deploys the ETH Options Command Center on a single Ubuntu 24.04 Droplet with FastAPI, APScheduler, Streamlit, systemd services, Supabase, and public Delta Exchange APIs.
 
-The deployment keeps private Delta trading disabled by default. Do not add `DELTA_API_KEY` or `DELTA_API_SECRET` unless you intentionally need private API features, and keep `FUTURES_LIVE_TRADING_ENABLED=false` in production.
+The deployment uses public Delta market-data endpoints by default. Add `DELTA_API_KEY` or `DELTA_API_SECRET` only if you intentionally need private API features elsewhere.
 
 ## 1. Create The Droplet
 
@@ -43,7 +43,6 @@ SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_key
 USE_FASTAPI_BACKEND=true
 FASTAPI_BACKEND_URL=http://127.0.0.1:8000
-FUTURES_LIVE_TRADING_ENABLED=false
 BACKEND_SCHEDULER_ENABLED=true
 BACKEND_JOB_TIMEOUT_SECONDS=50
 ```
@@ -157,7 +156,6 @@ systemctl status eth-streamlit
 - Virtual environment created at `venv/`.
 - Root and backend requirements installed.
 - `.env` configured with Supabase values.
-- `FUTURES_LIVE_TRADING_ENABLED=false`.
 - `BACKEND_SCHEDULER_ENABLED=true`.
 - `BACKEND_JOB_TIMEOUT_SECONDS=50`.
 - Delta private keys omitted for public API mode.

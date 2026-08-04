@@ -95,5 +95,5 @@ st.dataframe(
 )
 
 st.caption(
-    "Use this page for full table inspection. Charts and insights are separated into their own pages."
+    "Use this page for full table inspection. Insights are separated into their own page."
 )

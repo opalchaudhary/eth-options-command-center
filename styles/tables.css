@@ -24,7 +24,6 @@
     border-radius: var(--radius-card);
 }
 
-.st-key-option_chain_table [data-testid="stDataFrame"],
-.st-key-paper_journal [data-testid="stDataFrame"] {
+.st-key-option_chain_table [data-testid="stDataFrame"] {
     box-shadow: 0 8px 22px rgba(16, 42, 67, 0.07);
 }

@@ -9,7 +9,6 @@ STYLE_FILES = [
     "styles/cards.css",
     "styles/tables.css",
     "styles/sidebar.css",
-    "styles/paper_trading.css",
 ]
 
 

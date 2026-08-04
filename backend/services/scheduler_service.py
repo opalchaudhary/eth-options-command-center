@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from backend import config
-from backend.services import futures_trading_service, market_data_service, paper_trading_service
+from backend.services import market_data_service
 from data_refresh import cleanup_retained_snapshots, refresh_smc_sources, refresh_volume_profile_sources
 
 
@@ -22,8 +22,6 @@ _state_lock = threading.Lock()
 _job_locks = {
     "market_refresh": threading.Lock(),
     "option_chain_refresh": threading.Lock(),
-    "paper_trading": threading.Lock(),
-    "futures_trading": threading.Lock(),
     "smc_refresh": threading.Lock(),
     "volume_profile_refresh": threading.Lock(),
     "retention_cleanup": threading.Lock(),
@@ -224,18 +222,6 @@ def start_scheduler():
         config.OPTION_CHAIN_REFRESH_INTERVAL_SECONDS,
         True,
     )
-    _add_interval_job(
-        "paper_trading",
-        paper_trading_service.run_cycle,
-        config.PAPER_TRADING_INTERVAL_SECONDS,
-        start_delay_seconds=60,
-    )
-    _add_interval_job(
-        "futures_trading",
-        futures_trading_service.run_cycle,
-        config.FUTURES_TRADING_INTERVAL_SECONDS,
-        start_delay_seconds=120,
-    )
     _add_interval_job("smc_refresh", refresh_smc_sources, config.SMC_REFRESH_INTERVAL_SECONDS)
     _add_interval_job(
         "volume_profile_refresh",
@@ -290,8 +276,6 @@ def scheduler_status():
         "job_timeout_seconds": config.BACKEND_JOB_TIMEOUT_SECONDS,
         "last_successful_market_refresh": job_state["market_refresh"].get("last_success_at"),
         "last_option_chain_refresh": job_state["option_chain_refresh"].get("last_success_at"),
-        "last_paper_trading_cycle": job_state["paper_trading"].get("last_success_at"),
-        "last_futures_cycle": job_state["futures_trading"].get("last_success_at"),
         "skipped_cycles": skipped_cycles,
         "running_jobs": running_jobs,
         "jobs": jobs,

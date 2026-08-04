@@ -59,36 +59,6 @@ def insights(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.get("/charts")
-@ttl_cache(60)
-def charts(
-    expiry: str | None = Query(default=None),
-    symbol: str = Query(default="ETHUSD"),
-    limit: int = Query(default=150, ge=25, le=300),
-    compact: bool = Query(default=True),
-    include_raw: bool = Query(default=False),
-):
-    try:
-        return market_data_service.get_charts(expiry=expiry, symbol=symbol, limit=limit)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@router.get("/analytics")
-@ttl_cache(60)
-def analytics(
-    expiry: str | None = Query(default=None),
-    symbol: str = Query(default="ETHUSD"),
-    limit: int = Query(default=150, ge=25, le=300),
-    compact: bool = Query(default=True),
-    include_raw: bool = Query(default=False),
-):
-    try:
-        return market_data_service.get_charts(expiry=expiry, symbol=symbol, limit=limit)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @router.get("/recommendations")
 @ttl_cache(60)
 def recommendations(limit: int = Query(default=25, ge=1, le=100), compact: bool = Query(default=True)):

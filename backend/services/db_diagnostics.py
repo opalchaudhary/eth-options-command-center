@@ -2,11 +2,7 @@ from pathlib import Path
 
 
 ENGINE_TABLES = [
-    "paper_trading_engine_runs",
-    "paper_recommendation_evaluations",
-    "futures_trading_engine_runs",
     "recommendation_journal",
-    "alt_futures_scanner_snapshots",
 ]
 
 
@@ -25,37 +21,18 @@ select
   s.last_autovacuum
 from pg_stat_user_tables s
 where s.relname in (
-  'paper_trading_engine_runs',
-  'paper_recommendation_evaluations',
-  'futures_trading_engine_runs',
-  'recommendation_journal',
-  'alt_futures_scanner_snapshots'
+  'recommendation_journal'
 )
 order by total_size_bytes desc;
 
 with recent as (
-  select 'paper_trading_engine_runs' as table_name, date_trunc('minute', created_at) as minute, count(*) as inserts
-  from paper_trading_engine_runs where created_at > now() - interval '1 hour' group by 1, 2
-  union all
-  select 'paper_recommendation_evaluations', date_trunc('minute', created_at), count(*)
-  from paper_recommendation_evaluations where created_at > now() - interval '1 hour' group by 1, 2
-  union all
-  select 'futures_trading_engine_runs', date_trunc('minute', created_at), count(*)
-  from futures_trading_engine_runs where created_at > now() - interval '1 hour' group by 1, 2
-  union all
-  select 'recommendation_journal', date_trunc('minute', created_at), count(*)
+  select 'recommendation_journal' as table_name, date_trunc('minute', created_at) as minute, count(*) as inserts
   from recommendation_journal where created_at > now() - interval '1 hour' group by 1, 2
-  union all
-  select 'alt_futures_scanner_snapshots', date_trunc('minute', created_at), count(*)
-  from alt_futures_scanner_snapshots where created_at > now() - interval '1 hour' group by 1, 2
 )
 select table_name, max(inserts) as peak_inserts_per_minute, avg(inserts)::numeric(10,2) as avg_inserts_per_minute
 from recent
 group by table_name
 order by peak_inserts_per_minute desc;
-
-select 'paper_trading_engine_runs' as table_name, pg_column_size(t)::bigint as row_size_bytes, created_at
-from paper_trading_engine_runs t order by pg_column_size(t) desc limit 5;
 """
 
 

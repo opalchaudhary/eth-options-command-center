@@ -75,12 +75,9 @@ SUPABASE_URL = get_config_value("SUPABASE_URL")
 SUPABASE_KEY = get_config_value("SUPABASE_KEY")
 FASTAPI_BACKEND_URL = get_config_value("FASTAPI_BACKEND_URL", "http://127.0.0.1:8000")
 USE_FASTAPI_BACKEND = get_bool_config("USE_FASTAPI_BACKEND", True)
-FUTURES_LIVE_TRADING_ENABLED = get_bool_config("FUTURES_LIVE_TRADING_ENABLED", False)
 BACKEND_SCHEDULER_ENABLED = get_bool_config("BACKEND_SCHEDULER_ENABLED", True)
 BACKEND_JOB_TIMEOUT_SECONDS = get_int_config("BACKEND_JOB_TIMEOUT_SECONDS", 50)
 MARKET_REFRESH_INTERVAL_SECONDS = get_int_config("MARKET_REFRESH_INTERVAL_SECONDS", 900)
-PAPER_TRADING_INTERVAL_SECONDS = get_int_config("PAPER_TRADING_INTERVAL_SECONDS", 900)
-FUTURES_TRADING_INTERVAL_SECONDS = get_int_config("FUTURES_TRADING_INTERVAL_SECONDS", 900)
 OPTION_CHAIN_REFRESH_INTERVAL_SECONDS = get_int_config("OPTION_CHAIN_REFRESH_INTERVAL_SECONDS", 1800)
 SMC_REFRESH_INTERVAL_SECONDS = get_int_config("SMC_REFRESH_INTERVAL_SECONDS", 1800)
 VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS = get_int_config("VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS", 3600)
@@ -100,12 +97,9 @@ _sync_env_value("SUPABASE_URL", SUPABASE_URL)
 _sync_env_value("SUPABASE_KEY", SUPABASE_KEY)
 _sync_env_value("FASTAPI_BACKEND_URL", FASTAPI_BACKEND_URL)
 _sync_env_value("USE_FASTAPI_BACKEND", str(USE_FASTAPI_BACKEND).lower())
-_sync_env_value("FUTURES_LIVE_TRADING_ENABLED", str(FUTURES_LIVE_TRADING_ENABLED).lower())
 _sync_env_value("BACKEND_SCHEDULER_ENABLED", str(BACKEND_SCHEDULER_ENABLED).lower())
 _sync_env_value("BACKEND_JOB_TIMEOUT_SECONDS", str(BACKEND_JOB_TIMEOUT_SECONDS))
 _sync_env_value("MARKET_REFRESH_INTERVAL_SECONDS", MARKET_REFRESH_INTERVAL_SECONDS)
-_sync_env_value("PAPER_TRADING_INTERVAL_SECONDS", PAPER_TRADING_INTERVAL_SECONDS)
-_sync_env_value("FUTURES_TRADING_INTERVAL_SECONDS", FUTURES_TRADING_INTERVAL_SECONDS)
 _sync_env_value("OPTION_CHAIN_REFRESH_INTERVAL_SECONDS", OPTION_CHAIN_REFRESH_INTERVAL_SECONDS)
 _sync_env_value("SMC_REFRESH_INTERVAL_SECONDS", SMC_REFRESH_INTERVAL_SECONDS)
 _sync_env_value("VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS", VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS)
@@ -122,9 +116,7 @@ def delta_status():
         "api_key_configured": bool(DELTA_API_KEY),
         "api_secret_configured": bool(DELTA_API_SECRET),
         "private_api_configured": private_api_configured,
-        "private_trading_enabled": bool(
-            FUTURES_LIVE_TRADING_ENABLED and private_api_configured
-        ),
+        "private_trading_enabled": False,
     }
 
 
@@ -149,11 +141,5 @@ def log_startup_config():
     logger.info("Backend job timeout seconds: %s", BACKEND_JOB_TIMEOUT_SECONDS)
     logger.info("Market refresh interval seconds: %s", MARKET_REFRESH_INTERVAL_SECONDS)
     logger.info("Option chain refresh interval seconds: %s", OPTION_CHAIN_REFRESH_INTERVAL_SECONDS)
-    logger.info("Paper trading interval seconds: %s", PAPER_TRADING_INTERVAL_SECONDS)
-    logger.info("Futures trading interval seconds: %s", FUTURES_TRADING_INTERVAL_SECONDS)
     logger.info("SMC refresh interval seconds: %s", SMC_REFRESH_INTERVAL_SECONDS)
     logger.info("Volume profile refresh interval seconds: %s", VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS)
-    logger.info(
-        "Futures live trading enabled: %s",
-        bool(FUTURES_LIVE_TRADING_ENABLED and DELTA_API_KEY and DELTA_API_SECRET),
-    )

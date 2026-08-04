@@ -322,7 +322,11 @@ try:
                     st.warning("No ask data available.")
 
     else:
-        st.warning(orderbook_insights.get("message", "Order book data unavailable."))
+        st.warning(
+            orderbook_insights.get("message")
+            or eth_price_data.get("orderbook_error")
+            or "Order book data unavailable."
+        )
 
 except Exception as e:
     st.warning(f"Order book intelligence unavailable: {e}")
@@ -331,7 +335,7 @@ except Exception as e:
 st.divider()
 
 st.info(
-    "Use the sidebar navigation for Charts, Option Chain, Insights, Paper Trading, Futures Trading, and Alt Futures Scanner. "
+    "Use the sidebar navigation for Option Chain and Insights. "
     "This home page is intentionally kept clean for quick market reading."
 )
 

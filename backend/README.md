@@ -1,6 +1,6 @@
 # FastAPI Backend
 
-This backend moves market-data fetching, analytics refreshes, Supabase writes, and paper/futures trading cycles out of Streamlit.
+This backend moves market-data fetching, analytics refreshes, and Supabase writes out of Streamlit.
 
 ## Run Locally
 
@@ -57,8 +57,6 @@ Default background jobs:
 
 - market refresh every 300 seconds
 - option chain refresh every 300 seconds
-- paper trading cycle every 300 seconds
-- futures simulation cycle every 300 seconds
 - SMC refresh every 900 seconds
 - volume profile refresh every 900 seconds
 - retention cleanup every 3600 seconds
@@ -75,8 +73,6 @@ Scheduler controls:
 BACKEND_SCHEDULER_ENABLED=true
 BACKEND_JOB_TIMEOUT_SECONDS=50
 MARKET_REFRESH_INTERVAL_SECONDS=300
-PAPER_TRADING_INTERVAL_SECONDS=300
-FUTURES_TRADING_INTERVAL_SECONDS=300
 OPTION_CHAIN_REFRESH_INTERVAL_SECONDS=300
 SMC_REFRESH_INTERVAL_SECONDS=900
 VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS=900
@@ -99,11 +95,7 @@ The frontend should call:
 - `GET /market/eth`
 - `GET /option-chain`
 - `GET /insights`
-- `GET /paper-trading/status`
-- `POST /paper-trading/run-cycle`
-- `GET /futures-trading/status`
-- `POST /futures-trading/run-cycle`
 
 ## DigitalOcean Path
 
-A later deployment can run FastAPI as its own service on a Droplet or App Platform container, then set `FASTAPI_BACKEND_URL` in Streamlit to the public backend URL. Keep Supabase tables unchanged; this backend reuses the existing storage modules and migrations.
+A later deployment can run FastAPI as its own service on a Droplet or App Platform container, then set `FASTAPI_BACKEND_URL` in Streamlit to the public backend URL. Keep Supabase tables unchanged; this backend reuses the existing source-data migrations.
