@@ -42,18 +42,35 @@ def _position_size(position):
     return safe_float(position.get("size")) or 0.0
 
 
-def _position_greeks(position, tickers_by_symbol):
+def _account_delta_multiplier(account_config):
+    label = str(account_config.get("label") or "").strip().lower()
+    account_id = str(account_config.get("id") or "").strip().lower()
+
+    if label == "ethlongaccount" or account_id == "ethlongaccount":
+        return 0.01
+
+    if label == "ethshortaccount" or account_id == "ethshortaccount":
+        return -0.01
+
+    return None
+
+
+def _position_greeks(position, tickers_by_symbol, account_config):
     symbol = _position_symbol(position)
     ticker = tickers_by_symbol.get(symbol) or {}
     greeks = ticker.get("greeks") or {}
     size = _position_size(position)
     contract_type = _position_contract_type(position)
+    delta_multiplier = _account_delta_multiplier(account_config)
 
     values = {}
 
     for key in GREEK_KEYS:
         greek = safe_float(greeks.get(key))
         values[key] = (size * greek) / 100 if greek is not None else 0.0
+
+    if delta_multiplier is not None:
+        values["delta"] = size * delta_multiplier
 
     if contract_type not in OPTION_CONTRACT_TYPES:
         values["gamma"] = 0.0
@@ -63,12 +80,12 @@ def _position_greeks(position, tickers_by_symbol):
     return values
 
 
-def _summarize_positions(positions, tickers_by_symbol):
+def _summarize_positions(positions, tickers_by_symbol, account_config):
     rows = []
     totals = {key: 0.0 for key in GREEK_KEYS}
 
     for position in positions:
-        greeks = _position_greeks(position, tickers_by_symbol)
+        greeks = _position_greeks(position, tickers_by_symbol, account_config)
 
         for key in GREEK_KEYS:
             totals[key] += greeks[key]
@@ -181,7 +198,7 @@ def get_accounts_snapshot():
                 account_config["api_secret"],
             )
 
-            position_rows, greeks = _summarize_positions(positions, tickers_by_symbol)
+            position_rows, greeks = _summarize_positions(positions, tickers_by_symbol, account_config)
             wallet_rows, balance_summary = _wallet_rows_and_totals(wallet_payload)
 
             account.update({
