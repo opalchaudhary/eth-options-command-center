@@ -53,7 +53,7 @@ def _position_greeks(position, tickers_by_symbol):
 
     for key in GREEK_KEYS:
         greek = safe_float(greeks.get(key))
-        values[key] = size * greek if greek is not None else 0.0
+        values[key] = (size * greek) / 100 if greek is not None else 0.0
 
     if contract_type not in OPTION_CONTRACT_TYPES:
         values["gamma"] = 0.0
