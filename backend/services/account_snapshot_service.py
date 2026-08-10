@@ -70,7 +70,7 @@ def _position_greeks(position, tickers_by_symbol, account_config):
         values[key] = (size * greek) / 100 if greek is not None else 0.0
 
     if delta_multiplier is not None:
-        values["delta"] = size * delta_multiplier
+        values["delta"] = abs(size) * delta_multiplier
 
     if contract_type not in OPTION_CONTRACT_TYPES:
         values["gamma"] = 0.0
