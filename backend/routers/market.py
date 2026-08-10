@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from backend.services import market_data_service
+from backend.services import account_snapshot_service, market_data_service
 from backend.services.cache import ttl_cache
 from recommendation_journal import get_latest_recommendations
 from backend.services.json_utils import to_jsonable
@@ -65,5 +65,14 @@ def recommendations(limit: int = Query(default=25, ge=1, le=100), compact: bool 
     try:
         rows = get_latest_recommendations(limit=limit)
         return {"ok": True, "rows": to_jsonable(rows)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/accounts/subwallets")
+@ttl_cache(15)
+def subwallet_accounts():
+    try:
+        return account_snapshot_service.get_accounts_snapshot()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

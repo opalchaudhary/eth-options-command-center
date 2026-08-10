@@ -86,6 +86,48 @@ OPTION_CHAIN_REFRESH_MAX_EXPIRIES = get_int_config("OPTION_CHAIN_REFRESH_MAX_EXP
 SUPABASE_HISTORY_READ_LIMIT = get_int_config("SUPABASE_HISTORY_READ_LIMIT", 150)
 
 
+def delta_account_credentials():
+    accounts = []
+
+    if DELTA_API_KEY and DELTA_API_SECRET:
+        accounts.append({
+            "id": "main",
+            "label": get_config_value("DELTA_MAIN_ACCOUNT_NAME", "Main Account"),
+            "api_key": DELTA_API_KEY,
+            "api_secret": DELTA_API_SECRET,
+            "kind": "main",
+        })
+
+    for index in range(1, 11):
+        api_key = (
+            get_config_value(f"DELTA_SUBWALLET_{index}_API_KEY")
+            or get_config_value(f"DELTA_SUBACCOUNT_{index}_API_KEY")
+        )
+        api_secret = (
+            get_config_value(f"DELTA_SUBWALLET_{index}_API_SECRET")
+            or get_config_value(f"DELTA_SUBACCOUNT_{index}_API_SECRET")
+        )
+
+        if not (api_key and api_secret):
+            continue
+
+        label = (
+            get_config_value(f"DELTA_SUBWALLET_{index}_NAME")
+            or get_config_value(f"DELTA_SUBACCOUNT_{index}_NAME")
+            or f"Sub Wallet {index}"
+        )
+
+        accounts.append({
+            "id": f"subwallet_{index}",
+            "label": label,
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "kind": "subwallet",
+        })
+
+    return accounts
+
+
 def _sync_env_value(key, value):
     if value not in [None, ""]:
         os.environ.setdefault(key, str(value))
@@ -110,6 +152,7 @@ _sync_env_value("SUPABASE_HISTORY_READ_LIMIT", SUPABASE_HISTORY_READ_LIMIT)
 
 def delta_status():
     private_api_configured = bool(DELTA_API_KEY and DELTA_API_SECRET)
+    configured_accounts = delta_account_credentials()
 
     return {
         "public_api_mode": True,
@@ -117,6 +160,7 @@ def delta_status():
         "api_secret_configured": bool(DELTA_API_SECRET),
         "private_api_configured": private_api_configured,
         "private_trading_enabled": False,
+        "configured_account_count": len(configured_accounts),
     }
 
 

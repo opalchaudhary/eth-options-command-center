@@ -1,7 +1,14 @@
+import hashlib
+import hmac
+import json
+import time
+from urllib.parse import urlencode
+
 import requests
 import pandas as pd
 
 BASE_URL = "https://api.india.delta.exchange/v2"
+USER_AGENT = "python-requests/eth-options-command-center"
 
 
 def safe_float(value):
@@ -11,6 +18,86 @@ def safe_float(value):
         return float(value)
     except (ValueError, TypeError):
         return None
+
+
+def _clean_params(params):
+    if not params:
+        return {}
+
+    return {
+        key: value
+        for key, value in params.items()
+        if value not in [None, ""]
+    }
+
+
+def _encoded_query(params):
+    cleaned = _clean_params(params)
+
+    if not cleaned:
+        return ""
+
+    return "?" + urlencode(cleaned)
+
+
+def _signed_headers(api_key, api_secret, method, path, params=None, body=None):
+    timestamp = str(int(time.time()))
+    query_string = _encoded_query(params)
+    payload = json.dumps(body, separators=(",", ":")) if body else ""
+    signature_data = method.upper() + timestamp + path + query_string + payload
+    signature = hmac.new(
+        str(api_secret).encode("utf-8"),
+        signature_data.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "api-key": str(api_key),
+        "signature": signature,
+        "timestamp": timestamp,
+    }
+
+
+def delta_private_get(path, api_key, api_secret, params=None, timeout=15):
+    params = _clean_params(params)
+    headers = _signed_headers(api_key, api_secret, "GET", path, params=params)
+    response = requests.get(
+        f"{BASE_URL}{path}",
+        params=params,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_private_positions(api_key, api_secret, underlying_asset_symbol="ETH"):
+    params = {
+        "underlying_asset_symbol": underlying_asset_symbol,
+    }
+    return delta_private_get("/positions", api_key, api_secret, params=params).get("result")
+
+
+def get_margined_positions(api_key, api_secret, contract_types=None):
+    params = {}
+
+    if contract_types:
+        params["contract_types"] = contract_types
+
+    result = delta_private_get("/positions/margined", api_key, api_secret, params=params).get("result")
+
+    return result or []
+
+
+def get_wallet_balances(api_key, api_secret):
+    return delta_private_get("/wallet/balances", api_key, api_secret)
+
+
+def get_sub_accounts(api_key, api_secret):
+    return delta_private_get("/sub_accounts", api_key, api_secret).get("result") or []
 
 
 def iv_to_percent(value):
