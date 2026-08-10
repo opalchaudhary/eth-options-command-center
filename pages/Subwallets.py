@@ -12,8 +12,10 @@ st.set_page_config(
 
 load_css()
 
-st.title("Subwallets")
+st.title("My Account")
 st.caption("Main account and subwallet positions, computed Greeks, balances, and aggregate exposure.")
+
+USD_TO_INR = 85
 
 
 def _fmt_number(value, digits=4):
@@ -31,7 +33,7 @@ def _fmt_money(value):
         if value is None:
             return "NA"
 
-        return f"{float(value):,.2f}"
+        return f"INR {float(value) * USD_TO_INR:,.2f}"
     except (TypeError, ValueError):
         return "NA"
 
@@ -106,15 +108,6 @@ ab1.metric("Net Equity", _fmt_money(aggregate.get("net_equity")))
 ab2.metric("Total Balance", _fmt_money(aggregate.get("balance")))
 ab3.metric("Available Balance", _fmt_money(aggregate.get("available_balance")))
 ab4.metric("Blocked Margin", _fmt_money(aggregate.get("blocked_margin")))
-
-aggregate_balance_rows = _flatten_balance_summary({"by_asset": aggregate.get("balances_by_asset") or {}})
-
-with st.expander("Aggregate Balance By Asset", expanded=True):
-    if aggregate_balance_rows:
-        st.dataframe(pd.DataFrame(aggregate_balance_rows), use_container_width=True, hide_index=True)
-    else:
-        st.warning("No aggregate wallet balances available.")
-
 
 st.divider()
 st.subheader("Accounts")
