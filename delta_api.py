@@ -44,7 +44,8 @@ def _signed_headers(api_key, api_secret, method, path, params=None, body=None):
     timestamp = str(int(time.time()))
     query_string = _encoded_query(params)
     payload = json.dumps(body, separators=(",", ":")) if body else ""
-    signature_data = method.upper() + timestamp + path + query_string + payload
+    signature_path = f"/v2{path}" if path.startswith("/") else f"/v2/{path}"
+    signature_data = method.upper() + timestamp + signature_path + query_string + payload
     signature = hmac.new(
         str(api_secret).encode("utf-8"),
         signature_data.encode("utf-8"),
