@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "DeltaForge",
+    "slug": "deltaforge-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "deltaforge",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "plugins": [
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true
+        }
+      ]
+    ],
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "in.deltaforge.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#071013"
+      }
+    },
+    "extra": {
+      "apiBaseUrl": "https://deltaforge.in/api"
+    }
+  }
+}

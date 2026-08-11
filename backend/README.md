@@ -18,6 +18,7 @@ DELTA_API_KEY=...
 DELTA_API_SECRET=...
 SUPABASE_URL=...
 SUPABASE_KEY=...
+MOBILE_API_TOKEN=...
 ```
 
 You can copy `backend/.env.example` to either `.env` in the project root or `backend/.env` for local development. System environment variables take priority over file values.
@@ -95,6 +96,31 @@ The frontend should call:
 - `GET /market/eth`
 - `GET /option-chain`
 - `GET /insights`
+
+## Private Mobile API
+
+The private read-only mobile API is mounted under:
+
+```text
+/mobile
+```
+
+Through the production Nginx `/api/` proxy these routes are reachable as:
+
+```text
+https://deltaforge.in/api/mobile/health
+https://deltaforge.in/api/mobile/home
+https://deltaforge.in/api/mobile/subwallets
+https://deltaforge.in/api/mobile/iron-fly
+```
+
+All mobile routes require:
+
+```text
+Authorization: Bearer <MOBILE_API_TOKEN>
+```
+
+Set `MOBILE_API_TOKEN` only in the server environment or `.env`. Do not commit the actual token.
 
 ## DigitalOcean Path
 
