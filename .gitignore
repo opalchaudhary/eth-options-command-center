@@ -5,3 +5,4 @@ backend/.env
 .streamlit/
 logs/*
 !logs/.gitkeep
+mobile/node_modules/
