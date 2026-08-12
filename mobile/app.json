@@ -27,7 +27,10 @@
       }
     },
     "extra": {
-      "apiBaseUrl": "https://deltaforge.in/api"
+      "apiBaseUrl": "https://deltaforge.in/api",
+      "eas": {
+        "projectId": "440aefc8-6a0d-43dd-bc6f-372c767281cf"
+      }
     }
   }
 }
