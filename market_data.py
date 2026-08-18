@@ -6,6 +6,82 @@ from datetime import datetime, timezone, timedelta
 DELTA_BASE_URL = "https://api.india.delta.exchange"
 
 
+def _parse_ohlcv_response(response, symbol, resolution):
+    data = response.json()
+
+    if not data.get("success"):
+        print("Delta OHLCV API error:", data)
+        return pd.DataFrame()
+
+    candles = data.get("result", [])
+
+    if not candles:
+        print(f"No OHLCV candles received from Delta for {symbol} {resolution}.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(candles)
+
+    required_columns = ["time", "open", "high", "low", "close", "volume"]
+
+    for col in required_columns:
+        if col not in df.columns:
+            print(f"Missing column in OHLCV response: {col}")
+            return pd.DataFrame()
+
+    df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    numeric_columns = ["open", "high", "low", "close", "volume"]
+
+    for col in numeric_columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=numeric_columns)
+
+    df = df[
+        [
+            "timestamp",
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    ]
+
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def fetch_ohlcv_window(symbol="ETHUSD", resolution="5m", start_at=None, end_at=None):
+    if start_at is None or end_at is None:
+        return pd.DataFrame()
+
+    start_time = int(pd.Timestamp(start_at).timestamp())
+    end_time = int(pd.Timestamp(end_at).timestamp())
+
+    if end_time <= start_time:
+        return pd.DataFrame()
+
+    url = f"{DELTA_BASE_URL}/v2/history/candles"
+    params = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "start": start_time,
+        "end": end_time,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return _parse_ohlcv_response(response, symbol, resolution)
+    except requests.exceptions.RequestException as e:
+        print("Network/API error while fetching OHLCV:", e)
+        return pd.DataFrame()
+    except Exception as e:
+        print("Unexpected error while fetching OHLCV:", e)
+        return pd.DataFrame()
+
+
 def fetch_ohlcv(symbol="ETHUSD", resolution="5m", minutes_back=720):
     """
     Fetch OHLCV candle data from Delta Exchange India.
@@ -37,51 +113,7 @@ def fetch_ohlcv(symbol="ETHUSD", resolution="5m", minutes_back=720):
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
 
-        data = response.json()
-
-        if not data.get("success"):
-            print("Delta OHLCV API error:", data)
-            return pd.DataFrame()
-
-        candles = data.get("result", [])
-
-        if not candles:
-            print(f"No OHLCV candles received from Delta for {symbol} {resolution}.")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(candles)
-
-        required_columns = ["time", "open", "high", "low", "close", "volume"]
-
-        for col in required_columns:
-            if col not in df.columns:
-                print(f"Missing column in OHLCV response: {col}")
-                return pd.DataFrame()
-
-        df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
-        numeric_columns = ["open", "high", "low", "close", "volume"]
-
-        for col in numeric_columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna(subset=numeric_columns)
-
-        df = df[
-            [
-                "timestamp",
-                "time",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-        ]
-
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        return df
+        return _parse_ohlcv_response(response, symbol, resolution)
 
     except requests.exceptions.RequestException as e:
         print("Network/API error while fetching OHLCV:", e)

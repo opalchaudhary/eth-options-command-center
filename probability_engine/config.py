@@ -35,6 +35,7 @@ class ProbabilityEngineConfig:
     strike_scan_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_STRIKE_SCAN_INTERVAL", 900))
     outcome_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_OUTCOME_INTERVAL", 300))
     performance_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_PERFORMANCE_INTERVAL", 86400))
+    outcome_batch_limit: int = field(default_factory=lambda: _int_env("PROBABILITY_OUTCOME_BATCH_LIMIT", 25))
     horizons: list[str] = field(default_factory=lambda: _csv_env("PROBABILITY_HORIZONS", "1h,2h,4h,8h,12h,24h"))
     symbol: str = field(default_factory=lambda: os.getenv("PROBABILITY_SYMBOL", "ETHUSD"))
     feature_version: str = field(default_factory=lambda: os.getenv("PROBABILITY_FEATURE_VERSION", "features_v1"))
@@ -68,4 +69,3 @@ HORIZON_MINUTES = {
     "D3": 4320,
     "D7": 10080,
 }
-

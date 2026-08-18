@@ -1,6 +1,18 @@
 from probability_engine.repositories.base_repository import SupabaseRepository
 
 
+PREDICTION_EVALUATION_SELECT = (
+    "id,created_at,snapshot_id,symbol,horizon,record_type,model_version,"
+    "feature_version,regime_version,range_model_version,prediction_status,"
+    "mean_reversion_probability,upside_breakout_probability,"
+    "downside_breakdown_probability,range_continuation_probability,"
+    "trend_continuation_probability,confidence,expected_price,median_price,"
+    "expected_equilibrium,range_50_lower,range_50_upper,range_70_lower,"
+    "range_70_upper,range_90_lower,range_90_upper,analogue_sample_size,"
+    "metadata_json"
+)
+
+
 class PredictionRepository(SupabaseRepository):
     table_name = "probability_predictions"
 
@@ -16,11 +28,13 @@ class PredictionRepository(SupabaseRepository):
             params["horizon"] = f"eq.{horizon.upper()}"
         return self.read(params=params)
 
-    def mature_unevaluated(self, before_iso, limit=100):
+    def mature_unevaluated(self, before_iso, limit=100, offset=0):
         params = {
+            "select": PREDICTION_EVALUATION_SELECT,
             "created_at": f"lte.{before_iso}",
             "record_type": "eq.LIVE",
             "order": "created_at.asc",
             "limit": str(limit),
+            "offset": str(offset),
         }
         return self.read(params=params)

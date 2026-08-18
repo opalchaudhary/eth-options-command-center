@@ -1,6 +1,12 @@
 from probability_engine.config import get_probability_config
 
 
+def _inside(value, lower, upper):
+    if value is None or lower is None or upper is None:
+        return None
+    return float(lower) <= float(value) <= float(upper)
+
+
 class OutcomeService:
     def __init__(self, config=None):
         self.config = config or get_probability_config()
@@ -31,6 +37,10 @@ class OutcomeService:
             fraction = realized / abs(start - reversion_target) if start != reversion_target else 0
             mean_reversion = realized >= required
 
+        range_50_covered = _inside(close, prediction.range_50_lower, prediction.range_50_upper)
+        range_70_covered = _inside(close, prediction.range_70_lower, prediction.range_70_upper)
+        range_90_covered = _inside(close, prediction.range_90_lower, prediction.range_90_upper)
+
         return {
             "actual_open": open_price,
             "actual_high": high,
@@ -47,10 +57,9 @@ class OutcomeService:
                 (trend_direction == "UP" and close >= open_price + trend_threshold)
                 or (trend_direction == "DOWN" and close <= open_price - trend_threshold)
             ),
-            "range_50_covered": prediction.range_50_lower <= close <= prediction.range_50_upper,
-            "range_70_covered": prediction.range_70_lower <= close <= prediction.range_70_upper,
-            "range_90_covered": prediction.range_90_lower <= close <= prediction.range_90_upper,
+            "range_50_covered": range_50_covered,
+            "range_70_covered": range_70_covered,
+            "range_90_covered": range_90_covered,
             "upper_touch_occurred": bool(upper_boundary is not None and high >= upper_boundary),
             "lower_touch_occurred": bool(lower_boundary is not None and low <= lower_boundary),
         }
-
