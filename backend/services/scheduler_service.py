@@ -10,6 +10,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from backend import config
 from backend.services import market_data_service
 from data_refresh import cleanup_retained_snapshots, refresh_smc_sources, refresh_volume_profile_sources
+from probability_engine.config import get_probability_config
+from probability_engine.jobs.evaluation_job import run_probability_performance_job
+from probability_engine.jobs.outcome_job import run_probability_outcome_job
+from probability_engine.jobs.prediction_job import run_probability_prediction_job
+from probability_engine.jobs.snapshot_job import run_probability_snapshot_job
+from probability_engine.jobs.strike_job import run_probability_strike_scan_job
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +31,11 @@ _job_locks = {
     "smc_refresh": threading.Lock(),
     "volume_profile_refresh": threading.Lock(),
     "retention_cleanup": threading.Lock(),
+    "probability_snapshot_v1": threading.Lock(),
+    "probability_prediction_v1": threading.Lock(),
+    "probability_strike_scan_v1": threading.Lock(),
+    "probability_outcome_evaluator_v1": threading.Lock(),
+    "probability_performance_daily_v1": threading.Lock(),
 }
 
 
@@ -230,6 +241,36 @@ def start_scheduler():
         start_delay_seconds=max(60, config.VOLUME_PROFILE_REFRESH_INTERVAL_SECONDS // 2),
     )
     _add_interval_job("retention_cleanup", cleanup_retained_snapshots, config.RETENTION_CLEANUP_INTERVAL_SECONDS)
+    probability_config = get_probability_config()
+    if probability_config.enabled:
+        _add_interval_job(
+            "probability_snapshot_v1",
+            run_probability_snapshot_job,
+            probability_config.snapshot_interval_seconds,
+        )
+        _add_interval_job(
+            "probability_prediction_v1",
+            run_probability_prediction_job,
+            probability_config.prediction_interval_seconds,
+        )
+        _add_interval_job(
+            "probability_strike_scan_v1",
+            run_probability_strike_scan_job,
+            probability_config.strike_scan_interval_seconds,
+        )
+        _add_interval_job(
+            "probability_outcome_evaluator_v1",
+            run_probability_outcome_job,
+            probability_config.outcome_interval_seconds,
+        )
+        _add_interval_job(
+            "probability_performance_daily_v1",
+            run_probability_performance_job,
+            probability_config.performance_interval_seconds,
+        )
+        logger.info("Probability Engine scheduler jobs registered.")
+    else:
+        logger.info("Probability Engine scheduler jobs are disabled by config.")
     _scheduler.start()
     logger.info("Backend scheduler started with production interval configuration.")
     return _scheduler
@@ -292,6 +333,11 @@ def data_refresh_jobs_running():
                 "option_chain_refresh",
                 "smc_refresh",
                 "volume_profile_refresh",
+                "probability_snapshot_v1",
+                "probability_prediction_v1",
+                "probability_strike_scan_v1",
+                "probability_outcome_evaluator_v1",
+                "probability_performance_daily_v1",
             ]
             if _job_state.get(job_name, {}).get("status") == "running" or _job_locks[job_name].locked()
         ]

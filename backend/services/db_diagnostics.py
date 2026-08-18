@@ -3,6 +3,13 @@ from pathlib import Path
 
 ENGINE_TABLES = [
     "recommendation_journal",
+    "probability_market_snapshots",
+    "probability_predictions",
+    "probability_outcomes",
+    "probability_model_performance",
+    "probability_calibration",
+    "option_strike_recommendations",
+    "option_strike_outcomes",
 ]
 
 
@@ -21,13 +28,29 @@ select
   s.last_autovacuum
 from pg_stat_user_tables s
 where s.relname in (
-  'recommendation_journal'
+  'recommendation_journal',
+  'probability_market_snapshots',
+  'probability_predictions',
+  'probability_outcomes',
+  'probability_model_performance',
+  'probability_calibration',
+  'option_strike_recommendations',
+  'option_strike_outcomes'
 )
 order by total_size_bytes desc;
 
 with recent as (
   select 'recommendation_journal' as table_name, date_trunc('minute', created_at) as minute, count(*) as inserts
   from recommendation_journal where created_at > now() - interval '1 hour' group by 1, 2
+  union all
+  select 'probability_market_snapshots' as table_name, date_trunc('minute', timestamp) as minute, count(*) as inserts
+  from probability_market_snapshots where timestamp > now() - interval '1 hour' group by 1, 2
+  union all
+  select 'probability_predictions' as table_name, date_trunc('minute', created_at) as minute, count(*) as inserts
+  from probability_predictions where created_at > now() - interval '1 hour' group by 1, 2
+  union all
+  select 'option_strike_recommendations' as table_name, date_trunc('minute', timestamp) as minute, count(*) as inserts
+  from option_strike_recommendations where timestamp > now() - interval '1 hour' group by 1, 2
 )
 select table_name, max(inserts) as peak_inserts_per_minute, avg(inserts)::numeric(10,2) as avg_inserts_per_minute
 from recent

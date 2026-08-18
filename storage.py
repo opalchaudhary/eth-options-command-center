@@ -41,6 +41,43 @@ HEADERS = {
 }
 
 
+def post_to_supabase_returning(table_name, payload):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Supabase not configured.")
+        return None
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    try:
+        response = requests.post(
+            url,
+            headers={**HEADERS, "Prefer": "return=representation"},
+            json=payload,
+            timeout=10
+        )
+
+        if response.status_code in [200, 201]:
+            return response.json()
+
+        print(f"Supabase insert failed: {table_name}")
+        print("Status:", response.status_code)
+        print("Response:", response.text)
+        print("Payload:", payload)
+        return None
+
+    except requests.exceptions.Timeout:
+        print(f"Supabase timeout while saving to {table_name}")
+        return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"Supabase request error in {table_name}:", str(e))
+        return None
+
+    except Exception as e:
+        print(f"Unexpected Supabase error in {table_name}:", str(e))
+        return None
+
+
 def post_to_supabase(table_name, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("❌ Supabase not configured.")

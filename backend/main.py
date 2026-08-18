@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import log_startup_config
 from backend.routers import health, market, mobile, strategy, system
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
+from probability_engine.routers import probability_router
 
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
@@ -43,6 +44,7 @@ app.include_router(market.router)
 app.include_router(mobile.router)
 app.include_router(strategy.router)
 app.include_router(system.router)
+app.include_router(probability_router.router)
 
 
 @app.on_event("startup")
