@@ -80,8 +80,10 @@ def _has_complete_window(candles, start_at, end_at):
     first_ts = pd.Timestamp(candles.iloc[0]["timestamp"])
     last_ts = pd.Timestamp(candles.iloc[-1]["timestamp"])
     start = pd.Timestamp(start_at)
-    required_last = pd.Timestamp(end_at) - pd.Timedelta(seconds=RESOLUTION_SECONDS)
-    return first_ts <= start + pd.Timedelta(seconds=RESOLUTION_SECONDS) and last_ts >= required_last
+    end = pd.Timestamp(end_at)
+    first_allowed = start.ceil("5min")
+    required_last = (end - pd.Timedelta(seconds=RESOLUTION_SECONDS)).floor("5min")
+    return first_ts <= first_allowed and last_ts >= required_last
 
 
 class LiveOutcomeEvaluator:

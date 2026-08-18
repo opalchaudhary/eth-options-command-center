@@ -167,6 +167,24 @@ def test_incomplete_candles_are_not_persisted_and_can_retry_later():
     assert outcomes.inserted == []
 
 
+def test_second_aligned_prediction_accepts_complete_5m_candles():
+    created_at = datetime(2026, 8, 18, 0, 0, 7, tzinfo=timezone.utc)
+    row = _prediction(created_at=created_at)
+    candles = _candles(datetime(2026, 8, 18, 0, 5, tzinfo=timezone.utc), count=11)
+    outcomes = FakeOutcomeRepository()
+    evaluator = LiveOutcomeEvaluator(
+        config=ProbabilityEngineConfig(outcome_batch_limit=5),
+        prediction_repository=FakePredictionRepository([row]),
+        outcome_repository=outcomes,
+        candle_fetcher=lambda **kwargs: candles,
+    )
+
+    result = evaluator.run(now=created_at + timedelta(hours=2))
+
+    assert result["created_count"] == 1
+    assert outcomes.inserted[0]["metadata_json"]["candle_count"] == 11
+
+
 def test_batch_limit_bounds_backlog_processing():
     created_at = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
     rows = [_prediction(f"prediction-{index}", created_at=created_at) for index in range(6)]
