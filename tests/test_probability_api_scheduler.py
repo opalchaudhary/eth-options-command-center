@@ -56,6 +56,39 @@ def test_scheduler_does_not_register_probability_jobs_when_disabled(monkeypatch)
     scheduler_service._scheduler = None
     scheduler_service.start_scheduler()
     assert "probability_prediction_v1" not in added
+    assert "probability_snapshot_v1" not in added
+    assert "retention_cleanup" in added
+
+
+def test_scheduler_registers_canonical_probability_jobs_when_enabled(monkeypatch):
+    import backend.services.scheduler_service as scheduler_service
+
+    added = []
+    monkeypatch.setattr(scheduler_service.config, "BACKEND_SCHEDULER_ENABLED", True)
+    monkeypatch.setattr(scheduler_service, "get_probability_config", lambda: ProbabilityEngineConfig(enabled=True))
+
+    class FakeScheduler:
+        running = False
+
+        def add_job(self, *args, **kwargs):
+            added.append(kwargs["id"])
+
+        def start(self):
+            self.running = True
+
+        def get_jobs(self):
+            return []
+
+    monkeypatch.setattr(scheduler_service, "BackgroundScheduler", lambda timezone: FakeScheduler())
+    scheduler_service._scheduler = None
+    scheduler_service.start_scheduler()
+
+    assert "probability_snapshot_v1" not in added
+    assert added.count("probability_prediction_v1") == 1
+    assert added.count("probability_outcome_evaluator_v1") == 1
+    assert added.count("probability_strike_scan_v1") == 1
+    assert added.count("probability_performance_daily_v1") == 1
+    assert "market_refresh" in added
     assert "retention_cleanup" in added
 
 
@@ -79,15 +112,18 @@ def test_live_prediction_insert_requires_snapshot_id():
     assert ok is False
 
 
-def test_persist_predictions_reuses_saved_snapshot_id_for_all_horizons(monkeypatch):
+def test_persist_predictions_creates_one_canonical_snapshot_for_all_horizons(monkeypatch):
     from probability_engine.services.market_data_service import ProbabilityMarketDataService
 
     saved_predictions = []
+    saved_snapshots = []
     saved_snapshot_id = "8af7bb6f-d5ac-4d27-9fdf-d6cb2a932d41"
-    service = ProbabilityMarketDataService(config=ProbabilityEngineConfig(horizons=["1H", "4H"]))
+    horizons = ["1H", "2H", "4H", "8H", "12H", "24H"]
+    service = ProbabilityMarketDataService(config=ProbabilityEngineConfig(horizons=horizons))
 
     class FakeSnapshotRepository:
         def safe_insert_returning(self, snapshot):
+            saved_snapshots.append(snapshot.to_record())
             return {"id": saved_snapshot_id, **snapshot.to_record()}
 
     class FakePredictionRepository:
@@ -103,8 +139,11 @@ def test_persist_predictions_reuses_saved_snapshot_id_for_all_horizons(monkeypat
 
     assert result["ok"] is True
     assert result["snapshot_id"] == saved_snapshot_id
-    assert {item["horizon"] for item in result["results"]} == {"1H", "4H"}
+    assert len(saved_snapshots) == 1
+    assert len(saved_predictions) == 6
+    assert {item["horizon"] for item in result["results"]} == set(horizons)
     assert {row["snapshot_id"] for row in saved_predictions} == {saved_snapshot_id}
+    assert all(row["snapshot_id"] for row in saved_predictions)
 
 
 def test_outcome_repository_for_prediction_handles_empty_dataframe(monkeypatch):

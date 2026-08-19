@@ -14,7 +14,6 @@ from probability_engine.config import get_probability_config
 from probability_engine.jobs.evaluation_job import run_probability_performance_job
 from probability_engine.jobs.outcome_job import run_probability_outcome_job
 from probability_engine.jobs.prediction_job import run_probability_prediction_job
-from probability_engine.jobs.snapshot_job import run_probability_snapshot_job
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
 
 
@@ -31,7 +30,6 @@ _job_locks = {
     "smc_refresh": threading.Lock(),
     "volume_profile_refresh": threading.Lock(),
     "retention_cleanup": threading.Lock(),
-    "probability_snapshot_v1": threading.Lock(),
     "probability_prediction_v1": threading.Lock(),
     "probability_strike_scan_v1": threading.Lock(),
     "probability_outcome_evaluator_v1": threading.Lock(),
@@ -244,11 +242,6 @@ def start_scheduler():
     probability_config = get_probability_config()
     if probability_config.enabled:
         _add_interval_job(
-            "probability_snapshot_v1",
-            run_probability_snapshot_job,
-            probability_config.snapshot_interval_seconds,
-        )
-        _add_interval_job(
             "probability_prediction_v1",
             run_probability_prediction_job,
             probability_config.prediction_interval_seconds,
@@ -333,7 +326,6 @@ def data_refresh_jobs_running():
                 "option_chain_refresh",
                 "smc_refresh",
                 "volume_profile_refresh",
-                "probability_snapshot_v1",
                 "probability_prediction_v1",
                 "probability_strike_scan_v1",
                 "probability_outcome_evaluator_v1",
