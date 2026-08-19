@@ -73,16 +73,14 @@ def test_probability_values_do_not_sum_to_one_and_confidence_separate():
 
 
 def test_outcome_labels_mean_reversion_breakout_and_range_coverage():
-    prediction = ProbabilityService(ProbabilityEngineConfig()).predict(
-        MarketSnapshot(spot_price=100, vwap=95, vwap_zscore=1.2, atr=5, atr_pct=0.05),
-        "1H",
-    )
-    prediction.metadata_json.update({"initial_vwap_zscore": 1.2, "mean_reversion_target": 98, "upper_boundary": 106, "lower_boundary": 93})
-    outcome = OutcomeService().evaluate_prediction(prediction, _candles())
+    snapshot = MarketSnapshot(spot_price=100, vwap=97, vwap_zscore=1.2, atr=5, atr_pct=0.05)
+    prediction = ProbabilityService(ProbabilityEngineConfig()).predict(snapshot, "1H")
+    outcome = OutcomeService().evaluate_prediction(prediction, _candles(), snapshot=snapshot)
     assert outcome["mean_reversion_occurred"] is True
     assert outcome["upside_breakout_occurred"] is True
     assert outcome["downside_breakdown_occurred"] is False
     assert outcome["range_90_covered"] is True
+    assert outcome["label_version"] == "label_v2"
 
 
 def test_probability_scoring_and_calibration():

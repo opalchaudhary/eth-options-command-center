@@ -87,6 +87,25 @@ class FakeOutcomeRepository:
         return True
 
 
+class FakeSnapshotRepository:
+    def by_ids(self, snapshot_ids):
+        return {
+            snapshot_id: {
+                "id": snapshot_id,
+                "spot_price": 100,
+                "vwap": 98,
+                "vwap_zscore": 1.2,
+                "atr": 4,
+                "atr_pct": 0.04,
+                "return_1h": 0.01,
+                "return_4h": 0.02,
+                "regime": "TREND_UP",
+            }
+            for snapshot_id in snapshot_ids
+            if snapshot_id
+        }
+
+
 def test_maturity_and_horizon_windows():
     start = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
     expected_minutes = {"1H": 60, "2H": 120, "4H": 240, "8H": 480, "12H": 720, "24H": 1440}
@@ -110,6 +129,7 @@ def test_mature_prediction_persists_outcome_without_mutating_prediction():
         config=ProbabilityEngineConfig(outcome_batch_limit=5),
         prediction_repository=predictions,
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
     )
 
@@ -139,6 +159,7 @@ def test_idempotency_skips_existing_outcome():
         config=ProbabilityEngineConfig(outcome_batch_limit=5),
         prediction_repository=FakePredictionRepository([row]),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
     )
 
@@ -157,6 +178,7 @@ def test_incomplete_candles_are_not_persisted_and_can_retry_later():
         config=ProbabilityEngineConfig(outcome_batch_limit=5),
         prediction_repository=FakePredictionRepository([row]),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=3),
     )
 
@@ -176,6 +198,7 @@ def test_second_aligned_prediction_accepts_complete_5m_candles():
         config=ProbabilityEngineConfig(outcome_batch_limit=5),
         prediction_repository=FakePredictionRepository([row]),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: candles,
     )
 
@@ -193,6 +216,7 @@ def test_batch_limit_bounds_backlog_processing():
         config=ProbabilityEngineConfig(outcome_batch_limit=2),
         prediction_repository=FakePredictionRepository(rows),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
     )
 
@@ -211,6 +235,7 @@ def test_paged_candidate_scan_gets_past_existing_outcomes():
         config=ProbabilityEngineConfig(outcome_batch_limit=2),
         prediction_repository=FakePredictionRepository(rows),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
     )
 
@@ -235,6 +260,7 @@ def test_event_labels_and_close_coverage_semantics():
         config=ProbabilityEngineConfig(outcome_batch_limit=5),
         prediction_repository=FakePredictionRepository([row]),
         outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
         candle_fetcher=lambda **kwargs: _candles(created_at, count=12, high=107, low=96, close=104),
     )
 

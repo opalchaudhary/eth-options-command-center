@@ -8,6 +8,7 @@ from market_data import fetch_ohlcv_window
 from probability_engine.config import HORIZON_MINUTES, get_probability_config
 from probability_engine.repositories.outcome_repository import OutcomeRepository
 from probability_engine.repositories.prediction_repository import PredictionRepository
+from probability_engine.repositories.snapshot_repository import SnapshotRepository
 from probability_engine.services.outcome_service import OutcomeService
 
 
@@ -92,12 +93,14 @@ class LiveOutcomeEvaluator:
         config=None,
         prediction_repository=None,
         outcome_repository=None,
+        snapshot_repository=None,
         outcome_service=None,
         candle_fetcher=None,
     ):
         self.config = config or get_probability_config()
         self.prediction_repository = prediction_repository or PredictionRepository()
         self.outcome_repository = outcome_repository or OutcomeRepository()
+        self.snapshot_repository = snapshot_repository or SnapshotRepository()
         self.outcome_service = outcome_service or OutcomeService(self.config)
         self.candle_fetcher = candle_fetcher or fetch_ohlcv_window
 
@@ -145,6 +148,7 @@ class LiveOutcomeEvaluator:
             }
 
         candles_by_symbol = self._fetch_candles(pending)
+        snapshots_by_id = self.snapshot_repository.by_ids([row.get("snapshot_id") for row in pending])
         created = 0
         incomplete = 0
         failed = 0
@@ -152,17 +156,27 @@ class LiveOutcomeEvaluator:
         for row in pending:
             prediction_id = row.get("id")
             try:
+                snapshot = snapshots_by_id.get(row.get("snapshot_id"))
+                if not snapshot:
+                    incomplete += 1
+                    logger.warning(
+                        "probability.outcome.snapshot_missing",
+                        extra={"prediction_id": prediction_id, "snapshot_id": row.get("snapshot_id")},
+                    )
+                    continue
                 start_at, end_at = prediction_window(row)
                 candles = _window_candles(candles_by_symbol.get(row.get("symbol")), start_at, end_at)
                 if not _has_complete_window(candles, start_at, end_at):
                     incomplete += 1
                     continue
-                outcome = self.outcome_service.evaluate_prediction(_prediction_object(row), candles)
+                outcome = self.outcome_service.evaluate_prediction(_prediction_object(row), candles, snapshot=snapshot)
                 if outcome.get("ok") is False:
                     incomplete += 1
                     continue
+                outcome_metadata = outcome.get("metadata_json") or {}
                 outcome["evaluated_at"] = now.isoformat()
                 outcome["metadata_json"] = {
+                    **outcome_metadata,
                     "horizon": row.get("horizon"),
                     "window_start": start_at.isoformat(),
                     "window_end": end_at.isoformat(),
@@ -171,8 +185,8 @@ class LiveOutcomeEvaluator:
                     "actual_open_semantics": "first 5m candle open at or after prediction created_at",
                     "actual_close_semantics": "last 5m candle close before prediction created_at + horizon",
                     "range_coverage_semantics": "future close contained within predicted range",
-                    "range_held_semantics": "entire future high-low path stayed within predicted 70% range",
-                    "breakout_boundary_semantics": "predicted 70% range boundaries",
+                    "range_held_semantics": "Label V2 range_continuation event: entire future high-low path stayed within frozen prediction-time 70% range",
+                    "breakout_boundary_semantics": "Label V2 path touch of frozen prediction-time 70% range boundaries",
                 }
                 if self.outcome_repository.safe_insert_outcome(prediction_id, outcome):
                     created += 1
