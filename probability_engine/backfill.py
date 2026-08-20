@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--horizons", default=",".join(DEFAULT_HORIZONS))
     parser.add_argument("--dry-run", action="store_true", default=True)
     parser.add_argument("--persist", action="store_true", help="Persist the bounded pilot. Omit for dry-run only.")
+    parser.add_argument("--chunk-size", type=int, default=100, help="BACKTEST persistence insert/read chunk size.")
     args = parser.parse_args()
 
     start = parse_utc(args.start)
@@ -37,6 +38,7 @@ def main():
         horizons=_parse_horizons(args.horizons),
         dry_run=not args.persist,
         persist=args.persist,
+        chunk_size=args.chunk_size,
     )
     print(json.dumps(result.to_dict(), indent=2, default=str))
 

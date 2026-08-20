@@ -49,6 +49,7 @@ class BacktestPilotResult:
     snapshots_inserted: int = 0
     predictions_inserted: int = 0
     outcomes_inserted: int = 0
+    skipped_existing_snapshots: int = 0
     skipped_existing_predictions: int = 0
     skipped_existing_outcomes: int = 0
     skipped_incomplete: int = 0
@@ -189,6 +190,7 @@ class HistoricalBacktestPilot:
         horizons: tuple[str, ...] = DEFAULT_HORIZONS,
         dry_run: bool = True,
         persist: bool = False,
+        chunk_size: int = 100,
     ) -> BacktestPilotResult:
         horizons = tuple(item.upper() for item in horizons if item.upper() in HORIZON_MINUTES)
         read_start = start - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
@@ -216,6 +218,7 @@ class HistoricalBacktestPilot:
             result.errors.append("No stored eth_ohlcv rows found for pilot window.")
             return result
 
+        persistence_plan = []
         for timestamp in pd.date_range(start=pd.Timestamp(start), end=pd.Timestamp(end), freq=f"{sample_minutes}min"):
             ts = timestamp.to_pydatetime()
             lookback = complete_lookback(candles, ts, timedelta(hours=DEFAULT_LOOKBACK_HOURS))
@@ -229,17 +232,7 @@ class HistoricalBacktestPilot:
                 continue
             result.selected_timestamps.append(ts.isoformat())
             result.snapshots_generated += 1
-            persisted_snapshot_id = None
-            if persist and not dry_run:
-                existing = self._existing_backtest_snapshot(symbol, ts)
-                if existing:
-                    persisted_snapshot_id = existing.get("id")
-                else:
-                    saved = self.snapshot_repository.safe_insert_returning(snapshot)
-                    result.supabase_writes += 1
-                    result.snapshots_inserted += 1 if saved else 0
-                    persisted_snapshot_id = saved.get("id") if saved else None
-                setattr(snapshot, "id", persisted_snapshot_id)
+            plan_entry = {"timestamp": ts, "snapshot": snapshot, "predictions": []}
 
             for horizon in complete_horizons:
                 result.expected_prediction_count += 1
@@ -276,37 +269,183 @@ class HistoricalBacktestPilot:
                 }
                 result.outcomes_generated += 1
                 self._add_manual_check(result, snapshot, prediction, outcome, candles_for_outcome, horizon)
-                if persist and not dry_run:
-                    if not persisted_snapshot_id:
-                        result.failed_count += 1
-                        continue
-                    prediction.snapshot_id = persisted_snapshot_id
-                    existing_prediction = self._existing_backtest_prediction(persisted_snapshot_id, horizon)
-                    if existing_prediction:
-                        result.skipped_existing_predictions += 1
-                        prediction_id = existing_prediction.get("id")
-                    else:
-                        saved_prediction = self.prediction_repository.safe_insert_returning(prediction)
-                        result.supabase_writes += 1
-                        result.predictions_inserted += 1 if saved_prediction else 0
-                        prediction_id = saved_prediction.get("id") if saved_prediction else None
-                    if not prediction_id:
-                        result.failed_count += 1
-                        continue
-                    existing_outcome = self.outcome_repository.for_prediction(prediction_id, label_version=LABEL_VERSION)
-                    if existing_outcome:
-                        result.skipped_existing_outcomes += 1
-                        continue
-                    if self.outcome_repository.safe_insert_outcome(prediction_id, outcome, label_version=LABEL_VERSION):
-                        result.supabase_writes += 1
-                        result.outcomes_inserted += 1
-                    else:
-                        result.failed_count += 1
+                plan_entry["predictions"].append(
+                    {"horizon": horizon, "prediction": prediction, "outcome": outcome}
+                )
+            persistence_plan.append(plan_entry)
+
+        if persist and not dry_run:
+            self._persist_plan_batched(result, persistence_plan, symbol=symbol, chunk_size=chunk_size)
 
         result.ok = result.failed_count == 0 and not result.errors
         result.diagnostics["event_rates"] = self._event_rates(result.manual_checks)
+        result.diagnostics["persistence_mode"] = "batched" if persist and not dry_run else "dry_run"
+        result.diagnostics["chunk_size"] = chunk_size
         result.manual_checks = result.manual_checks[:12]
         return result
+
+    def _persist_plan_batched(self, result: BacktestPilotResult, plan: list[dict[str, Any]], symbol: str, chunk_size: int) -> None:
+        chunk_size = max(1, min(int(chunk_size or 100), 500))
+        if not plan:
+            return
+        start = min(item["timestamp"] for item in plan)
+        end = max(item["timestamp"] for item in plan)
+
+        snapshot_by_key = self._read_existing_snapshots(symbol, start, end, result)
+        missing_snapshots = []
+        for item in plan:
+            key = self._snapshot_semantic_key(symbol, item["timestamp"])
+            if key in snapshot_by_key:
+                result.skipped_existing_snapshots += 1
+                continue
+            missing_snapshots.append(item["snapshot"].to_record())
+
+        for rows in _chunks(missing_snapshots, chunk_size):
+            inserted = self._insert_many_returning(self.snapshot_repository, rows, result)
+            result.snapshots_inserted += len(inserted)
+
+        if missing_snapshots:
+            snapshot_by_key = self._read_existing_snapshots(symbol, start, end, result)
+
+        prediction_items = []
+        for item in plan:
+            snapshot_row = snapshot_by_key.get(self._snapshot_semantic_key(symbol, item["timestamp"]))
+            if not snapshot_row:
+                result.failed_count += len(item["predictions"]) or 1
+                result.errors.append(f"Missing persisted BACKTEST snapshot for {item['timestamp'].isoformat()}")
+                continue
+            snapshot_id = snapshot_row.get("id")
+            for pred_item in item["predictions"]:
+                pred_item["prediction"].snapshot_id = snapshot_id
+                prediction_items.append(pred_item)
+
+        prediction_by_key = self._read_existing_predictions(
+            [row.get("id") for row in snapshot_by_key.values() if row.get("id")],
+            result,
+            chunk_size,
+        )
+        missing_predictions = []
+        for item in prediction_items:
+            prediction = item["prediction"]
+            key = self._prediction_semantic_key(prediction.snapshot_id, prediction.horizon)
+            if key in prediction_by_key:
+                result.skipped_existing_predictions += 1
+                continue
+            missing_predictions.append(prediction.to_record())
+
+        for rows in _chunks(missing_predictions, chunk_size):
+            inserted = self._insert_many_returning(self.prediction_repository, rows, result)
+            result.predictions_inserted += len(inserted)
+
+        if missing_predictions:
+            prediction_by_key = self._read_existing_predictions(
+                [row.get("id") for row in snapshot_by_key.values() if row.get("id")],
+                result,
+                chunk_size,
+            )
+
+        outcome_payloads = []
+        prediction_ids = []
+        for item in prediction_items:
+            prediction = item["prediction"]
+            prediction_row = prediction_by_key.get(self._prediction_semantic_key(prediction.snapshot_id, prediction.horizon))
+            if not prediction_row:
+                result.failed_count += 1
+                result.errors.append(
+                    f"Missing persisted BACKTEST prediction for snapshot {prediction.snapshot_id} horizon {prediction.horizon}"
+                )
+                continue
+            prediction_id = prediction_row.get("id")
+            prediction_ids.append(prediction_id)
+            outcome_payloads.append({"prediction_id": prediction_id, "label_version": LABEL_VERSION, **item["outcome"]})
+
+        existing_outcome_ids = self._read_existing_outcome_prediction_ids(prediction_ids, result, chunk_size)
+        missing_outcomes = []
+        for payload in outcome_payloads:
+            if payload["prediction_id"] in existing_outcome_ids:
+                result.skipped_existing_outcomes += 1
+                continue
+            missing_outcomes.append(payload)
+
+        for rows in _chunks(missing_outcomes, chunk_size):
+            inserted = self._insert_many_returning(self.outcome_repository, rows, result)
+            result.outcomes_inserted += len(inserted)
+
+    def _read_existing_snapshots(self, symbol: str, start: datetime, end: datetime, result: BacktestPilotResult) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        rows = self.snapshot_repository.read(
+            params={
+                "select": "id,symbol,timestamp,feature_version,metadata_json",
+                "symbol": f"eq.{symbol}",
+                "feature_version": f"eq.{HISTORICAL_FEATURE_VERSION}",
+                "and": f"(timestamp.gte.{start.isoformat()},timestamp.lte.{end.isoformat()})",
+                "order": "timestamp.asc",
+                "limit": "1000",
+            }
+        )
+        result.supabase_reads += 1
+        records = {}
+        for row in _records(rows):
+            metadata = row.get("metadata_json") or {}
+            if metadata.get("record_type") != "BACKTEST" or metadata.get("backtest_version") != BACKTEST_VERSION:
+                continue
+            records[self._snapshot_semantic_key(row.get("symbol"), parse_utc(row.get("timestamp")))] = row
+        return records
+
+    def _read_existing_predictions(self, snapshot_ids: list[str], result: BacktestPilotResult, chunk_size: int) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        records = {}
+        for ids in _chunks([item for item in snapshot_ids if item], max(1, min(chunk_size, 100))):
+            rows = self.prediction_repository.read(
+                params={
+                    "select": "id,snapshot_id,horizon,record_type,model_version",
+                    "snapshot_id": f"in.({','.join(ids)})",
+                    "record_type": "eq.BACKTEST",
+                    "model_version": f"eq.{self.config.model_version}",
+                    "limit": str(max(len(ids) * len(DEFAULT_HORIZONS), 1)),
+                }
+            )
+            result.supabase_reads += 1
+            for row in _records(rows):
+                records[self._prediction_semantic_key(row.get("snapshot_id"), row.get("horizon"))] = row
+        return records
+
+    def _read_existing_outcome_prediction_ids(self, prediction_ids: list[str], result: BacktestPilotResult, chunk_size: int) -> set[str]:
+        existing = set()
+        for ids in _chunks([item for item in prediction_ids if item], max(1, min(chunk_size, 100))):
+            rows = self.outcome_repository.read(
+                params={
+                    "select": "prediction_id,label_version",
+                    "prediction_id": f"in.({','.join(ids)})",
+                    "label_version": f"eq.{LABEL_VERSION}",
+                    "limit": str(len(ids)),
+                }
+            )
+            result.supabase_reads += 1
+            existing.update(row.get("prediction_id") for row in _records(rows) if row.get("prediction_id"))
+        return existing
+
+    def _insert_many_returning(self, repository, payloads: list[dict[str, Any]], result: BacktestPilotResult) -> list[dict[str, Any]]:
+        if not payloads:
+            return []
+        try:
+            if hasattr(repository, "insert_many_returning"):
+                rows = repository.insert_many_returning(payloads)
+            else:
+                rows = [repository.safe_insert_returning(payload) for payload in payloads]
+        except Exception as exc:
+            result.failed_count += len(payloads)
+            result.errors.append(f"Bulk insert failed for {getattr(repository, 'table_name', 'repository')}: {exc}")
+            return []
+        result.supabase_writes += 1
+        inserted = [row for row in _records(rows) if row]
+        if len(inserted) != len(payloads):
+            result.failed_count += len(payloads) - len(inserted)
+        return inserted
+
+    def _snapshot_semantic_key(self, symbol: str, timestamp: datetime) -> tuple[str, str, str, str]:
+        return (symbol, parse_utc(timestamp).isoformat(), HISTORICAL_FEATURE_VERSION, BACKTEST_VERSION)
+
+    def _prediction_semantic_key(self, snapshot_id: str, horizon: str) -> tuple[str, str, str, str]:
+        return (snapshot_id, horizon, "BACKTEST", self.config.model_version)
 
     def _snapshot_from_lookback(self, symbol: str, timestamp: datetime, lookback: pd.DataFrame) -> MarketSnapshot:
         snapshot = self.feature_engine.build_snapshot(
@@ -409,3 +548,9 @@ def _records(rows):
     if isinstance(rows, dict):
         return [rows]
     return list(rows or [])
+
+
+def _chunks(items, size):
+    size = max(1, int(size or 1))
+    for index in range(0, len(items), size):
+        yield items[index : index + size]

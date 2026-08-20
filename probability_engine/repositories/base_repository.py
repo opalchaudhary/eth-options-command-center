@@ -16,6 +16,9 @@ class SupabaseRepository:
     def insert_returning(self, payload):
         return storage.post_to_supabase_returning(self.table_name, payload)
 
+    def insert_many_returning(self, payloads):
+        return storage.post_to_supabase_returning(self.table_name, payloads)
+
     def read(self, params=None):
         return database_reader.read_supabase_table(self.table_name, params=params or {})
 

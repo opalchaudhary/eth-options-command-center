@@ -35,10 +35,13 @@ class FakeSnapshotRepository:
         self.rows = []
 
     def safe_insert_returning(self, snapshot):
-        row = snapshot.to_record()
+        row = snapshot.to_record() if hasattr(snapshot, "to_record") else snapshot.copy()
         row["id"] = f"snapshot-{len(self.rows) + 1}"
         self.rows.append(row)
         return row
+
+    def insert_many_returning(self, snapshots):
+        return [self.safe_insert_returning(snapshot) for snapshot in snapshots]
 
     def read(self, params=None):
         params = params or {}
@@ -50,7 +53,7 @@ class FakeSnapshotRepository:
         return [
             row
             for row in self.rows
-            if row.get("timestamp") == timestamp and row.get("feature_version") == feature_version
+            if row.get("timestamp") >= timestamp and row.get("feature_version") == feature_version
         ]
 
 
@@ -60,21 +63,28 @@ class FakePredictionRepository:
         self.latest_params = None
 
     def safe_insert_returning(self, prediction):
-        row = prediction.to_record()
+        row = prediction.to_record() if hasattr(prediction, "to_record") else prediction.copy()
         row["id"] = f"prediction-{len(self.rows) + 1}"
         self.rows.append(row)
         return row
 
+    def insert_many_returning(self, predictions):
+        return [self.safe_insert_returning(prediction) for prediction in predictions]
+
     def read(self, params=None):
         params = params or {}
-        snapshot_id = params.get("snapshot_id", "").replace("eq.", "")
+        snapshot_filter = params.get("snapshot_id", "")
+        if snapshot_filter.startswith("in.("):
+            snapshot_ids = set(snapshot_filter[4:-1].split(","))
+        else:
+            snapshot_ids = {snapshot_filter.replace("eq.", "")}
         horizon = params.get("horizon", "").replace("eq.", "")
         record_type = params.get("record_type", "").replace("eq.", "")
         return [
             row
             for row in self.rows
-            if row.get("snapshot_id") == snapshot_id
-            and row.get("horizon") == horizon
+            if row.get("snapshot_id") in snapshot_ids
+            and (not horizon or row.get("horizon") == horizon)
             and row.get("record_type") == record_type
         ]
 
@@ -92,6 +102,30 @@ class FakeOutcomeRepository:
     def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
         self.rows.append({"prediction_id": prediction_id, "label_version": label_version, **outcome})
         return True
+
+    def insert_many_returning(self, outcomes):
+        saved = []
+        for outcome in outcomes:
+            row = outcome.copy()
+            row["id"] = f"outcome-{len(self.rows) + 1}"
+            self.rows.append(row)
+            saved.append(row)
+        return saved
+
+    def read(self, params=None):
+        params = params or {}
+        prediction_filter = params.get("prediction_id", "")
+        if prediction_filter.startswith("in.("):
+            prediction_ids = set(prediction_filter[4:-1].split(","))
+        else:
+            prediction_ids = {prediction_filter.replace("eq.", "")}
+        label_version = params.get("label_version", "").replace("eq.", "")
+        return [
+            row
+            for row in self.rows
+            if row.get("prediction_id") in prediction_ids
+            and (not label_version or row.get("label_version") == label_version)
+        ]
 
 
 def _pilot(monkeypatch, rows):
