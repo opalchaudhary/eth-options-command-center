@@ -15,6 +15,7 @@ from probability_engine.services.outcome_service import OutcomeService
 logger = logging.getLogger(__name__)
 
 RESOLUTION_SECONDS = 300
+LABEL_VERSION = "label_v2"
 
 
 def parse_utc(value):
@@ -121,12 +122,16 @@ class LiveOutcomeEvaluator:
                     before_iso=earliest_maturity.isoformat(),
                     limit=candidate_limit,
                     offset=page * candidate_limit,
+                    label_version=LABEL_VERSION,
                 )
             )
             rows.extend(page_rows)
             page_matured = [row for row in page_rows if is_mature(row, now=now)]
             matured.extend(page_matured)
-            page_existing_ids = self.outcome_repository.existing_prediction_ids([row.get("id") for row in page_matured])
+            page_existing_ids = self.outcome_repository.existing_prediction_ids(
+                [row.get("id") for row in page_matured],
+                label_version=LABEL_VERSION,
+            )
             existing_ids.update(page_existing_ids)
             pending.extend(row for row in page_matured if row.get("id") not in page_existing_ids)
             pending = pending[:batch_limit]
@@ -188,7 +193,7 @@ class LiveOutcomeEvaluator:
                     "range_held_semantics": "Label V2 range_continuation event: entire future high-low path stayed within frozen prediction-time 70% range",
                     "breakout_boundary_semantics": "Label V2 path touch of frozen prediction-time 70% range boundaries",
                 }
-                if self.outcome_repository.safe_insert_outcome(prediction_id, outcome):
+                if self.outcome_repository.safe_insert_outcome(prediction_id, outcome, label_version=LABEL_VERSION):
                     created += 1
                 else:
                     failed += 1

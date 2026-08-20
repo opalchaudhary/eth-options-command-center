@@ -13,6 +13,10 @@ PREDICTION_EVALUATION_SELECT = (
 )
 
 
+def _pending_outcome_select():
+    return f"{PREDICTION_EVALUATION_SELECT},pending_outcome:probability_outcomes!left()"
+
+
 class PredictionRepository(SupabaseRepository):
     table_name = "probability_predictions"
 
@@ -28,13 +32,15 @@ class PredictionRepository(SupabaseRepository):
             params["horizon"] = f"eq.{horizon.upper()}"
         return self.read(params=params)
 
-    def mature_unevaluated(self, before_iso, limit=100, offset=0):
+    def mature_unevaluated(self, before_iso, limit=100, offset=0, label_version="label_v2"):
         params = {
-            "select": PREDICTION_EVALUATION_SELECT,
+            "select": _pending_outcome_select(),
             "created_at": f"lte.{before_iso}",
             "record_type": "eq.LIVE",
             "order": "created_at.asc",
             "limit": str(limit),
             "offset": str(offset),
+            "pending_outcome.label_version": f"eq.{label_version}",
+            "pending_outcome": "is.null",
         }
         return self.read(params=params)

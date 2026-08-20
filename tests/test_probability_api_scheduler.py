@@ -112,6 +112,33 @@ def test_live_prediction_insert_requires_snapshot_id():
     assert ok is False
 
 
+def test_mature_unevaluated_uses_label_version_anti_join(monkeypatch):
+    from probability_engine.repositories.prediction_repository import PredictionRepository
+
+    repo = PredictionRepository()
+    calls = {}
+    def fake_read(params):
+        calls["params"] = params
+        return []
+
+    monkeypatch.setattr(repo, "read", fake_read)
+
+    rows = repo.mature_unevaluated(
+        before_iso="2026-08-20T02:00:00+00:00",
+        limit=25,
+        offset=0,
+        label_version="label_v2",
+    )
+
+    assert rows == []
+    assert "pending_outcome:probability_outcomes!left()" in calls["params"]["select"]
+    assert calls["params"]["pending_outcome.label_version"] == "eq.label_v2"
+    assert calls["params"]["pending_outcome"] == "is.null"
+    assert calls["params"]["record_type"] == "eq.LIVE"
+    assert calls["params"]["order"] == "created_at.asc"
+    assert calls["params"]["limit"] == "25"
+
+
 def test_persist_predictions_creates_one_canonical_snapshot_for_all_horizons(monkeypatch):
     from probability_engine.services.market_data_service import ProbabilityMarketDataService
 

@@ -65,7 +65,22 @@ def _summarize_result(result):
 
     summary = {
         key: result.get(key)
-        for key in ["ok", "mode", "action", "row_count", "expiry_count"]
+        for key in [
+            "ok",
+            "mode",
+            "action",
+            "row_count",
+            "expiry_count",
+            "candidate_count",
+            "mature_count",
+            "attempted_count",
+            "created_count",
+            "skipped_existing_count",
+            "skipped_incomplete_count",
+            "failed_count",
+            "batch_limit",
+            "candidate_pages_scanned",
+        ]
         if key in result
     }
 

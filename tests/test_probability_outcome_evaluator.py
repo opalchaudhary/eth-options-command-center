@@ -66,23 +66,52 @@ class FakePredictionRepository:
         self.rows = rows
         self.calls = []
 
-    def mature_unevaluated(self, before_iso, limit=100, offset=0):
-        self.calls.append({"before_iso": before_iso, "limit": limit})
+    def mature_unevaluated(self, before_iso, limit=100, offset=0, label_version="label_v2"):
+        self.calls.append({"before_iso": before_iso, "limit": limit, "label_version": label_version})
         return list(self.rows)[offset : offset + limit]
 
 
+class FilteringPredictionRepository(FakePredictionRepository):
+    def __init__(self, rows, existing_by_version=None):
+        super().__init__(rows)
+        self.existing_by_version = {
+            version: set(prediction_ids)
+            for version, prediction_ids in (existing_by_version or {}).items()
+        }
+
+    def mature_unevaluated(self, before_iso, limit=100, offset=0, label_version="label_v2"):
+        self.calls.append({"before_iso": before_iso, "limit": limit, "offset": offset, "label_version": label_version})
+        blocked = self.existing_by_version.get(label_version, set())
+        before = pd.Timestamp(before_iso)
+        pending = [
+            row
+            for row in self.rows
+            if row["id"] not in blocked
+            and row.get("record_type") == "LIVE"
+            and pd.Timestamp(row["created_at"]) <= before
+        ]
+        return pending[offset : offset + limit]
+
+
 class FakeOutcomeRepository:
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, existing_by_version=None):
         self.existing = set(existing or [])
+        self.existing_by_version = {
+            version: set(prediction_ids)
+            for version, prediction_ids in (existing_by_version or {}).items()
+        }
         self.inserted = []
 
-    def existing_prediction_ids(self, prediction_ids):
+    def existing_prediction_ids(self, prediction_ids, label_version="label_v2"):
+        if self.existing_by_version:
+            return self.existing_by_version.get(label_version, set()).intersection(prediction_ids)
         return self.existing.intersection(prediction_ids)
 
-    def safe_insert_outcome(self, prediction_id, outcome):
-        if prediction_id in self.existing:
+    def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
+        if prediction_id in self.existing or prediction_id in self.existing_by_version.get(label_version, set()):
             return False
         self.existing.add(prediction_id)
+        self.existing_by_version.setdefault(label_version, set()).add(prediction_id)
         self.inserted.append({"prediction_id": prediction_id, **outcome})
         return True
 
@@ -225,6 +254,112 @@ def test_batch_limit_bounds_backlog_processing():
     assert result["attempted_count"] == 2
     assert result["created_count"] == 2
     assert len(outcomes.inserted) == 2
+
+
+def test_candidate_selection_finds_pending_after_more_than_2000_existing_v2_outcomes():
+    created_at = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _prediction(
+            f"prediction-{index:04d}",
+            created_at=created_at + timedelta(seconds=index),
+        )
+        for index in range(2004)
+    ]
+    existing_v2 = {f"prediction-{index:04d}" for index in range(2000)}
+    existing_v1 = {f"prediction-{index:04d}" for index in range(2004)}
+    predictions = FilteringPredictionRepository(
+        rows,
+        existing_by_version={
+            "label_v1": existing_v1,
+            "label_v2": existing_v2,
+        },
+    )
+    outcomes = FakeOutcomeRepository(existing_by_version={"label_v2": existing_v2})
+    evaluator = LiveOutcomeEvaluator(
+        config=ProbabilityEngineConfig(outcome_batch_limit=2),
+        prediction_repository=predictions,
+        outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
+        candle_fetcher=lambda **kwargs: _candles(created_at, count=24),
+    )
+
+    result = evaluator.run(now=created_at + timedelta(hours=2))
+
+    assert result["attempted_count"] == 2
+    assert result["created_count"] == 2
+    assert [row["prediction_id"] for row in outcomes.inserted] == [
+        "prediction-2000",
+        "prediction-2001",
+    ]
+    assert predictions.calls[0]["label_version"] == "label_v2"
+    assert predictions.calls[0]["offset"] == 0
+
+
+def test_existing_label_v1_does_not_block_label_v2_selection():
+    created_at = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
+    rows = [_prediction("prediction-1", created_at=created_at)]
+    predictions = FilteringPredictionRepository(
+        rows,
+        existing_by_version={"label_v1": {"prediction-1"}},
+    )
+    outcomes = FakeOutcomeRepository(existing_by_version={"label_v1": {"prediction-1"}})
+    evaluator = LiveOutcomeEvaluator(
+        config=ProbabilityEngineConfig(outcome_batch_limit=5),
+        prediction_repository=predictions,
+        outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
+        candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
+    )
+
+    result = evaluator.run(now=created_at + timedelta(hours=2))
+
+    assert result["created_count"] == 1
+    assert outcomes.inserted[0]["prediction_id"] == "prediction-1"
+
+
+def test_existing_label_v2_blocks_duplicate_selection_and_insert():
+    created_at = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
+    rows = [_prediction("prediction-1", created_at=created_at)]
+    predictions = FilteringPredictionRepository(
+        rows,
+        existing_by_version={"label_v2": {"prediction-1"}},
+    )
+    outcomes = FakeOutcomeRepository(existing_by_version={"label_v2": {"prediction-1"}})
+    evaluator = LiveOutcomeEvaluator(
+        config=ProbabilityEngineConfig(outcome_batch_limit=5),
+        prediction_repository=predictions,
+        outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
+        candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
+    )
+
+    result = evaluator.run(now=created_at + timedelta(hours=2))
+
+    assert result["candidate_count"] == 0
+    assert result["created_count"] == 0
+    assert outcomes.inserted == []
+
+
+def test_immature_and_non_live_rows_are_excluded_before_insert():
+    created_at = datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc)
+    immature = _prediction("immature", horizon="24H", created_at=created_at + timedelta(hours=23))
+    backtest = _prediction("backtest", created_at=created_at)
+    backtest["record_type"] = "BACKTEST"
+    mature_live = _prediction("mature-live", created_at=created_at)
+    predictions = FilteringPredictionRepository([backtest, immature, mature_live])
+    outcomes = FakeOutcomeRepository()
+    evaluator = LiveOutcomeEvaluator(
+        config=ProbabilityEngineConfig(outcome_batch_limit=5),
+        prediction_repository=predictions,
+        outcome_repository=outcomes,
+        snapshot_repository=FakeSnapshotRepository(),
+        candle_fetcher=lambda **kwargs: _candles(created_at, count=12),
+    )
+
+    result = evaluator.run(now=created_at + timedelta(hours=2))
+
+    assert result["created_count"] == 1
+    assert outcomes.inserted[0]["prediction_id"] == "mature-live"
 
 
 def test_paged_candidate_scan_gets_past_existing_outcomes():
