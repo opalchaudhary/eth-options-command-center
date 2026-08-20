@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -175,3 +176,12 @@ def test_prediction_latest_filters_live_by_default(monkeypatch):
     PredictionRepository().latest(horizon="1H", limit=5)
 
     assert calls["params"]["record_type"] == "eq.LIVE"
+
+
+def test_manual_uniqueness_migration_scopes_backtest_and_allows_versions():
+    sql = Path("migrations/probability_backtest_snapshot_uniqueness_manual.sql").read_text()
+
+    assert "where metadata_json->>'record_type' = 'BACKTEST'" in sql
+    assert "metadata_json->>'backtest_version'" in sql
+    assert "idx_probability_backtest_snapshot_unique" in sql
+    assert "idx_probability_backtest_prediction_unique" in sql
