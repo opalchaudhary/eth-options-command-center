@@ -15,6 +15,7 @@ from probability_engine.jobs.evaluation_job import run_probability_performance_j
 from probability_engine.jobs.outcome_job import run_probability_outcome_job
 from probability_engine.jobs.prediction_job import run_probability_prediction_job
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
+from rich_data.jobs import run_rich_derivatives_job, run_rich_orderbook_job, run_rich_orderflow_job
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,9 @@ _job_locks = {
     "probability_strike_scan_v1": threading.Lock(),
     "probability_outcome_evaluator_v1": threading.Lock(),
     "probability_performance_daily_v1": threading.Lock(),
+    "rich_derivatives_v1": threading.Lock(),
+    "rich_orderflow_v1": threading.Lock(),
+    "rich_orderbook_v1": threading.Lock(),
 }
 
 
@@ -279,6 +283,28 @@ def start_scheduler():
         logger.info("Probability Engine scheduler jobs registered.")
     else:
         logger.info("Probability Engine scheduler jobs are disabled by config.")
+    if config.RICH_DATA_COLLECTION_ENABLED:
+        _add_interval_job(
+            "rich_derivatives_v1",
+            run_rich_derivatives_job,
+            config.RICH_DERIVATIVES_INTERVAL_SECONDS,
+            start_delay_seconds=30,
+        )
+        _add_interval_job(
+            "rich_orderflow_v1",
+            run_rich_orderflow_job,
+            config.RICH_ORDERFLOW_INTERVAL_SECONDS,
+            start_delay_seconds=45,
+        )
+        _add_interval_job(
+            "rich_orderbook_v1",
+            run_rich_orderbook_job,
+            config.RICH_ORDERBOOK_INTERVAL_SECONDS,
+            start_delay_seconds=50,
+        )
+        logger.info("Rich data scheduler jobs registered.")
+    else:
+        logger.info("Rich data scheduler jobs are disabled by config.")
     _scheduler.start()
     logger.info("Backend scheduler started with production interval configuration.")
     return _scheduler
@@ -345,6 +371,9 @@ def data_refresh_jobs_running():
                 "probability_strike_scan_v1",
                 "probability_outcome_evaluator_v1",
                 "probability_performance_daily_v1",
+                "rich_derivatives_v1",
+                "rich_orderflow_v1",
+                "rich_orderbook_v1",
             ]
             if _job_state.get(job_name, {}).get("status") == "running" or _job_locks[job_name].locked()
         ]
