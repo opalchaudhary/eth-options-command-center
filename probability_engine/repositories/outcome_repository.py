@@ -17,7 +17,11 @@ class OutcomeRepository(SupabaseRepository):
     table_name = "probability_outcomes"
 
     def for_prediction(self, prediction_id, label_version=None):
-        params = {"prediction_id": f"eq.{prediction_id}", "limit": "1"}
+        params = {
+            "select": "id,prediction_id,label_version,evaluated_at,metadata_json",
+            "prediction_id": f"eq.{prediction_id}",
+            "limit": "1",
+        }
         if label_version:
             params["label_version"] = f"eq.{label_version}"
         else:

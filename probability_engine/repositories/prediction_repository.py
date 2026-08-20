@@ -26,10 +26,12 @@ class PredictionRepository(SupabaseRepository):
             return False
         return super().safe_insert(payload)
 
-    def latest(self, symbol="ETHUSD", horizon=None, limit=25):
+    def latest(self, symbol="ETHUSD", horizon=None, limit=25, record_type="LIVE"):
         params = {"symbol": f"eq.{symbol}", "order": "created_at.desc", "limit": str(limit)}
         if horizon:
             params["horizon"] = f"eq.{horizon.upper()}"
+        if record_type:
+            params["record_type"] = f"eq.{record_type.upper()}"
         return self.read(params=params)
 
     def mature_unevaluated(self, before_iso, limit=100, offset=0, label_version="label_v2"):
