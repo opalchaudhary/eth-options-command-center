@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from probability_engine.repositories.prediction_repository import PredictionRepository
-from probability_engine.services.historical_backtest import HistoricalBacktestPilot, normalize_ohlcv
+from probability_engine.services.historical_backtest import HistoricalBacktestPilot, normalize_ohlcv, read_stored_ohlcv
 
 
 def _stored_rows(start, count=700, gap_at=None):
@@ -185,3 +185,22 @@ def test_manual_uniqueness_migration_scopes_backtest_and_allows_versions():
     assert "metadata_json->>'backtest_version'" in sql
     assert "idx_probability_backtest_snapshot_unique" in sql
     assert "idx_probability_backtest_prediction_unique" in sql
+
+
+def test_stored_ohlcv_reader_pages_past_supabase_default_limit(monkeypatch):
+    start = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    rows = _stored_rows(start, count=1205)
+    calls = []
+
+    def fake_read(table_name, params=None, timeout=15):
+        calls.append(params)
+        offset = int(params.get("offset", 0))
+        limit = int(params.get("limit", 1000))
+        return pd.DataFrame(rows[offset : offset + limit])
+
+    monkeypatch.setattr("probability_engine.services.historical_backtest.database_reader.read_supabase_table", fake_read)
+
+    frame = read_stored_ohlcv("ETHUSD", start, start + timedelta(days=5))
+
+    assert len(frame) == 1205
+    assert [call["offset"] for call in calls] == ["0", "1000"]

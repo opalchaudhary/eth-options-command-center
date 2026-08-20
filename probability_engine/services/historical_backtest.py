@@ -98,21 +98,36 @@ def normalize_ohlcv(rows) -> pd.DataFrame:
 
 
 def read_stored_ohlcv(symbol: str, start_at: datetime, end_at: datetime, resolution: str = "5m") -> pd.DataFrame:
-    rows = database_reader.read_supabase_table(
-        "eth_ohlcv",
-        params={
-            "select": "symbol,resolution,candle_time,epoch_time,open,high,low,close,volume",
-            "symbol": f"eq.{symbol}",
-            "resolution": f"eq.{resolution}",
-            "candle_time": f"gte.{start_at.isoformat()}",
-            "order": "candle_time.asc",
-            "limit": "10000",
-        },
-        timeout=30,
-    )
-    if not rows.empty:
-        rows = rows[pd.to_datetime(rows["candle_time"], utc=True) <= pd.Timestamp(end_at)]
-    return normalize_ohlcv(rows)
+    page_size = 1000
+    frames = []
+    offset = 0
+    while True:
+        rows = database_reader.read_supabase_table(
+            "eth_ohlcv",
+            params={
+                "select": "symbol,resolution,candle_time,epoch_time,open,high,low,close,volume",
+                "symbol": f"eq.{symbol}",
+                "resolution": f"eq.{resolution}",
+                "candle_time": f"gte.{start_at.isoformat()}",
+                "order": "candle_time.asc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            },
+            timeout=30,
+        )
+        if rows.empty:
+            break
+        frames.append(rows)
+        if len(rows) < page_size:
+            break
+        max_time = pd.to_datetime(rows["candle_time"], utc=True).max()
+        if max_time > pd.Timestamp(end_at):
+            break
+        offset += page_size
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not combined.empty:
+        combined = combined[pd.to_datetime(combined["candle_time"], utc=True) <= pd.Timestamp(end_at)]
+    return normalize_ohlcv(combined)
 
 
 def has_gap(frame: pd.DataFrame) -> bool:
