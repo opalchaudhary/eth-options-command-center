@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import log_startup_config
 from backend.routers import health, market, mobile, strategy, system
+from backend.services.rich_orderflow_ws_service import start_orderflow_ws_service, stop_orderflow_ws_service
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
 from probability_engine.routers import probability_router
 
@@ -50,8 +51,10 @@ app.include_router(probability_router.router)
 @app.on_event("startup")
 def startup_event():
     start_scheduler()
+    start_orderflow_ws_service()
 
 
 @app.on_event("shutdown")
 def shutdown_event():
+    stop_orderflow_ws_service()
     stop_scheduler()

@@ -5,3 +5,4 @@ requests
 supabase==2.0.0
 python-dotenv
 streamlit-autorefresh
+websocket-client

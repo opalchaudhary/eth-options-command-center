@@ -15,6 +15,7 @@ from probability_engine.jobs.evaluation_job import run_probability_performance_j
 from probability_engine.jobs.outcome_job import run_probability_outcome_job
 from probability_engine.jobs.prediction_job import run_probability_prediction_job
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
+from backend.services.rich_orderflow_ws_service import orderflow_ws_status
 from rich_data.jobs import run_rich_derivatives_job, run_rich_orderbook_job, run_rich_orderflow_job
 
 
@@ -290,12 +291,15 @@ def start_scheduler():
             config.RICH_DERIVATIVES_INTERVAL_SECONDS,
             start_delay_seconds=30,
         )
-        _add_interval_job(
-            "rich_orderflow_v1",
-            run_rich_orderflow_job,
-            config.RICH_ORDERFLOW_INTERVAL_SECONDS,
-            start_delay_seconds=45,
-        )
+        if config.RICH_ORDERFLOW_REST_ENABLED:
+            _add_interval_job(
+                "rich_orderflow_v1",
+                run_rich_orderflow_job,
+                config.RICH_ORDERFLOW_INTERVAL_SECONDS,
+                start_delay_seconds=45,
+            )
+        else:
+            logger.info("REST rich orderflow scheduler job is disabled by config.")
         _add_interval_job(
             "rich_orderbook_v1",
             run_rich_orderbook_job,
@@ -355,6 +359,7 @@ def scheduler_status():
         "running_jobs": running_jobs,
         "jobs": jobs,
         "job_state": job_state,
+        "rich_orderflow_ws": orderflow_ws_status(),
     }
 
 

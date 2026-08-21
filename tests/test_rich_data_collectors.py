@@ -167,6 +167,7 @@ def test_rich_data_scheduler_registers_when_enabled(monkeypatch):
     added = []
     monkeypatch.setattr(scheduler_service.config, "BACKEND_SCHEDULER_ENABLED", True)
     monkeypatch.setattr(scheduler_service.config, "RICH_DATA_COLLECTION_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_REST_ENABLED", True)
     monkeypatch.setattr(scheduler_service.config, "RICH_DERIVATIVES_INTERVAL_SECONDS", 300)
     monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_INTERVAL_SECONDS", 60)
     monkeypatch.setattr(scheduler_service.config, "RICH_ORDERBOOK_INTERVAL_SECONDS", 60)
