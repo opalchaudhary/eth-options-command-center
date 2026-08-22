@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEDUPE_LIMIT = 20_000
 HEARTBEAT_TIMEOUT_SECONDS = 35
+TRADE_STALE_TIMEOUT_SECONDS = int(os.getenv("RICH_ORDERFLOW_WS_TRADE_STALE_SECONDS", "120"))
 LARGE_TRADE_NOTIONAL_USD = 100_000
 
 
@@ -242,6 +243,7 @@ class WebsocketOrderflowAggregator:
         self.duplicate_suppression_count = 0
         self.reconnect_count = 0
         self.last_message_at = None
+        self.last_trade_timestamp = None
 
     def mark_connected(self, at=None):
         at = at or utc_now()
@@ -255,25 +257,51 @@ class WebsocketOrderflowAggregator:
         self.disconnected_at = at or utc_now()
 
     def ingest_message(self, message, received_at=None):
+        return self.ingest_message_stats(message, received_at=received_at)["accepted_count"]
+
+    def ingest_message_stats(self, message, received_at=None):
         received_at = received_at or utc_now()
         trades = parse_delta_ws_trade(message, expected_symbol=self.symbol) or []
+        stats = {
+            "parsed_count": len(trades),
+            "accepted_count": 0,
+            "deduped_count": 0,
+            "late_count": 0,
+            "out_of_order_count": 0,
+            "received_volume": sum(safe_float(trade.get("size")) or 0.0 for trade in trades),
+            "accepted_volume": 0.0,
+            "deduped_volume": 0.0,
+            "late_volume": 0.0,
+        }
         if trades:
             self.last_message_at = received_at
-        accepted = 0
         for trade in trades:
+            trade_time = parse_delta_timestamp(trade.get("timestamp"))
+            if self.last_trade_timestamp and trade_time and trade_time < self.last_trade_timestamp:
+                stats["out_of_order_count"] += 1
+            if trade_time and (not self.last_trade_timestamp or trade_time > self.last_trade_timestamp):
+                self.last_trade_timestamp = trade_time
+
+            volume = safe_float(trade.get("size")) or 0.0
+            bucket_time = floor_time(trade_time, 60)
+            if bucket_time < floor_time(received_at, 60):
+                stats["late_count"] += 1
+                stats["late_volume"] += volume
+
             key = websocket_trade_dedupe_key(trade)
             if not self.dedupe.add(key):
                 self.duplicate_suppression_count += 1
+                stats["deduped_count"] += 1
+                stats["deduped_volume"] += volume
                 continue
-            trade_time = parse_delta_timestamp(trade.get("timestamp"))
-            bucket_time = floor_time(trade_time, 60)
             bucket = self.buckets.setdefault(
                 bucket_time,
                 OrderflowBucket(bucket_time=bucket_time, symbol=self.symbol, version=self.version),
             )
             bucket.add_trade(trade)
-            accepted += 1
-        return accepted
+            stats["accepted_count"] += 1
+            stats["accepted_volume"] += volume
+        return stats
 
     def close_ready_buckets(self, now=None, previous_rows=None):
         now = now or utc_now()
@@ -325,6 +353,9 @@ class WebsocketOrderflowAggregator:
             )
             bucket.mark_gap(start_at, end_at, reason)
             current += timedelta(minutes=1)
+
+    def mark_trade_stream_stale(self, start_at, end_at):
+        self._mark_gap(start_at, end_at, "trade_stream_stale")
 
 
 class ConsumerProcessLock:
@@ -383,10 +414,32 @@ class WebsocketOrderflowService:
             "connected": False,
             "last_error": None,
             "last_message_at": None,
+            "last_any_message_at": None,
+            "last_heartbeat_at": None,
+            "last_trade_message_at": None,
+            "last_accepted_trade_at": None,
             "last_persist_at": None,
             "persisted_rows": 0,
             "reconnect_count": 0,
             "duplicate_suppression_count": 0,
+            "current_subscription_state": "unknown",
+            "connection_started_at": None,
+            "stale_trade_detections": 0,
+            "forced_recoveries": 0,
+            "ws_messages_received_total": 0,
+            "heartbeat_messages_received_total": 0,
+            "trade_messages_received_total": 0,
+            "trade_messages_parsed_total": 0,
+            "trade_messages_rejected_total": 0,
+            "trade_messages_deduped_total": 0,
+            "trade_messages_accepted_total": 0,
+            "trade_messages_late_total": 0,
+            "trade_messages_out_of_order_total": 0,
+            "trade_volume_received_total": 0.0,
+            "trade_volume_accepted_total": 0.0,
+            "trade_volume_rejected_total": 0.0,
+            "trade_volume_late_total": 0.0,
+            "message_type_counts": {},
         }
 
     def start(self):
@@ -415,6 +468,7 @@ class WebsocketOrderflowService:
             "reconnect_count": self.aggregator.reconnect_count,
             "duplicate_suppression_count": self.aggregator.duplicate_suppression_count,
             "buffered_bucket_count": len(self.aggregator.buckets),
+            "trade_stale_timeout_seconds": TRADE_STALE_TIMEOUT_SECONDS,
             "version": self.aggregator.version,
             "symbol": self.aggregator.symbol,
         }
@@ -444,10 +498,14 @@ class WebsocketOrderflowService:
             websocket = _import_websocket()
             factory = websocket.WebSocketApp
         heartbeat_state = {"last_seen_at": None, "ws": None}
+        trade_state = {"last_trade_at": None, "stale_since": None, "ws": None}
         heartbeat_stop = threading.Event()
+        trade_stop = threading.Event()
 
         def on_open(ws):
             self.status["connected"] = True
+            self.status["current_subscription_state"] = "connecting"
+            self.status["connection_started_at"] = utc_now().isoformat()
             self.aggregator.mark_connected()
             heartbeat_state["last_seen_at"] = utc_now()
             ws.send(json.dumps({"type": "enable_heartbeat"}))
@@ -456,13 +514,43 @@ class WebsocketOrderflowService:
         def on_message(ws, message):
             now = utc_now()
             heartbeat_state["last_seen_at"] = now
+            self.status["ws_messages_received_total"] += 1
+            self.status["last_any_message_at"] = now.isoformat()
+            payload = _json_payload(message)
+            message_type = str(payload.get("type")) if isinstance(payload, dict) else "unknown"
+            self.status["message_type_counts"][message_type] = self.status["message_type_counts"].get(message_type, 0) + 1
             if _is_heartbeat(message):
+                self.status["heartbeat_messages_received_total"] += 1
+                self.status["last_heartbeat_at"] = now.isoformat()
                 self.aggregator.last_message_at = now
                 self._persist_closed()
                 return
-            accepted = self.aggregator.ingest_message(message)
-            if accepted:
-                self.status["last_message_at"] = utc_now().isoformat()
+            if message_type == "subscriptions":
+                self.status["current_subscription_state"] = "subscribed"
+                self._persist_closed()
+                return
+            if message_type == RICH_ORDERFLOW_WS_CHANNEL or _looks_like_trade(payload or {}):
+                self.status["trade_messages_received_total"] += 1
+            stats = self.aggregator.ingest_message_stats(message, received_at=now)
+            self.status["trade_messages_parsed_total"] += stats["parsed_count"]
+            self.status["trade_messages_accepted_total"] += stats["accepted_count"]
+            self.status["trade_messages_deduped_total"] += stats["deduped_count"]
+            self.status["trade_messages_late_total"] += stats["late_count"]
+            self.status["trade_messages_out_of_order_total"] += stats["out_of_order_count"]
+            self.status["trade_volume_received_total"] += stats["received_volume"]
+            self.status["trade_volume_accepted_total"] += stats["accepted_volume"]
+            self.status["trade_volume_rejected_total"] += stats["deduped_volume"]
+            self.status["trade_volume_late_total"] += stats["late_volume"]
+            if self.status["trade_messages_received_total"] and not stats["parsed_count"]:
+                self.status["trade_messages_rejected_total"] += 1
+            if stats["parsed_count"]:
+                self.status["last_trade_message_at"] = now.isoformat()
+                trade_state["last_trade_at"] = now
+                trade_state["stale_since"] = None
+            if stats["accepted_count"]:
+                accepted_at = utc_now()
+                self.status["last_message_at"] = accepted_at.isoformat()
+                self.status["last_accepted_trade_at"] = accepted_at.isoformat()
             self._persist_closed()
 
         def on_error(ws, error):
@@ -471,6 +559,7 @@ class WebsocketOrderflowService:
 
         def on_close(ws, close_status_code, close_msg):
             self.status["connected"] = False
+            self.status["current_subscription_state"] = "closed"
             self.aggregator.mark_disconnected()
             logger.warning(
                 "rich_orderflow_ws.socket_closed status=%s msg=%s",
@@ -486,18 +575,28 @@ class WebsocketOrderflowService:
             on_close=on_close,
         )
         heartbeat_state["ws"] = ws
+        trade_state["ws"] = ws
         watchdog = threading.Thread(
             target=self._heartbeat_watchdog,
             args=(heartbeat_state, heartbeat_stop),
             name="rich-orderflow-ws-heartbeat",
             daemon=True,
         )
+        trade_watchdog = threading.Thread(
+            target=self._trade_stream_watchdog,
+            args=(trade_state, trade_stop),
+            name="rich-orderflow-ws-trade-stale",
+            daemon=True,
+        )
         watchdog.start()
+        trade_watchdog.start()
         try:
             ws.run_forever(ping_interval=0)
         finally:
             heartbeat_stop.set()
+            trade_stop.set()
             watchdog.join(timeout=2)
+            trade_watchdog.join(timeout=2)
 
     def _heartbeat_watchdog(self, heartbeat_state, heartbeat_stop):
         while not self.stop_event.is_set() and not heartbeat_stop.wait(1):
@@ -510,6 +609,35 @@ class WebsocketOrderflowService:
                 continue
             self.status["last_error"] = "heartbeat timed out"
             logger.warning("rich_orderflow_ws.heartbeat_timeout elapsed_seconds=%s", round(elapsed, 3))
+            ws.close()
+            break
+
+    def _trade_stream_watchdog(self, trade_state, trade_stop):
+        while not self.stop_event.is_set() and not trade_stop.wait(1):
+            ws = trade_state.get("ws")
+            if not ws or not self.status.get("connected"):
+                continue
+            last_trade_at = trade_state.get("last_trade_at")
+            connection_started_at = _parse_iso(self.status.get("connection_started_at"))
+            baseline = last_trade_at or connection_started_at
+            if not baseline:
+                continue
+            elapsed = (utc_now() - baseline).total_seconds()
+            if elapsed <= TRADE_STALE_TIMEOUT_SECONDS:
+                continue
+            stale_since = trade_state.get("stale_since") or baseline
+            trade_state["stale_since"] = stale_since
+            now = utc_now()
+            self.status["stale_trade_detections"] += 1
+            self.status["forced_recoveries"] += 1
+            self.status["last_error"] = "trade stream stale"
+            self.status["current_subscription_state"] = "trade_stream_stale"
+            self.aggregator.mark_trade_stream_stale(stale_since, now)
+            logger.warning(
+                "rich_orderflow_ws.trade_stream_stale elapsed_seconds=%s last_trade_at=%s",
+                round(elapsed, 3),
+                last_trade_at.isoformat() if last_trade_at else None,
+            )
             ws.close()
             break
 
@@ -543,11 +671,24 @@ def _subscribe_payload():
 
 
 def _is_heartbeat(message):
-    try:
-        payload = json.loads(message) if isinstance(message, str) else message
-    except Exception:
-        return False
+    payload = _json_payload(message)
     return isinstance(payload, dict) and payload.get("type") in {"heartbeat", "pong"}
+
+
+def _json_payload(message):
+    try:
+        return json.loads(message) if isinstance(message, str) else message
+    except Exception:
+        return None
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _import_websocket():

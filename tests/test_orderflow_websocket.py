@@ -185,7 +185,10 @@ def test_service_uses_delta_heartbeat_without_websocket_client_auto_ping():
         def run_forever(self, **kwargs):
             self.run_kwargs = kwargs
             self.on_open(self)
+            self.on_message(self, '{"type":"subscriptions"}')
             self.on_message(self, '{"type":"heartbeat"}')
+            ts = int(datetime(2026, 12, 20, 12, 1, 30, tzinfo=timezone.utc).timestamp() * 1_000_000)
+            self.on_message(self, _trade(ts, price="2400", size="3", role="t"))
 
     service = WebsocketOrderflowService(repository=FakeRepository(), ws_app_factory=FakeWebSocketApp)
 
@@ -193,6 +196,12 @@ def test_service_uses_delta_heartbeat_without_websocket_client_auto_ping():
 
     assert instances[0].run_kwargs == {"ping_interval": 0}
     assert '{"type": "enable_heartbeat"}' in instances[0].sent
+    assert service.status["heartbeat_messages_received_total"] == 1
+    assert service.status["trade_messages_received_total"] == 1
+    assert service.status["trade_messages_parsed_total"] == 1
+    assert service.status["trade_messages_accepted_total"] == 1
+    assert service.status["trade_volume_accepted_total"] == 3
+    assert service.status["current_subscription_state"] == "subscribed"
 
 
 def test_heartbeat_watchdog_closes_stale_connection():
@@ -214,3 +223,55 @@ def test_heartbeat_watchdog_closes_stale_connection():
 
     assert fake_ws.closed is True
     assert service.status["last_error"] == "heartbeat timed out"
+
+
+def test_trade_stream_watchdog_closes_socket_and_marks_stale_bucket_incomplete():
+    class FakeWebSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    service = WebsocketOrderflowService()
+    now = utc_now()
+    service.status["connected"] = True
+    service.status["connection_started_at"] = (now - timedelta(seconds=130)).isoformat()
+    fake_ws = FakeWebSocket()
+    trade_state = {"last_trade_at": now - timedelta(seconds=130), "stale_since": None, "ws": fake_ws}
+
+    service._trade_stream_watchdog(trade_state, trade_stop=type("Stop", (), {"wait": lambda self, seconds: False})())
+
+    assert fake_ws.closed is True
+    assert service.status["last_error"] == "trade stream stale"
+    assert service.status["stale_trade_detections"] == 1
+    assert service.status["forced_recoveries"] == 1
+    assert any(bucket.incomplete for bucket in service.aggregator.buckets.values())
+
+
+def test_trade_stream_watchdog_does_not_close_fresh_trade_stream():
+    class FakeWebSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class OnePassStop:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, seconds):
+            self.calls += 1
+            return self.calls > 1
+
+    service = WebsocketOrderflowService()
+    service.status["connected"] = True
+    service.status["connection_started_at"] = utc_now().isoformat()
+    fake_ws = FakeWebSocket()
+    trade_state = {"last_trade_at": utc_now(), "stale_since": None, "ws": fake_ws}
+
+    service._trade_stream_watchdog(trade_state, trade_stop=OnePassStop())
+
+    assert fake_ws.closed is False
+    assert service.status["stale_trade_detections"] == 0
