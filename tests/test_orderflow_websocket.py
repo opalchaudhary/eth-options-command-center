@@ -1,11 +1,14 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from rich_data.config import RICH_ORDERFLOW_WS_VERSION
 from rich_data.orderflow_ws import (
     ConsumerProcessLock,
+    HEARTBEAT_TIMEOUT_SECONDS,
     OrderflowBucket,
     WebsocketOrderflowAggregator,
+    WebsocketOrderflowService,
     parse_delta_ws_trade,
+    utc_now,
     websocket_trade_dedupe_key,
 )
 
@@ -153,3 +156,61 @@ def test_single_consumer_lock_prevents_duplicate_process(tmp_path):
     first.release()
     assert second.acquire() is True
     second.release()
+
+
+def test_service_uses_delta_heartbeat_without_websocket_client_auto_ping():
+    instances = []
+
+    class FakeRepository:
+        def recent_cvd(self, **kwargs):
+            return []
+
+        def upsert_many(self, rows):
+            return True
+
+    class FakeWebSocketApp:
+        def __init__(self, url, on_open, on_message, on_error, on_close):
+            self.url = url
+            self.on_open = on_open
+            self.on_message = on_message
+            self.on_error = on_error
+            self.on_close = on_close
+            self.sent = []
+            self.run_kwargs = None
+            instances.append(self)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+        def run_forever(self, **kwargs):
+            self.run_kwargs = kwargs
+            self.on_open(self)
+            self.on_message(self, '{"type":"heartbeat"}')
+
+    service = WebsocketOrderflowService(repository=FakeRepository(), ws_app_factory=FakeWebSocketApp)
+
+    service._connect_once()
+
+    assert instances[0].run_kwargs == {"ping_interval": 0}
+    assert '{"type": "enable_heartbeat"}' in instances[0].sent
+
+
+def test_heartbeat_watchdog_closes_stale_connection():
+    class FakeWebSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    service = WebsocketOrderflowService()
+    fake_ws = FakeWebSocket()
+    heartbeat_state = {
+        "last_seen_at": utc_now() - timedelta(seconds=HEARTBEAT_TIMEOUT_SECONDS + 1),
+        "ws": fake_ws,
+    }
+
+    service._heartbeat_watchdog(heartbeat_state, heartbeat_stop=type("Stop", (), {"wait": lambda self, seconds: False})())
+
+    assert fake_ws.closed is True
+    assert service.status["last_error"] == "heartbeat timed out"

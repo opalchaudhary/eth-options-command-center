@@ -438,18 +438,26 @@ class WebsocketOrderflowService:
             self.status.update({"running": False, "connected": False})
 
     def _connect_once(self):
-        websocket = _import_websocket()
-        factory = self.ws_app_factory or websocket.WebSocketApp
+        if self.ws_app_factory:
+            factory = self.ws_app_factory
+        else:
+            websocket = _import_websocket()
+            factory = websocket.WebSocketApp
+        heartbeat_state = {"last_seen_at": None, "ws": None}
+        heartbeat_stop = threading.Event()
 
         def on_open(ws):
             self.status["connected"] = True
             self.aggregator.mark_connected()
+            heartbeat_state["last_seen_at"] = utc_now()
             ws.send(json.dumps({"type": "enable_heartbeat"}))
             ws.send(json.dumps(_subscribe_payload()))
 
         def on_message(ws, message):
+            now = utc_now()
+            heartbeat_state["last_seen_at"] = now
             if _is_heartbeat(message):
-                self.aggregator.last_message_at = utc_now()
+                self.aggregator.last_message_at = now
                 self._persist_closed()
                 return
             accepted = self.aggregator.ingest_message(message)
@@ -477,7 +485,33 @@ class WebsocketOrderflowService:
             on_error=on_error,
             on_close=on_close,
         )
-        ws.run_forever(ping_interval=30, ping_timeout=5)
+        heartbeat_state["ws"] = ws
+        watchdog = threading.Thread(
+            target=self._heartbeat_watchdog,
+            args=(heartbeat_state, heartbeat_stop),
+            name="rich-orderflow-ws-heartbeat",
+            daemon=True,
+        )
+        watchdog.start()
+        try:
+            ws.run_forever(ping_interval=0)
+        finally:
+            heartbeat_stop.set()
+            watchdog.join(timeout=2)
+
+    def _heartbeat_watchdog(self, heartbeat_state, heartbeat_stop):
+        while not self.stop_event.is_set() and not heartbeat_stop.wait(1):
+            last_seen_at = heartbeat_state.get("last_seen_at")
+            ws = heartbeat_state.get("ws")
+            if not last_seen_at or not ws:
+                continue
+            elapsed = (utc_now() - last_seen_at).total_seconds()
+            if elapsed <= HEARTBEAT_TIMEOUT_SECONDS:
+                continue
+            self.status["last_error"] = "heartbeat timed out"
+            logger.warning("rich_orderflow_ws.heartbeat_timeout elapsed_seconds=%s", round(elapsed, 3))
+            ws.close()
+            break
 
     def _persist_closed(self):
         previous = self.repository.recent_cvd(
