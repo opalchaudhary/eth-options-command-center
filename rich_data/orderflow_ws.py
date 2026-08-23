@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 DEDUPE_LIMIT = 20_000
 HEARTBEAT_TIMEOUT_SECONDS = 35
 TRADE_STALE_TIMEOUT_SECONDS = int(os.getenv("RICH_ORDERFLOW_WS_TRADE_STALE_SECONDS", "120"))
+BUCKET_CLOSE_GRACE_SECONDS = int(os.getenv("RICH_ORDERFLOW_WS_BUCKET_CLOSE_GRACE_SECONDS", "5"))
+CLOSED_BUCKET_RETENTION_SECONDS = int(os.getenv("RICH_ORDERFLOW_WS_CLOSED_BUCKET_RETENTION_SECONDS", "7200"))
 LARGE_TRADE_NOTIONAL_USD = 100_000
 
 
@@ -172,7 +174,14 @@ class OrderflowBucket:
         large_buy_volume = sum(volume for volume, side in large_trades if side == "buy")
         large_sell_volume = sum(volume for volume, side in large_trades if side == "sell")
         large_total = large_buy_volume + large_sell_volume
-        previous_rows = sorted(previous_rows, key=lambda row: row.get("bucket_timestamp") or "")
+        previous_rows = sorted(
+            [
+                row
+                for row in previous_rows
+                if parse_delta_timestamp(row.get("bucket_timestamp")) and parse_delta_timestamp(row.get("bucket_timestamp")) < self.bucket_time
+            ],
+            key=lambda row: row.get("bucket_timestamp") or "",
+        )
         previous_cvd = safe_float(previous_rows[-1].get("cvd_running")) if previous_rows else 0.0
         cvd_running = (previous_cvd or 0.0) + cvd_increment
         status = "INCOMPLETE" if self.incomplete else ("NO_TRADES" if not self.trades else "COMPLETE")
@@ -238,9 +247,15 @@ class WebsocketOrderflowAggregator:
         self.version = version
         self.dedupe = dedupe or BoundedDedupe()
         self.buckets = {}
+        self.closed_buckets = OrderedDict()
+        self.repair_bucket_times = set()
         self.connected_at = None
         self.disconnected_at = None
         self.duplicate_suppression_count = 0
+        self.late_repair_count = 0
+        self.late_repair_volume = 0.0
+        self.late_unrepairable_count = 0
+        self.late_unrepairable_volume = 0.0
         self.reconnect_count = 0
         self.last_message_at = None
         self.last_trade_timestamp = None
@@ -268,10 +283,14 @@ class WebsocketOrderflowAggregator:
             "deduped_count": 0,
             "late_count": 0,
             "out_of_order_count": 0,
+            "repair_count": 0,
+            "unrepairable_late_count": 0,
             "received_volume": sum(safe_float(trade.get("size")) or 0.0 for trade in trades),
             "accepted_volume": 0.0,
             "deduped_volume": 0.0,
             "late_volume": 0.0,
+            "repair_volume": 0.0,
+            "unrepairable_late_volume": 0.0,
         }
         if trades:
             self.last_message_at = received_at
@@ -284,7 +303,9 @@ class WebsocketOrderflowAggregator:
 
             volume = safe_float(trade.get("size")) or 0.0
             bucket_time = floor_time(trade_time, 60)
-            if bucket_time < floor_time(received_at, 60):
+            received_bucket = floor_time(received_at, 60)
+            is_late = bucket_time < received_bucket
+            if is_late:
                 stats["late_count"] += 1
                 stats["late_volume"] += volume
 
@@ -294,10 +315,25 @@ class WebsocketOrderflowAggregator:
                 stats["deduped_count"] += 1
                 stats["deduped_volume"] += volume
                 continue
-            bucket = self.buckets.setdefault(
-                bucket_time,
-                OrderflowBucket(bucket_time=bucket_time, symbol=self.symbol, version=self.version),
-            )
+
+            if bucket_time in self.closed_buckets:
+                bucket = self.closed_buckets[bucket_time]
+                self.repair_bucket_times.add(bucket_time)
+                self.late_repair_count += 1
+                self.late_repair_volume += volume
+                stats["repair_count"] += 1
+                stats["repair_volume"] += volume
+            elif self._is_closed_bucket(bucket_time, received_at):
+                self.late_unrepairable_count += 1
+                self.late_unrepairable_volume += volume
+                stats["unrepairable_late_count"] += 1
+                stats["unrepairable_late_volume"] += volume
+                continue
+            else:
+                bucket = self.buckets.setdefault(
+                    bucket_time,
+                    OrderflowBucket(bucket_time=bucket_time, symbol=self.symbol, version=self.version),
+                )
             bucket.add_trade(trade)
             stats["accepted_count"] += 1
             stats["accepted_volume"] += volume
@@ -305,7 +341,8 @@ class WebsocketOrderflowAggregator:
 
     def close_ready_buckets(self, now=None, previous_rows=None):
         now = now or utc_now()
-        cutoff = floor_time(now, 60)
+        self._prune_closed_buckets(now)
+        cutoff = floor_time(now - timedelta(seconds=BUCKET_CLOSE_GRACE_SECONDS), 60)
         if self.disconnected_at:
             self._mark_gap(self.disconnected_at, now, "currently_disconnected")
         if self.connected_at:
@@ -324,10 +361,47 @@ class WebsocketOrderflowAggregator:
                 "reconnect_count": self.reconnect_count,
                 "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
             }
+            row["metadata_json"]["finalization"] = {
+                "bucket_close_grace_seconds": BUCKET_CLOSE_GRACE_SECONDS,
+                "closed_bucket_retention_seconds": CLOSED_BUCKET_RETENTION_SECONDS,
+            }
             rows.append(row)
+            self.closed_buckets[bucket_time] = bucket
+        for bucket_time in sorted(self.repair_bucket_times):
+            bucket = self.closed_buckets.get(bucket_time)
+            if not bucket:
+                continue
+            row = bucket.to_row(now=now, previous_rows=(previous_rows or []) + rows)
+            row["metadata_json"]["dedupe"] = {
+                "recent_key_count": len(self.dedupe),
+                "duplicate_suppression_count": self.duplicate_suppression_count,
+            }
+            row["metadata_json"]["connection"] = {
+                "reconnect_count": self.reconnect_count,
+                "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            }
+            row["metadata_json"]["finalization"] = {
+                "bucket_close_grace_seconds": BUCKET_CLOSE_GRACE_SECONDS,
+                "closed_bucket_retention_seconds": CLOSED_BUCKET_RETENTION_SECONDS,
+                "late_bucket_repair": True,
+            }
+            rows.append(row)
+        self.repair_bucket_times.clear()
         if rows and self.connected_at and not self.disconnected_at:
             self.connected_at = cutoff
         return rows
+
+    def _is_closed_bucket(self, bucket_time, now):
+        close_at = bucket_time + timedelta(minutes=1, seconds=BUCKET_CLOSE_GRACE_SECONDS)
+        return now >= close_at
+
+    def _prune_closed_buckets(self, now):
+        cutoff = now - timedelta(seconds=CLOSED_BUCKET_RETENTION_SECONDS)
+        for bucket_time in list(self.closed_buckets):
+            if bucket_time >= cutoff:
+                break
+            self.closed_buckets.pop(bucket_time, None)
+            self.repair_bucket_times.discard(bucket_time)
 
     def _create_connected_empty_buckets(self, cutoff):
         if not self.connected_at:
@@ -356,6 +430,14 @@ class WebsocketOrderflowAggregator:
 
     def mark_trade_stream_stale(self, start_at, end_at):
         self._mark_gap(start_at, end_at, "trade_stream_stale")
+
+    def open_bucket_totals(self):
+        trade_count = 0
+        volume = 0.0
+        for bucket in self.buckets.values():
+            trade_count += len(bucket.trades)
+            volume += sum(safe_float(trade.get("size")) or 0.0 for trade in bucket.trades)
+        return {"trade_count": trade_count, "volume": volume}
 
 
 class ConsumerProcessLock:
@@ -435,10 +517,14 @@ class WebsocketOrderflowService:
             "trade_messages_accepted_total": 0,
             "trade_messages_late_total": 0,
             "trade_messages_out_of_order_total": 0,
+            "trade_messages_repaired_total": 0,
+            "trade_messages_unrepairable_late_total": 0,
             "trade_volume_received_total": 0.0,
             "trade_volume_accepted_total": 0.0,
             "trade_volume_rejected_total": 0.0,
             "trade_volume_late_total": 0.0,
+            "trade_volume_repaired_total": 0.0,
+            "trade_volume_unrepairable_late_total": 0.0,
             "message_type_counts": {},
         }
 
@@ -463,11 +549,18 @@ class WebsocketOrderflowService:
         self.status.update({"running": False, "connected": False})
 
     def snapshot(self):
+        open_totals = self.aggregator.open_bucket_totals()
         return {
             **self.status,
             "reconnect_count": self.aggregator.reconnect_count,
             "duplicate_suppression_count": self.aggregator.duplicate_suppression_count,
             "buffered_bucket_count": len(self.aggregator.buckets),
+            "buffered_trade_count": open_totals["trade_count"],
+            "buffered_volume": open_totals["volume"],
+            "closed_bucket_cache_count": len(self.aggregator.closed_buckets),
+            "pending_repair_bucket_count": len(self.aggregator.repair_bucket_times),
+            "bucket_close_grace_seconds": BUCKET_CLOSE_GRACE_SECONDS,
+            "closed_bucket_retention_seconds": CLOSED_BUCKET_RETENTION_SECONDS,
             "trade_stale_timeout_seconds": TRADE_STALE_TIMEOUT_SECONDS,
             "version": self.aggregator.version,
             "symbol": self.aggregator.symbol,
@@ -537,10 +630,14 @@ class WebsocketOrderflowService:
             self.status["trade_messages_deduped_total"] += stats["deduped_count"]
             self.status["trade_messages_late_total"] += stats["late_count"]
             self.status["trade_messages_out_of_order_total"] += stats["out_of_order_count"]
+            self.status["trade_messages_repaired_total"] += stats["repair_count"]
+            self.status["trade_messages_unrepairable_late_total"] += stats["unrepairable_late_count"]
             self.status["trade_volume_received_total"] += stats["received_volume"]
             self.status["trade_volume_accepted_total"] += stats["accepted_volume"]
             self.status["trade_volume_rejected_total"] += stats["deduped_volume"]
             self.status["trade_volume_late_total"] += stats["late_volume"]
+            self.status["trade_volume_repaired_total"] += stats["repair_volume"]
+            self.status["trade_volume_unrepairable_late_total"] += stats["unrepairable_late_volume"]
             if self.status["trade_messages_received_total"] and not stats["parsed_count"]:
                 self.status["trade_messages_rejected_total"] += 1
             if stats["parsed_count"]:

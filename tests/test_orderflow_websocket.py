@@ -109,18 +109,38 @@ def test_disconnected_gap_marks_bucket_incomplete_not_zero_complete():
 def test_connected_empty_minute_is_explicit_no_trades():
     aggregator = WebsocketOrderflowAggregator()
     aggregator.mark_connected(datetime(2026, 12, 20, 12, 0, tzinfo=timezone.utc))
-    rows = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 1, tzinfo=timezone.utc))
+    rows = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 6, tzinfo=timezone.utc))
 
     assert rows[0]["source_status"] == "NO_TRADES"
     assert rows[0]["total_volume"] == 0
     assert rows[0]["completeness"] == 1.0
 
 
+def test_bucket_close_grace_keeps_previous_minute_mutable():
+    aggregator = WebsocketOrderflowAggregator()
+    aggregator.mark_connected(datetime(2026, 12, 20, 12, 0, tzinfo=timezone.utc))
+    ts = int(datetime(2026, 12, 20, 12, 0, 59, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+    rows = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 3, tzinfo=timezone.utc))
+    stats = aggregator.ingest_message_stats(
+        _trade(ts, price="2400", size="10", role="t", trade_id="1"),
+        received_at=datetime(2026, 12, 20, 12, 1, 3, tzinfo=timezone.utc),
+    )
+    closed = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 6, tzinfo=timezone.utc))
+
+    assert rows == []
+    assert stats["late_count"] == 1
+    assert stats["accepted_count"] == 1
+    assert stats["repair_count"] == 0
+    assert closed[0]["trade_count"] == 1
+    assert closed[0]["total_volume"] == 10
+
+
 def test_repeated_flush_does_not_recreate_persisted_empty_minutes():
     aggregator = WebsocketOrderflowAggregator()
     aggregator.mark_connected(datetime(2026, 12, 20, 12, 0, tzinfo=timezone.utc))
 
-    first = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 1, tzinfo=timezone.utc))
+    first = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 6, tzinfo=timezone.utc))
     second = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 30, tzinfo=timezone.utc))
 
     assert len(first) == 1
@@ -144,6 +164,67 @@ def test_cvd_rolling_sums_reconcile():
     assert row["cvd_increment"] == 5
     assert row["cvd_running"] == 10
     assert row["cvd_5m"] == 10
+
+
+def test_late_trade_repairs_full_cached_bucket_instead_of_partial_overwrite():
+    aggregator = WebsocketOrderflowAggregator()
+    aggregator.mark_connected(datetime(2026, 12, 20, 12, 0, tzinfo=timezone.utc))
+    first_ts = int(datetime(2026, 12, 20, 12, 0, 30, tzinfo=timezone.utc).timestamp() * 1_000_000)
+    late_ts = int(datetime(2026, 12, 20, 12, 0, 45, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+    aggregator.ingest_message(_trade(first_ts, price="2400", size="10", role="t", trade_id="1"), received_at=datetime(2026, 12, 20, 12, 0, 31, tzinfo=timezone.utc))
+    closed = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 6, tzinfo=timezone.utc))
+    stats = aggregator.ingest_message_stats(
+        _trade(late_ts, price="2401", size="4", role="m", trade_id="2"),
+        received_at=datetime(2026, 12, 20, 12, 1, 7, tzinfo=timezone.utc),
+    )
+    repaired = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 8, tzinfo=timezone.utc))
+
+    assert closed[0]["trade_count"] == 1
+    assert closed[0]["total_volume"] == 10
+    assert stats["late_count"] == 1
+    assert stats["repair_count"] == 1
+    assert repaired[0]["bucket_timestamp"] == "2026-12-20T12:00:00+00:00"
+    assert repaired[0]["trade_count"] == 2
+    assert repaired[0]["total_volume"] == 14
+    assert repaired[0]["taker_buy_volume"] == 10
+    assert repaired[0]["taker_sell_volume"] == 4
+    assert repaired[0]["metadata_json"]["finalization"]["late_bucket_repair"] is True
+
+
+def test_duplicate_late_trade_does_not_double_count_repair():
+    aggregator = WebsocketOrderflowAggregator()
+    aggregator.mark_connected(datetime(2026, 12, 20, 12, 0, tzinfo=timezone.utc))
+    ts = int(datetime(2026, 12, 20, 12, 0, 30, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+    aggregator.ingest_message(_trade(ts, price="2400", size="10", role="t", trade_id="1"), received_at=datetime(2026, 12, 20, 12, 0, 31, tzinfo=timezone.utc))
+    aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 6, tzinfo=timezone.utc))
+    stats = aggregator.ingest_message_stats(
+        _trade(ts, price="2400", size="10", role="t", trade_id="1"),
+        received_at=datetime(2026, 12, 20, 12, 1, 7, tzinfo=timezone.utc),
+    )
+    repaired = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 12, 1, 8, tzinfo=timezone.utc))
+
+    assert stats["late_count"] == 1
+    assert stats["deduped_count"] == 1
+    assert stats["repair_count"] == 0
+    assert repaired == []
+
+
+def test_unrepairable_late_trade_is_not_persisted_as_partial_bucket():
+    aggregator = WebsocketOrderflowAggregator()
+    ts = int(datetime(2026, 12, 20, 12, 0, 30, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+    stats = aggregator.ingest_message_stats(
+        _trade(ts, price="2400", size="10", role="t", trade_id="1"),
+        received_at=datetime(2026, 12, 20, 15, 0, 0, tzinfo=timezone.utc),
+    )
+    rows = aggregator.close_ready_buckets(now=datetime(2026, 12, 20, 15, 0, 1, tzinfo=timezone.utc))
+
+    assert stats["late_count"] == 1
+    assert stats["accepted_count"] == 0
+    assert stats["unrepairable_late_count"] == 1
+    assert rows == []
 
 
 def test_single_consumer_lock_prevents_duplicate_process(tmp_path):
