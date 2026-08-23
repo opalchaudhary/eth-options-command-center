@@ -158,6 +158,7 @@ def test_rich_data_scheduler_jobs_are_opt_in(monkeypatch):
     assert "rich_derivatives_v1" not in added
     assert "rich_orderflow_v1" not in added
     assert "rich_orderbook_v1" not in added
+    assert "rich_options_surface_v1" not in added
 
 
 def test_rich_data_scheduler_registers_when_enabled(monkeypatch):
@@ -168,9 +169,11 @@ def test_rich_data_scheduler_registers_when_enabled(monkeypatch):
     monkeypatch.setattr(scheduler_service.config, "BACKEND_SCHEDULER_ENABLED", True)
     monkeypatch.setattr(scheduler_service.config, "RICH_DATA_COLLECTION_ENABLED", True)
     monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_REST_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_OPTIONS_SURFACE_ENABLED", False)
     monkeypatch.setattr(scheduler_service.config, "RICH_DERIVATIVES_INTERVAL_SECONDS", 300)
     monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_INTERVAL_SECONDS", 60)
     monkeypatch.setattr(scheduler_service.config, "RICH_ORDERBOOK_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(scheduler_service.config, "RICH_OPTIONS_SURFACE_INTERVAL_SECONDS", 600)
     monkeypatch.setattr(scheduler_service, "get_probability_config", lambda: ProbabilityEngineConfig(enabled=False))
 
     class FakeScheduler:
@@ -192,3 +195,38 @@ def test_rich_data_scheduler_registers_when_enabled(monkeypatch):
     assert "rich_derivatives_v1" in added
     assert "rich_orderflow_v1" in added
     assert "rich_orderbook_v1" in added
+    assert "rich_options_surface_v1" not in added
+
+
+def test_rich_options_surface_scheduler_registers_when_enabled(monkeypatch):
+    import backend.services.scheduler_service as scheduler_service
+    from probability_engine.config import ProbabilityEngineConfig
+
+    added = []
+    monkeypatch.setattr(scheduler_service.config, "BACKEND_SCHEDULER_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_DATA_COLLECTION_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_REST_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_OPTIONS_SURFACE_ENABLED", True)
+    monkeypatch.setattr(scheduler_service.config, "RICH_DERIVATIVES_INTERVAL_SECONDS", 300)
+    monkeypatch.setattr(scheduler_service.config, "RICH_ORDERFLOW_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(scheduler_service.config, "RICH_ORDERBOOK_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(scheduler_service.config, "RICH_OPTIONS_SURFACE_INTERVAL_SECONDS", 600)
+    monkeypatch.setattr(scheduler_service, "get_probability_config", lambda: ProbabilityEngineConfig(enabled=False))
+
+    class FakeScheduler:
+        running = False
+
+        def add_job(self, *args, **kwargs):
+            added.append(kwargs["id"])
+
+        def start(self):
+            self.running = True
+
+        def get_jobs(self):
+            return []
+
+    monkeypatch.setattr(scheduler_service, "BackgroundScheduler", lambda timezone: FakeScheduler())
+    scheduler_service._scheduler = None
+    scheduler_service.start_scheduler()
+
+    assert "rich_options_surface_v1" in added

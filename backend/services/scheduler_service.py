@@ -16,7 +16,12 @@ from probability_engine.jobs.outcome_job import run_probability_outcome_job
 from probability_engine.jobs.prediction_job import run_probability_prediction_job
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
 from backend.services.rich_orderflow_ws_service import orderflow_ws_status
-from rich_data.jobs import run_rich_derivatives_job, run_rich_orderbook_job, run_rich_orderflow_job
+from rich_data.jobs import (
+    run_rich_derivatives_job,
+    run_rich_options_surface_job,
+    run_rich_orderbook_job,
+    run_rich_orderflow_job,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ _job_locks = {
     "rich_derivatives_v1": threading.Lock(),
     "rich_orderflow_v1": threading.Lock(),
     "rich_orderbook_v1": threading.Lock(),
+    "rich_options_surface_v1": threading.Lock(),
 }
 
 
@@ -306,6 +312,15 @@ def start_scheduler():
             config.RICH_ORDERBOOK_INTERVAL_SECONDS,
             start_delay_seconds=50,
         )
+        if config.RICH_OPTIONS_SURFACE_ENABLED:
+            _add_interval_job(
+                "rich_options_surface_v1",
+                run_rich_options_surface_job,
+                config.RICH_OPTIONS_SURFACE_INTERVAL_SECONDS,
+                start_delay_seconds=60,
+            )
+        else:
+            logger.info("Rich options surface scheduler job is disabled by config.")
         logger.info("Rich data scheduler jobs registered.")
     else:
         logger.info("Rich data scheduler jobs are disabled by config.")
@@ -379,6 +394,7 @@ def data_refresh_jobs_running():
                 "rich_derivatives_v1",
                 "rich_orderflow_v1",
                 "rich_orderbook_v1",
+                "rich_options_surface_v1",
             ]
             if _job_state.get(job_name, {}).get("status") == "running" or _job_locks[job_name].locked()
         ]

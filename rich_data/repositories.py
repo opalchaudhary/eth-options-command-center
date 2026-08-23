@@ -110,3 +110,23 @@ class OrderbookAggregateRepository(RichDataRepository):
     table_name = "orderbook_aggregates"
     conflict_columns = "symbol,timestamp,version"
 
+
+class OptionsSurfaceSnapshotRepository(RichDataRepository):
+    table_name = "options_surface_snapshots"
+    conflict_columns = "symbol,logical_expiry_bucket,snapshot_timestamp,version"
+
+    def latest(self, symbol="ETHUSD", logical_expiry_bucket=None, version=None, limit=8):
+        params = {
+            "select": "snapshot_timestamp,symbol,version,logical_expiry_bucket,actual_expiry,atm_iv,atm_straddle_mark,implied_move_pct,source_status,completeness",
+            "symbol": f"eq.{symbol}",
+            "order": "snapshot_timestamp.desc",
+            "limit": str(limit),
+        }
+        if logical_expiry_bucket:
+            params["logical_expiry_bucket"] = f"eq.{logical_expiry_bucket}"
+        if version:
+            params["version"] = f"eq.{version}"
+        rows = self.read(params)
+        if hasattr(rows, "empty"):
+            return [] if rows.empty else rows.to_dict("records")
+        return list(rows or [])
