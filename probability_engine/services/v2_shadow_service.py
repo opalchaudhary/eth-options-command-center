@@ -6,6 +6,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -121,28 +122,48 @@ def _records(rows):
     return list(rows or [])
 
 
-def load_manifest(path: Path = MANIFEST_PATH) -> dict:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+@lru_cache(maxsize=4)
+def _load_manifest_cached(path: str) -> dict:
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
     errors = validate_manifest(manifest)
-    expected_hash = manifest.get("source", {}).get("step13_dataset_hash")
     if errors:
         raise ValueError(f"Invalid V2 manifest: {errors}")
     return manifest
 
 
-def load_model_bundle(model_record: dict) -> dict:
-    path = Path(model_record["artifact_path"])
+def load_manifest(path: Path = MANIFEST_PATH) -> dict:
+    return _load_manifest_cached(str(path))
+
+
+@lru_cache(maxsize=64)
+def _file_sha256_cached(path: str) -> str:
+    return file_sha256(Path(path))
+
+
+def _resolve_model_artifact_path(artifact_path: str) -> Path:
+    path = Path(artifact_path)
     if not path.is_absolute():
         candidate = Path(__file__).resolve().parents[2] / path
         if not candidate.exists():
-            candidate = MODEL_DIR / Path(model_record["artifact_path"]).name
+            candidate = MODEL_DIR / Path(artifact_path).name
         path = candidate
-    actual_hash = file_sha256(path)
-    if actual_hash != model_record["artifact_sha256"]:
-        raise ValueError(f"Model artifact hash mismatch for {model_record['model_id']}")
-    with path.open("rb") as handle:
-        bundle = pickle.load(handle)
-    return bundle
+    return path
+
+
+@lru_cache(maxsize=64)
+def _load_model_bundle_cached(path: str, expected_hash: str, model_id: str) -> dict:
+    artifact_path = Path(path)
+    actual_hash = _file_sha256_cached(str(artifact_path))
+    if actual_hash != expected_hash:
+        raise ValueError(f"Model artifact hash mismatch for {model_id}")
+    with artifact_path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def load_model_bundle(model_record: dict) -> dict:
+    path = Path(model_record["artifact_path"])
+    path = _resolve_model_artifact_path(str(path))
+    return _load_model_bundle_cached(str(path), model_record["artifact_sha256"], model_record["model_id"])
 
 
 class V2ShadowEngine:
@@ -247,7 +268,7 @@ class V2ShadowEngine:
 
     @property
     def manifest_hash(self) -> str:
-        return file_sha256(self.manifest_path)
+        return _file_sha256_cached(str(self.manifest_path))
 
     def _prediction_row(self, model_record, features, prediction_timestamp, feature_source_cutoff, regime, ood, snapshot_abstention, range_reference=None):
         raw_probability = None
@@ -528,7 +549,7 @@ def shadow_health() -> dict[str, Any]:
             "enabled": config.v2_shadow_enabled,
             "model_version": MODEL_VERSION,
             "feature_version": FEATURE_VERSION,
-            "manifest_hash": file_sha256(MANIFEST_PATH),
+                "manifest_hash": _file_sha256_cached(str(MANIFEST_PATH)),
             "direct_model_count": len(manifest.get("models", [])),
             "derived_output_count": len(manifest.get("derived_outputs", [])),
             "model_dir": str(MODEL_DIR),
