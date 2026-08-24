@@ -9,6 +9,7 @@ from probability_engine.services.v2_shadow_service import V2ShadowEngine, V2Shad
 
 
 router = APIRouter(prefix="/api/probability", tags=["probability"])
+public_shadow_router = APIRouter(prefix="/probability", tags=["probability"])
 
 
 def _service():
@@ -127,6 +128,11 @@ def probability_v2_shadow_dry_run():
         return V2ShadowEngine().run_shadow_prediction(persist=False, force_disabled=True)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+public_shadow_router.add_api_route("/v2/shadow/health", probability_v2_shadow_health, methods=["GET"])
+public_shadow_router.add_api_route("/v2/shadow/latest", probability_v2_shadow_latest, methods=["GET"])
+public_shadow_router.add_api_route("/v2/shadow/dry-run", probability_v2_shadow_dry_run, methods=["GET"])
 
 
 @router.get("/storage-stats")
