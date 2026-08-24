@@ -52,6 +52,11 @@ class ProbabilityEngineConfig:
     reversion_fraction: float = field(default_factory=lambda: _float_env("PROBABILITY_REVERSION_FRACTION", 0.5))
     breakout_atr_multiple: float = field(default_factory=lambda: _float_env("PROBABILITY_BREAKOUT_ATR_MULTIPLE", 0.6))
     trend_atr_multiple: float = field(default_factory=lambda: _float_env("PROBABILITY_TREND_ATR_MULTIPLE", 0.5))
+    v2_shadow_enabled: bool = field(default_factory=lambda: _bool_env("PROBABILITY_V2_SHADOW_ENABLED", False))
+    v2_shadow_model_version: str = field(default_factory=lambda: os.getenv("PROBABILITY_V2_SHADOW_MODEL_VERSION", "probability_v2_candidate_v1"))
+    v2_shadow_feature_version: str = field(default_factory=lambda: os.getenv("PROBABILITY_V2_SHADOW_FEATURE_VERSION", "probability_v2_features_v1"))
+    v2_shadow_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_SHADOW_INTERVAL", 300))
+    v2_shadow_history_days: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_SHADOW_HISTORY_DAYS", 120))
 
 
 def get_probability_config() -> ProbabilityEngineConfig:

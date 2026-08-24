@@ -5,6 +5,7 @@ from probability_engine.config import get_probability_config
 from probability_engine.repositories.prediction_repository import PredictionRepository
 from probability_engine.services.market_data_service import ProbabilityMarketDataService
 from probability_engine.services.model_registry import ModelRegistry
+from probability_engine.services.v2_shadow_service import V2ShadowEngine, V2ShadowPredictionRepository, shadow_health
 
 
 router = APIRouter(prefix="/api/probability", tags=["probability"])
@@ -104,6 +105,28 @@ def probability_models():
     config = get_probability_config()
     registry = ModelRegistry(config)
     return {"ok": True, "champion": registry.champion().__dict__, "challengers": registry.challengers(), "auto_promotion": False}
+
+
+@router.get("/v2/shadow/health")
+def probability_v2_shadow_health():
+    return shadow_health()
+
+
+@router.get("/v2/shadow/latest")
+def probability_v2_shadow_latest(limit: int = Query(default=200, ge=1, le=500)):
+    try:
+        rows = V2ShadowPredictionRepository().latest(limit=limit)
+        return {"ok": True, "rows": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"V2 shadow storage unavailable: {exc}") from exc
+
+
+@router.get("/v2/shadow/dry-run")
+def probability_v2_shadow_dry_run():
+    try:
+        return V2ShadowEngine().run_shadow_prediction(persist=False, force_disabled=True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/storage-stats")
