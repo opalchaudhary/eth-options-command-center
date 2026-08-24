@@ -12,6 +12,16 @@ router = APIRouter(prefix="/api/probability", tags=["probability"])
 public_shadow_router = APIRouter(prefix="/probability", tags=["probability"])
 
 
+def _json_records(rows):
+    if hasattr(rows, "to_dict"):
+        try:
+            rows = rows.where(rows.notna(), None)
+        except Exception:
+            pass
+        return rows.to_dict(orient="records")
+    return rows
+
+
 def _service():
     return ProbabilityMarketDataService(get_probability_config())
 
@@ -117,7 +127,7 @@ def probability_v2_shadow_health():
 def probability_v2_shadow_latest(limit: int = Query(default=200, ge=1, le=500)):
     try:
         rows = V2ShadowPredictionRepository().latest(limit=limit)
-        return {"ok": True, "rows": rows}
+        return {"ok": True, "rows": _json_records(rows)}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"V2 shadow storage unavailable: {exc}") from exc
 
