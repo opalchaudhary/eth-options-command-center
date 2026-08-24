@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 
 import database_reader
 from probability_engine.config import HORIZON_MINUTES, get_probability_config
@@ -341,19 +342,34 @@ class V2ShadowEngine:
 def load_ohlcv_from_supabase(symbol=SYMBOL, end_at=None, days=120) -> pd.DataFrame:
     end = pd.Timestamp(end_at or datetime.now(timezone.utc)).tz_convert("UTC")
     start = end - pd.Timedelta(days=days)
-    rows = _records(
-        database_reader.read_supabase_table(
-            "eth_ohlcv",
+    rows = []
+    page_start = start
+    url = f"{database_reader.SUPABASE_URL}/rest/v1/eth_ohlcv"
+    for _page in range(max(1, int(days) + 2)):
+        response = requests.get(
+            url,
+            headers=database_reader.HEADERS,
             params={
                 "select": "symbol,resolution,candle_time,epoch_time,open,high,low,close,volume",
                 "symbol": f"eq.{symbol}",
                 "resolution": "eq.5m",
-                "candle_time": f"gte.{start.isoformat()}",
+                "candle_time": f"gte.{page_start.isoformat()}",
                 "order": "candle_time.asc",
-                "limit": "50000",
+                "limit": "1000",
             },
+            timeout=20,
         )
-    )
+        if response.status_code != 200:
+            logger.warning("probability.v2.ohlcv_page_failed", extra={"status_code": response.status_code, "body": response.text[:300]})
+            break
+        page_rows = response.json()
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+        last_time = pd.Timestamp(page_rows[-1]["candle_time"]).tz_convert("UTC")
+        if last_time >= end or len(page_rows) < 1000:
+            break
+        page_start = last_time + pd.Timedelta(microseconds=1)
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame

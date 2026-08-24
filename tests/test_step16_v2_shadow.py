@@ -8,6 +8,7 @@ from probability_engine.services.v2_shadow_outcome import is_mature
 from probability_engine.services.v2_shadow_service import (
     clamp_probability,
     compute_v2_features_for_timestamps,
+    load_ohlcv_from_supabase,
     load_manifest,
     requires_range_reference,
 )
@@ -56,6 +57,46 @@ def test_probability_clamp_rejects_bad_values_and_bounds_good_values():
 def test_range_dependent_targets_require_range_reference():
     assert requires_range_reference("path_inside_70") is True
     assert requires_range_reference("up_excursion_ge_1_0_atr") is False
+
+
+def test_live_ohlcv_loader_pages_until_current_cutoff(monkeypatch):
+    import probability_engine.services.v2_shadow_service as service
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def json(self):
+            return self._rows
+
+    pages = [
+        [
+            {"symbol": "ETHUSD", "resolution": "5m", "candle_time": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(minutes=5 * i), "epoch_time": i, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+            for i in range(1000)
+        ],
+        [
+            {"symbol": "ETHUSD", "resolution": "5m", "candle_time": pd.Timestamp("2026-01-04T12:00:00Z") + pd.Timedelta(minutes=5 * i), "epoch_time": 1000 + i, "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2}
+            for i in range(3)
+        ],
+    ]
+    calls = []
+
+    def fake_get(url, headers, params, timeout):
+        calls.append(params["candle_time"])
+        return Response([{**row, "candle_time": row["candle_time"].isoformat()} for row in pages[len(calls) - 1]])
+
+    monkeypatch.setattr(service.database_reader, "SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setattr(service.requests, "get", fake_get)
+
+    frame = load_ohlcv_from_supabase(end_at=pd.Timestamp("2026-01-04T12:10:00Z"), days=4)
+
+    assert len(calls) == 2
+    assert len(frame) == 1003
+    assert frame["candle_time"].max() == pd.Timestamp("2026-01-04T12:10:00Z")
+    assert frame["candle_time"].is_monotonic_increasing
 
 
 def test_v2_shadow_outcome_maturity_respects_horizon():

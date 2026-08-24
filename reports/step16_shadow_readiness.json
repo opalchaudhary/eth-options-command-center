@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-24T17:22:26.504980Z",
+  "generated_at": "2026-08-24T17:31:37.649458Z",
   "manifest_path": "probability_engine/models/v2_candidate_v1/manifest.json",
   "manifest_hash": "aa59ecc3c4a036ff1309d617ecd20566c2378582b687d5f163ae64370907019b",
   "direct_model_count": 26,
@@ -7,11 +7,11 @@
   "feature_contract": "probability_v2_features_v1",
   "spec_version": "probability_v2_candidate_v1",
   "schema_status": {
-    "probability_v2_feature_snapshots": false,
-    "probability_v2_shadow_predictions": false,
-    "probability_v2_shadow_outcomes": false
+    "probability_v2_feature_snapshots": true,
+    "probability_v2_shadow_predictions": true,
+    "probability_v2_shadow_outcomes": true
   },
-  "manual_sql_required": true,
+  "manual_sql_required": false,
   "manual_migration": "migrations/probability_v2_shadow_schema.sql",
   "step13_feature_parity": {
     "timestamps_checked": 15,
@@ -21,5 +21,5 @@
     "mismatches": {},
     "passed": true
   },
-  "decision_gate": "STEP 16 CODE READY \u2014 MANUAL SUPABASE SQL REQUIRED"
+  "decision_gate": "STEP 16 CODE READY \u2014 SHADOW TABLES PRESENT"
 }
