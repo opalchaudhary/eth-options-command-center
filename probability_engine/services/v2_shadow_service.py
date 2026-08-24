@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import logging
 import pickle
@@ -25,6 +27,7 @@ from probability_engine.research.step15_spec import file_sha256, validate_manife
 
 
 logger = logging.getLogger(__name__)
+_LIBC = None
 
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "v2_candidate_v1"
 MANIFEST_PATH = MODEL_DIR / "manifest.json"
@@ -191,15 +194,17 @@ class V2ShadowEngine:
             payload = self.build_shadow_payload(now)
             if not persist:
                 payload["duration_seconds"] = round(time.monotonic() - started, 3)
+                release_unused_memory()
                 return payload
             saved_snapshot = self.feature_repository.safe_insert_returning(payload["feature_snapshot"])
             if not saved_snapshot or not saved_snapshot.get("id"):
+                release_unused_memory()
                 return V2ShadowResult(ok=False, enabled=True, action="FAILED", reason="feature_snapshot_insert_failed").to_dict()
             snapshot_id = saved_snapshot["id"]
             predictions = [{**row, "feature_snapshot_id": snapshot_id} for row in payload["predictions"]]
             inserted = self.prediction_repository.insert_many_returning(predictions) if predictions else []
             created = len(inserted or [])
-            return V2ShadowResult(
+            result = V2ShadowResult(
                 ok=created == len(predictions),
                 enabled=True,
                 action="PERSISTED",
@@ -210,8 +215,11 @@ class V2ShadowEngine:
                 feature_snapshot_id=snapshot_id,
                 duration_seconds=round(time.monotonic() - started, 3),
             ).to_dict()
+            release_unused_memory()
+            return result
         except Exception as exc:
             logger.exception("probability.v2.shadow.failed")
+            release_unused_memory()
             return V2ShadowResult(ok=False, enabled=True, action="FAILED", reason=str(exc), errors=[str(exc)]).to_dict()
 
     def build_shadow_payload(self, now: datetime) -> dict:
@@ -538,6 +546,17 @@ def jsonable(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             result[key] = value
     return result
+
+
+def release_unused_memory() -> None:
+    gc.collect()
+    try:
+        global _LIBC
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        _LIBC.malloc_trim(0)
+    except Exception:
+        return
 
 
 def shadow_health() -> dict[str, Any]:
