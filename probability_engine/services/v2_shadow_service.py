@@ -72,6 +72,17 @@ class V2FeatureSnapshotRepository(SupabaseRepository):
 class V2ShadowPredictionRepository(SupabaseRepository):
     table_name = "probability_v2_shadow_predictions"
 
+    def insert_many_returning(self, payloads):
+        base_insert_many = getattr(super(), "insert_many_returning", None)
+        if base_insert_many is not None:
+            return base_insert_many(payloads)
+        inserted = []
+        for payload in payloads:
+            row = self.safe_insert_returning(payload)
+            if row:
+                inserted.append(row)
+        return inserted
+
     def latest(self, symbol=SYMBOL, limit=200):
         return self.read(
             params={
