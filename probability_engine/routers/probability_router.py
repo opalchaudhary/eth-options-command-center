@@ -1,3 +1,5 @@
+import math
+
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.services.db_diagnostics import diagnostics_payload
@@ -18,8 +20,23 @@ def _json_records(rows):
             rows = rows.where(rows.notna(), None)
         except Exception:
             pass
-        return rows.to_dict(orient="records")
-    return rows
+        return [_json_safe(row) for row in rows.to_dict(orient="records")]
+    return _json_safe(rows)
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    return value
 
 
 def _service():
