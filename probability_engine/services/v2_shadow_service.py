@@ -379,9 +379,15 @@ def load_ohlcv_from_supabase(symbol=SYMBOL, end_at=None, days=120) -> pd.DataFra
 
 
 def load_v1_range_references(symbol=SYMBOL) -> dict[str, dict[str, Any]]:
-    rows = _records(PredictionRepository().latest(symbol=symbol, limit=50, record_type="LIVE"))
+    repository = PredictionRepository()
+    try:
+        rows = _records(repository.latest(symbol=symbol, limit=50, record_type="LIVE"))
+    except TypeError:
+        rows = _records(repository.latest(symbol=symbol, limit=50))
     refs = {}
     for row in rows:
+        if row.get("record_type") and row.get("record_type") != "LIVE":
+            continue
         if row.get("model_version") != "probability_v1":
             continue
         horizon = str(row.get("horizon") or "").upper()
