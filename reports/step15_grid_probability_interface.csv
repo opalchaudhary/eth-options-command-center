@@ -1,0 +1,11 @@
+strategy_interface,semantic_name,target,horizon,tier,quality_grade,test_bss,test_auc,semantic_description
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_1H,realized_over_range_width_ge_1,1H,CORE,MEDIUM,0.0561298766364585,0.6916017227235439,Probability the realized future 1H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_2H,realized_over_range_width_ge_1,2H,CORE,HIGH,0.1070580126588525,0.7469867454347472,Probability the realized future 2H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_4H,realized_over_range_width_ge_1,4H,CORE,HIGH,0.1233757593844959,0.7861340013109842,Probability the realized future 4H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_8H,realized_over_range_width_ge_1,8H,CORE,MEDIUM,0.0734170618557717,0.6180313269422181,Probability the realized future 8H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_12H,realized_over_range_width_ge_1,12H,CORE,HIGH,0.1437403513710986,0.8448250106700811,Probability the realized future 12H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_REALIZED_OVER_RANGE_WIDTH_GE_1_24H,realized_over_range_width_ge_1,24H,CORE,MEDIUM,0.0741058753812807,0.7787795368257314,Probability the realized future 24H high-low path width is at least 1x the frozen 70% range width.
+GRID,P_PATH_INSIDE_70_4H,path_inside_70,4H,CORE,MEDIUM,0.0428368495846094,0.7051745635910225,Probability the full future 4H path remains inside the frozen Step 13 70% range containment definition.
+GRID,P_PATH_INSIDE_70_8H,path_inside_70,8H,CORE,MEDIUM,0.0515744509798035,0.6677188703159003,Probability the full future 8H path remains inside the frozen Step 13 70% range containment definition.
+GRID,P_PATH_INSIDE_70_12H,path_inside_70,12H,CORE,MEDIUM,0.034132229173605,0.8667229473775353,Probability the full future 12H path remains inside the frozen Step 13 70% range containment definition.
+GRID,P_PATH_INSIDE_70_24H,path_inside_70,24H,CORE,MEDIUM,0.0225455764847921,0.81218650250798,Probability the full future 24H path remains inside the frozen Step 13 70% range containment definition.

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import log_startup_config
-from backend.routers import health, market, mobile, strategy, system
+from backend.routers import grid, health, market, mobile, strategy, system
 from backend.services.rich_orderflow_ws_service import start_orderflow_ws_service, stop_orderflow_ws_service
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
 from probability_engine.routers import probability_router
@@ -45,6 +45,7 @@ app.include_router(market.router)
 app.include_router(mobile.router)
 app.include_router(strategy.router)
 app.include_router(system.router)
+app.include_router(grid.router)
 app.include_router(probability_router.router)
 app.include_router(probability_router.public_shadow_router)
 

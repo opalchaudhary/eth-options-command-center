@@ -1,0 +1,5 @@
+strategy_interface,semantic_name,target,horizon,tier,quality_grade,test_bss,test_auc,semantic_description
+DEFENSIVE_LONG_OPTION,P_UP_EXCURSION_GE_1_ATR_1H,up_excursion_ge_1_0_atr,1H,DEFENSIVE,LOW,0.0150048683396302,0.5700080212102843,Probability maximum upside excursion over the future 1H reaches at least 1 ATR.
+DEFENSIVE_LONG_OPTION,P_UP_EXCURSION_GE_1_ATR_24H,up_excursion_ge_1_0_atr,24H,DEFENSIVE,MEDIUM,0.039862679475048,0.6697204903083513,Probability maximum upside excursion over the future 24H reaches at least 1 ATR.
+DEFENSIVE_LONG_OPTION,P_DOWN_EXCURSION_GE_1_ATR_1H,down_excursion_ge_1_0_atr,1H,DEFENSIVE,MEDIUM,0.025012392660877,0.5889372583640293,Probability maximum downside excursion over the future 1H reaches at least 1 ATR.
+DEFENSIVE_LONG_OPTION,P_DOWN_EXCURSION_GE_1_ATR_2H,down_excursion_ge_1_0_atr,2H,DEFENSIVE,MEDIUM,0.0252370149560671,0.6022562546473288,Probability maximum downside excursion over the future 2H reaches at least 1 ATR.

@@ -1,0 +1,97 @@
+{
+  "generated_at": "2026-08-24T17:04:13.088236Z",
+  "step14_source_verified": true,
+  "frozen_model_count": 26,
+  "derived_output_count": 4,
+  "manifest_hash": "aa59ecc3c4a036ff1309d617ecd20566c2378582b687d5f163ae64370907019b",
+  "manifest_validation_errors": [],
+  "selected_targets": [
+    "both_side_breach",
+    "down_excursion_ge_1_0_atr",
+    "downside_breakdown",
+    "lower_breach_only",
+    "path_inside_70",
+    "realized_over_range_width_ge_1",
+    "up_excursion_ge_1_0_atr",
+    "upper_breach_only",
+    "upside_breakout"
+  ],
+  "selected_horizons": [
+    "1H",
+    "2H",
+    "4H",
+    "8H",
+    "12H",
+    "24H"
+  ],
+  "dropped_targets": [
+    "mean_reversion",
+    "trend_continuation",
+    "one_sided_runaway",
+    "trend_efficiency_high"
+  ],
+  "answers": {
+    "A_surviving_challengers": 26,
+    "B_targets": [
+      "both_side_breach",
+      "down_excursion_ge_1_0_atr",
+      "downside_breakdown",
+      "lower_breach_only",
+      "path_inside_70",
+      "realized_over_range_width_ge_1",
+      "up_excursion_ge_1_0_atr",
+      "upper_breach_only",
+      "upside_breakout"
+    ],
+    "C_horizons": [
+      "1H",
+      "2H",
+      "4H",
+      "8H",
+      "12H",
+      "24H"
+    ],
+    "D_dominant_model_family": "logistic",
+    "E_global_features": "See reports/step15_v2_feature_selection.csv",
+    "F_surviving_step12_interactions": [
+      "high_atr_pct_and_rising_atr_slope",
+      "ema_spread_high_and_rising_atr",
+      "low_atr_pct_and_falling_atr_slope"
+    ],
+    "G_dropped_targets": [
+      "mean_reversion",
+      "trend_continuation",
+      "one_sided_runaway",
+      "trend_efficiency_high"
+    ],
+    "H_mean_reversion_removed": true,
+    "I_trend_continuation_removed": true,
+    "J_grid_outputs": [
+      "P_REALIZED_OVER_RANGE_WIDTH_GE_1_*",
+      "P_PATH_INSIDE_70_*",
+      "P_BOTH_SIDE_BREACH_*",
+      "derived P_RANGE_BREACH_*"
+    ],
+    "K_ironfly_outputs": [
+      "P_PATH_INSIDE_70_*",
+      "derived P_RANGE_BREACH_*",
+      "P_BOTH_SIDE_BREACH_*",
+      "P_UPPER_BREACH_ONLY_*",
+      "P_LOWER_BREACH_ONLY_*"
+    ],
+    "L_defensive_outputs": [
+      "P_UP_EXCURSION_GE_1_ATR_1H/24H",
+      "P_DOWN_EXCURSION_GE_1_ATR_1H/2H",
+      "directional breakout/breakdown secondary outputs"
+    ],
+    "M_regime_specific_warning": "No selected model is frozen as regime-specific, but quality should be lowered in unsupported or sparse regimes.",
+    "N_abstention": "NO_RELIABLE_FORECAST for unsupported target/horizon, post-warmup missing features, as-of violation, severe OOD, or unsupported regime.",
+    "O_version": "probability_v2_candidate_v1",
+    "P_reproducible": true,
+    "Q_live_shadow_evidence": "See reports/step15_live_shadow_acceptance_plan.json",
+    "R_ready_for_step16_shadow": true,
+    "manifest_hash": "aa59ecc3c4a036ff1309d617ecd20566c2378582b687d5f163ae64370907019b"
+  },
+  "decision_gate": "STEP 15 COMPLETE \u2014 V2 CANDIDATE SPECIFICATION FROZEN AND SHADOW-READY",
+  "recommended_step16": "Implement local/live shadow inference plumbing only, using the frozen manifest and abstention/OOD policies; do not route outputs to trading."
+}

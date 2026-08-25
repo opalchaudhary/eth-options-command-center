@@ -1,0 +1,19 @@
+feature,type,source
+atr_slope_96b,individual_step11,Step 11 shortlist
+rv_slope_96b,individual_step11,Step 11 shortlist
+atr_pct_12b,individual_step11,Step 11 shortlist
+bollinger_bandwidth_20b,individual_step11,Step 11 shortlist
+keltner_width_20b,individual_step11,Step 11 shortlist
+rv_12b,individual_step11,Step 11 shortlist
+price_efficiency_96b,individual_step11,Step 11 shortlist
+rolling_vwap_z_96b,individual_step11,Step 11 shortlist
+donchian_pos_96b,individual_step11,Step 11 shortlist
+volume_z_96b,individual_step11,Step 11 shortlist
+high_atr_pct_and_rising_atr_slope,interaction_step12,Step 12 evidence
+ema_spread_high_and_rising_atr,interaction_step12,Step 12 evidence
+low_vwap_displacement_and_low_atr,interaction_step12,Step 12 evidence
+high_vwap_displacement_and_rising_atr,interaction_step12,Step 12 evidence
+low_atr_and_mid_donchian,interaction_step12,Step 12 evidence
+rising_atr_and_high_volume,interaction_step12,Step 12 evidence
+low_atr_pct_and_falling_atr_slope,interaction_step12,Step 12 evidence
+low_adx_and_falling_atr,interaction_step12,Step 12 evidence

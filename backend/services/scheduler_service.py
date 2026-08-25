@@ -17,6 +17,7 @@ from probability_engine.jobs.prediction_job import run_probability_prediction_jo
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
 from probability_engine.jobs.v2_shadow_job import run_probability_v2_shadow_job
 from backend.services.rich_orderflow_ws_service import orderflow_ws_status
+from grid_bot.jobs import run_gridbot_heartbeat_job
 from rich_data.jobs import (
     run_rich_derivatives_job,
     run_rich_options_surface_job,
@@ -47,6 +48,7 @@ _job_locks = {
     "rich_orderflow_v1": threading.Lock(),
     "rich_orderbook_v1": threading.Lock(),
     "rich_options_surface_v1": threading.Lock(),
+    "gridbot_v01_heartbeat": threading.Lock(),
 }
 
 
@@ -93,6 +95,10 @@ def _summarize_result(result):
             "failed_count",
             "batch_limit",
             "candidate_pages_scanned",
+            "bot_count",
+            "run_count",
+            "active_run_id",
+            "active_status",
         ]
         if key in result
     }
@@ -335,6 +341,8 @@ def start_scheduler():
         logger.info("Rich data scheduler jobs registered.")
     else:
         logger.info("Rich data scheduler jobs are disabled by config.")
+    _add_interval_job("gridbot_v01_heartbeat", run_gridbot_heartbeat_job, 60, start_delay_seconds=20)
+    logger.info("DeltaGridBot V0.1 scheduler heartbeat registered.")
     _scheduler.start()
     logger.info("Backend scheduler started with production interval configuration.")
     return _scheduler
@@ -407,6 +415,7 @@ def data_refresh_jobs_running():
                 "rich_orderflow_v1",
                 "rich_orderbook_v1",
                 "rich_options_surface_v1",
+                "gridbot_v01_heartbeat",
             ]
             if _job_state.get(job_name, {}).get("status") == "running" or _job_locks[job_name].locked()
         ]

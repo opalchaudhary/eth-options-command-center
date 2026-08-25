@@ -1,0 +1,27 @@
+{
+  "manifest_hash": "aa59ecc3c4a036ff1309d617ecd20566c2378582b687d5f163ae64370907019b",
+  "model_count": 26,
+  "principle": "Live forward evidence receives more weight than historical backtest evidence for any promotion decision.",
+  "minimum_observations": {
+    "1H_2H": "At least 300 mature forward predictions per target/horizon before firm judgment.",
+    "4H_8H": "At least 200 mature forward predictions per target/horizon plus less-overlap diagnostics.",
+    "12H_24H": "At least 120 mature forward predictions per target/horizon; treat early conclusions as tentative."
+  },
+  "pass": [
+    "Forward Brier skill remains positive against forward empirical/train-origin base-rate benchmark.",
+    "Calibration ECE remains in the same broad quality band as Step 14.",
+    "No sign inversion in strongest core targets.",
+    "Feature computation is point-in-time safe with no as-of violations."
+  ],
+  "tentative": [
+    "Mixed BSS but no catastrophic inversion.",
+    "Good ranking but calibration needs more mature outcomes.",
+    "Regime coverage remains narrow."
+  ],
+  "fail": [
+    "Negative BSS across most core outputs after minimum maturity.",
+    "Calibration materially deteriorates.",
+    "OOD/abstention rate is too high for operational use.",
+    "Any production/shadow feature leakage is detected."
+  ]
+}

@@ -1,0 +1,230 @@
+{
+  "generated_at": "2026-08-24T15:52:23.626359Z",
+  "feature_contract_version": "probability_v2_features_v1",
+  "dataset_contract": {
+    "record_type": "BACKTEST",
+    "model_version_source": "probability_v1",
+    "label_version": "label_v2",
+    "feature_version_source": "historical_reconstructible_v1",
+    "symbol": "ETHUSD",
+    "production_modified": false,
+    "rich_forward_data_used": false
+  },
+  "feature_shortlist_loaded": [
+    {
+      "feature": "atr_slope_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "rv_slope_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "atr_pct_12b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "bollinger_bandwidth_20b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "keltner_width_20b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "rv_12b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "price_efficiency_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "rolling_vwap_z_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "donchian_pos_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "volume_z_96b",
+      "type": "individual_step11",
+      "source": "Step 11 shortlist"
+    },
+    {
+      "feature": "high_atr_pct_and_rising_atr_slope",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "ema_spread_high_and_rising_atr",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "low_vwap_displacement_and_low_atr",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "high_vwap_displacement_and_rising_atr",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "low_atr_and_mid_donchian",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "rising_atr_and_high_volume",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "low_atr_pct_and_falling_atr_slope",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    },
+    {
+      "feature": "low_adx_and_falling_atr",
+      "type": "interaction_step12",
+      "source": "Step 12 evidence"
+    }
+  ],
+  "threshold_semantics": {
+    "step12_discovery": "Step 12 used whole-dataset quantiles for exploratory interaction discovery.",
+    "step13_canonical_bridge": "Step 13 reconstructs interaction states with expanding historical quantiles using observations <= T, min_periods=300.",
+    "fixed_thresholds": "Donchian center/edge uses fixed economic channel-position thresholds, not fitted future data."
+  },
+  "candle_cutoff_semantics": "Feature timestamp T uses the latest completed 5m OHLCV candle with candle_time <= prediction_timestamp. Current exact candle is included only when its timestamp equals prediction_timestamp in the historical completed-candle table.",
+  "future_rich_feature_asof_semantics": "Future rich feature domains must select the latest source_timestamp <= prediction_timestamp and later enforce maximum age thresholds by domain. No rich data is connected in Step 13.",
+  "label_v2_semantics": "Existing Label V2 columns are attached unchanged; per-target *_eligible columns preserve missing/ineligible semantics. Missing labels are not coerced to false.",
+  "price_scale_audit": [
+    {
+      "feature": "atr_slope_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "rv_slope_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "atr_pct_12b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "bollinger_bandwidth_20b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "keltner_width_20b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "rv_12b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "price_efficiency_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "rolling_vwap_z_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "donchian_pos_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "volume_z_96b",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "high_atr_pct_and_rising_atr_slope",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "ema_spread_high_and_rising_atr",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "low_vwap_displacement_and_low_atr",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "high_vwap_displacement_and_rising_atr",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "low_atr_and_mid_donchian",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "rising_atr_and_high_volume",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "low_atr_pct_and_falling_atr_slope",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "low_adx_and_falling_atr",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "horizon_hours",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    },
+    {
+      "feature": "regime",
+      "price_scale_safe": true,
+      "note": "No selected feature uses raw absolute ETH price as a direct model input."
+    }
+  ],
+  "step11_12_leakage_audit": {
+    "whole_dataset_quantiles_in_step12_discovery": true,
+    "affected": "Step 12 binary state interactions during exploratory ranking.",
+    "corrected_for_step13": true,
+    "step13_correction": "Expanding thresholds fitted only on feature observations at-or-before each prediction timestamp.",
+    "step11_indicator_leakage_found": false,
+    "future_regime_assignment_found": false,
+    "required_step14_action": "Chronological out-of-sample testing must decide whether exploratory Step 12 signals survive leakage-safe thresholding."
+  },
+  "artifacts": {
+    "dataset_csv": "reports/step13_probability_v2_dataset.csv",
+    "dataset_parquet": "reports/step13_probability_v2_dataset.parquet",
+    "parquet_error": null,
+    "sample_csv": "reports/step13_probability_v2_dataset_sample.csv"
+  }
+}

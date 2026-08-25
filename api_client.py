@@ -31,6 +31,13 @@ def api_post(path, payload=None, timeout=MAX_STREAMLIT_REQUEST_TIMEOUT_SECONDS):
     return response.json()
 
 
+def api_patch(path, payload=None, timeout=MAX_STREAMLIT_REQUEST_TIMEOUT_SECONDS):
+    timeout = _bounded_timeout(timeout)
+    response = requests.patch(f"{backend_url()}{path}", json=payload or {}, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
 def backend_health(timeout=5):
     try:
         return api_get("/health", timeout=timeout)

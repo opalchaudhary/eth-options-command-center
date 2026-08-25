@@ -1,0 +1,22 @@
+{
+  "recommended_scheme": "chronological 60/20/20 timestamp split plus horizon-specific non-overlap robustness samples",
+  "train": {
+    "start": "2026-05-24T03:00:00+00:00",
+    "end": "2026-07-15T16:00:00+00:00",
+    "timestamps": 2523,
+    "rows": 15138
+  },
+  "validation": {
+    "start": "2026-07-15T16:30:00+00:00",
+    "end": "2026-08-02T04:30:00+00:00",
+    "timestamps": 841,
+    "rows": 5046
+  },
+  "test": {
+    "start": "2026-08-02T05:00:00+00:00",
+    "end": "2026-08-19T17:30:00+00:00",
+    "timestamps": 842,
+    "rows": 5052
+  },
+  "overlap_recommendation": "For every horizon, report primary chronological validation/test and secondary less-overlapping samples using every horizon_minutes/5m-th timestamp with a purge/embargo of at least one horizon around split boundaries."
+}

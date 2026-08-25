@@ -1,0 +1,804 @@
+{
+  "generated_at": "2026-08-24T15:35:03.238575Z",
+  "dataset_contract": {
+    "record_type": "BACKTEST",
+    "model_version": "probability_v1",
+    "label_version": "label_v2",
+    "feature_version": "historical_reconstructible_v1",
+    "rich_forward_data_used": false,
+    "production_modified": false
+  },
+  "integrity": {
+    "snapshots": 4206,
+    "predictions": 25236,
+    "outcomes": 25236,
+    "counts_by_horizon": {
+      "12H": 4206,
+      "1H": 4206,
+      "24H": 4206,
+      "2H": 4206,
+      "4H": 4206,
+      "8H": 4206
+    },
+    "date_range": {
+      "start": "2026-05-24T03:00:00Z",
+      "end": "2026-08-19T17:30:00Z"
+    },
+    "regimes": {
+      "NORMAL_RANGE": 2314,
+      "LOW_VOL_RANGE": 1024,
+      "VOLATILITY_EXPANSION": 324,
+      "TREND_DOWN": 190,
+      "TREND_UP": 179,
+      "HIGH_VOL": 163,
+      "LIQUIDATION_STYLE_MOVE": 12
+    },
+    "duplicate_prediction_groups": 0,
+    "duplicate_snapshots": 0,
+    "predictions_missing_outcomes": 0,
+    "unexpected_prediction_versions": {
+      "record_type": {
+        "BACKTEST": 25236
+      },
+      "model_version": {
+        "probability_v1": 25236
+      },
+      "feature_version": {
+        "historical_reconstructible_v1": 25236
+      }
+    },
+    "outcome_label_versions": {
+      "label_v2": 25236
+    },
+    "canonical_timestamps": 4206,
+    "max_feature_timestamp_after_prediction": 0,
+    "horizon_counts_joined": {
+      "12H": 4206,
+      "1H": 4206,
+      "24H": 4206,
+      "2H": 4206,
+      "4H": 4206,
+      "8H": 4206
+    }
+  },
+  "step11_shortlist_used": [
+    "atr_slope_96b",
+    "rv_slope_96b",
+    "atr_pct_12b",
+    "bollinger_bandwidth_20b",
+    "atr_12b",
+    "keltner_width_20b",
+    "rv_12b",
+    "atr_pct_24b",
+    "atr_24b",
+    "rv_24b",
+    "price_efficiency_96b",
+    "price_efficiency_48b",
+    "rolling_vwap_z_96b",
+    "donchian_pos_96b",
+    "bb_keltner_width_ratio_48b",
+    "volume_z_96b",
+    "volume_rel_96b",
+    "adx_48b",
+    "ema_spread_atr_12_48b"
+  ],
+  "candidate_interactions_tested": 32,
+  "interaction_families_tested": [
+    "COMPRESSION_X_TREND_BREAKOUT",
+    "STRUCTURE_X_VOLATILITY",
+    "VOLATILITY_X_PATH_EFFICIENCY",
+    "VOLATILITY_X_VOLUME",
+    "VOL_LEVEL_X_VOL_SLOPE"
+  ],
+  "thresholds": {
+    "atr_slope_96b": {
+      "q30": -0.06662216288384334,
+      "q50": 0.00020385945136853895,
+      "q70": 0.05767927997677446
+    },
+    "rv_slope_96b": {
+      "q30": -0.06354039203474086,
+      "q50": 0.0012632717728927427,
+      "q70": 0.05445040415664179
+    },
+    "atr_pct_12b": {
+      "q30": 0.0012860755078908262,
+      "q50": 0.001690960653492682,
+      "q70": 0.0022362796214386396
+    },
+    "bollinger_bandwidth_20b": {
+      "q30": 0.004502945105539485,
+      "q50": 0.006455209975946548,
+      "q70": 0.009301265557235138
+    },
+    "atr_12b": {
+      "q30": 2.362500000000049,
+      "q50": 3.0645833333333505,
+      "q70": 4.008333333333364
+    },
+    "keltner_width_20b": {
+      "q30": 0.00527330491215691,
+      "q50": 0.006809836243725611,
+      "q70": 0.009030385690886813
+    },
+    "rv_12b": {
+      "q30": 24.59141497514274,
+      "q50": 33.69301984887813,
+      "q70": 45.427621874886036
+    },
+    "atr_pct_24b": {
+      "q30": 0.0013281378748059242,
+      "q50": 0.001713664329887656,
+      "q70": 0.0022813899785772097
+    },
+    "atr_24b": {
+      "q30": 2.431250000000034,
+      "q50": 3.0999999999999988,
+      "q70": 4.056249999999987
+    },
+    "rv_24b": {
+      "q30": 27.320326142198276,
+      "q50": 35.7816837663498,
+      "q70": 48.598763478458565
+    },
+    "price_efficiency_96b": {
+      "q30": 0.043536955788053264,
+      "q50": 0.07929269585169976,
+      "q70": 0.1250378443838946
+    },
+    "price_efficiency_48b": {
+      "q30": 0.06324358171571932,
+      "q50": 0.11245180943345481,
+      "q70": 0.17757009345794458
+    },
+    "rolling_vwap_z_96b": {
+      "q30": -1.3423418543625996,
+      "q50": 0.16234408318024868,
+      "q70": 1.6242612734984483,
+      "abs_q30": 1.0802599541769506,
+      "abs_q70": 3.0192937382467706
+    },
+    "donchian_pos_96b": {
+      "q30": 0.34866468842729925,
+      "q50": 0.5269816211372887,
+      "q70": 0.6901408450704442,
+      "center": "0.35..0.65",
+      "edge": "<=0.20 or >=0.80"
+    },
+    "bb_keltner_width_ratio_48b": {
+      "q30": 1.185015440699562,
+      "q50": 1.4583349309561346,
+      "q70": 1.8221523367623094
+    },
+    "volume_z_96b": {
+      "q30": -0.43346477097647756,
+      "q50": -0.0741256723032859,
+      "q70": 0.4633433367979608
+    },
+    "volume_rel_96b": {
+      "q30": 0.5988115476131985,
+      "q50": 0.9330279301312822,
+      "q70": 1.408359029270101
+    },
+    "adx_48b": {
+      "q30": 14.70029900902638,
+      "q50": 19.457037984025263,
+      "q70": 25.44344880648895
+    },
+    "ema_spread_atr_12_48b": {
+      "q30": -0.6441491273455655,
+      "q50": 0.05285728448675911,
+      "q70": 0.7201823986835186,
+      "abs_q30": 0.5109140542529812,
+      "abs_q70": 1.3539440832719851
+    }
+  },
+  "saturated_targets_excluded_or_downweighted": [
+    {
+      "target": "fast_1atr_touch",
+      "horizon": "2H",
+      "base_rate": 0.9940561103185925
+    },
+    {
+      "target": "fast_1atr_touch",
+      "horizon": "4H",
+      "base_rate": 0.9995244888254874
+    },
+    {
+      "target": "max_abs_excursion_ge_1_5_atr",
+      "horizon": "12H",
+      "base_rate": 0.9997622444127438
+    },
+    {
+      "target": "max_abs_excursion_ge_1_5_atr",
+      "horizon": "4H",
+      "base_rate": 0.994531621493105
+    },
+    {
+      "target": "max_abs_excursion_ge_1_5_atr",
+      "horizon": "8H",
+      "base_rate": 0.9992867332382311
+    }
+  ],
+  "top_interactions": [
+    {
+      "interaction": "high_atr_pct_and_rising_atr_slope",
+      "family": "VOL_LEVEL_X_VOL_SLOPE",
+      "features": "atr_pct_12b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 953,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.6726128016789087,
+      "best_abs_lift": -0.21183798291452927,
+      "best_incremental_abs_lift": 0.0595583552149106,
+      "best_rank_score": 74.64818840548128,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 43,
+      "chronological_hits": 51,
+      "nonoverlap_hits": 19,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "ema_spread_high_and_rising_atr",
+      "family": "COMPRESSION_X_TREND_BREAKOUT",
+      "features": "ema_spread_atr_12_48b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "2H",
+      "best_n": 837,
+      "best_base_rate": 0.8609129814550642,
+      "best_conditioned_rate": 0.7514934289127837,
+      "best_abs_lift": -0.10941955254228053,
+      "best_incremental_abs_lift": 0.04593881074484829,
+      "best_rank_score": 61.48351706886824,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 40,
+      "chronological_hits": 46,
+      "nonoverlap_hits": 20,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_vwap_displacement_and_low_atr",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "rolling_vwap_z_96b+atr_pct_12b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 479,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.9039665970772442,
+      "best_abs_lift": 0.2220835728261743,
+      "best_incremental_abs_lift": 0.043427769818924156,
+      "best_rank_score": 60.53197551371085,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 12,
+      "chronological_hits": 42,
+      "nonoverlap_hits": 10,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "high_vwap_displacement_and_rising_atr",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "rolling_vwap_z_96b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "2H",
+      "best_n": 808,
+      "best_base_rate": 0.8609129814550642,
+      "best_conditioned_rate": 0.754950495049505,
+      "best_abs_lift": -0.10596248640555928,
+      "best_incremental_abs_lift": 0.04248174460812704,
+      "best_rank_score": 59.819238134646724,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 39,
+      "chronological_hits": 46,
+      "nonoverlap_hits": 18,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_atr_and_mid_donchian",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "atr_pct_12b+donchian_pos_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 503,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8926441351888668,
+      "best_abs_lift": 0.21076111093779681,
+      "best_incremental_abs_lift": 0.03210530793054667,
+      "best_rank_score": 59.37834305803647,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 13,
+      "chronological_hits": 40,
+      "nonoverlap_hits": 9,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "rising_atr_and_high_volume",
+      "family": "VOLATILITY_X_VOLUME",
+      "features": "atr_slope_96b+volume_z_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 745,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.7476510067114094,
+      "best_abs_lift": -0.13679977788202857,
+      "best_incremental_abs_lift": 0.055011855865861214,
+      "best_rank_score": 58.55305120467006,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 32,
+      "chronological_hits": 43,
+      "nonoverlap_hits": 14,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "rising_rv_and_high_volume",
+      "family": "VOLATILITY_X_VOLUME",
+      "features": "rv_slope_96b+volume_z_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 745,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.7503355704697987,
+      "best_abs_lift": -0.13411521412363925,
+      "best_incremental_abs_lift": 0.05327831445649711,
+      "best_rank_score": 57.747220055706094,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 32,
+      "chronological_hits": 49,
+      "nonoverlap_hits": 14,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_atr_pct_and_falling_atr_slope",
+      "family": "VOL_LEVEL_X_VOL_SLOPE",
+      "features": "atr_pct_12b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 886,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8645598194130926,
+      "best_abs_lift": 0.18267679516202262,
+      "best_incremental_abs_lift": 0.004020992154772474,
+      "best_rank_score": 56.7307688226747,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 21,
+      "chronological_hits": 48,
+      "nonoverlap_hits": 10,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_adx_and_falling_atr",
+      "family": "VOLATILITY_X_PATH_EFFICIENCY",
+      "features": "adx_48b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 796,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8178391959798995,
+      "best_abs_lift": 0.13595617172882957,
+      "best_incremental_abs_lift": 0.057141890116191085,
+      "best_rank_score": 55.834083469401534,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 17,
+      "chronological_hits": 43,
+      "nonoverlap_hits": 8,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "keltner_compressed_and_falling_atr_slope",
+      "family": "COMPRESSION_X_TREND_BREAKOUT",
+      "features": "keltner_width_20b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 899,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8553948832035595,
+      "best_abs_lift": 0.17351185895248955,
+      "best_incremental_abs_lift": 0.00040280713382889743,
+      "best_rank_score": 55.08745275807167,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 21,
+      "chronological_hits": 49,
+      "nonoverlap_hits": 11,
+      "classification": "CORE INTERACTION"
+    }
+  ],
+  "weak_rejected_or_unstable": [
+    {
+      "interaction": "low_atr_and_donchian_edge",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "atr_pct_12b+donchian_pos_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 304,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8388157894736842,
+      "best_abs_lift": 0.15693276522261423,
+      "best_incremental_abs_lift": -0.021723037784635912,
+      "best_rank_score": 48.033253609966934,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 17,
+      "chronological_hits": 44,
+      "nonoverlap_hits": 0,
+      "classification": "REDUNDANT"
+    },
+    {
+      "interaction": "high_atr_pct_and_falling_atr_slope",
+      "family": "VOL_LEVEL_X_VOL_SLOPE",
+      "features": "atr_pct_12b+atr_slope_96b",
+      "best_target": "oscillatory_path",
+      "best_horizon": "24H",
+      "best_n": 309,
+      "best_base_rate": 0.4455539705183072,
+      "best_conditioned_rate": 0.30097087378640774,
+      "best_abs_lift": -0.14458309673189945,
+      "best_incremental_abs_lift": 0.048474451094733306,
+      "best_rank_score": 29.405879664301157,
+      "useful_horizons": "",
+      "horizon_class": "UNSTABLE",
+      "strong_hits": 0,
+      "chronological_hits": 0,
+      "nonoverlap_hits": 0,
+      "classification": "UNSTABLE"
+    }
+  ],
+  "proposed_market_state_features": [
+    {
+      "interaction": "high_atr_pct_and_rising_atr_slope",
+      "family": "VOL_LEVEL_X_VOL_SLOPE",
+      "features": "atr_pct_12b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 953,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.6726128016789087,
+      "best_abs_lift": -0.21183798291452927,
+      "best_incremental_abs_lift": 0.0595583552149106,
+      "best_rank_score": 74.64818840548128,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 43,
+      "chronological_hits": 51,
+      "nonoverlap_hits": 19,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "ema_spread_high_and_rising_atr",
+      "family": "COMPRESSION_X_TREND_BREAKOUT",
+      "features": "ema_spread_atr_12_48b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "2H",
+      "best_n": 837,
+      "best_base_rate": 0.8609129814550642,
+      "best_conditioned_rate": 0.7514934289127837,
+      "best_abs_lift": -0.10941955254228053,
+      "best_incremental_abs_lift": 0.04593881074484829,
+      "best_rank_score": 61.48351706886824,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 40,
+      "chronological_hits": 46,
+      "nonoverlap_hits": 20,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_vwap_displacement_and_low_atr",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "rolling_vwap_z_96b+atr_pct_12b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 479,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.9039665970772442,
+      "best_abs_lift": 0.2220835728261743,
+      "best_incremental_abs_lift": 0.043427769818924156,
+      "best_rank_score": 60.53197551371085,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 12,
+      "chronological_hits": 42,
+      "nonoverlap_hits": 10,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "high_vwap_displacement_and_rising_atr",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "rolling_vwap_z_96b+atr_slope_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "2H",
+      "best_n": 808,
+      "best_base_rate": 0.8609129814550642,
+      "best_conditioned_rate": 0.754950495049505,
+      "best_abs_lift": -0.10596248640555928,
+      "best_incremental_abs_lift": 0.04248174460812704,
+      "best_rank_score": 59.819238134646724,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 39,
+      "chronological_hits": 46,
+      "nonoverlap_hits": 18,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_atr_and_mid_donchian",
+      "family": "STRUCTURE_X_VOLATILITY",
+      "features": "atr_pct_12b+donchian_pos_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 503,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8926441351888668,
+      "best_abs_lift": 0.21076111093779681,
+      "best_incremental_abs_lift": 0.03210530793054667,
+      "best_rank_score": 59.37834305803647,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 13,
+      "chronological_hits": 40,
+      "nonoverlap_hits": 9,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "rising_atr_and_high_volume",
+      "family": "VOLATILITY_X_VOLUME",
+      "features": "atr_slope_96b+volume_z_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 745,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.7476510067114094,
+      "best_abs_lift": -0.13679977788202857,
+      "best_incremental_abs_lift": 0.055011855865861214,
+      "best_rank_score": 58.55305120467006,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 32,
+      "chronological_hits": 43,
+      "nonoverlap_hits": 14,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "rising_rv_and_high_volume",
+      "family": "VOLATILITY_X_VOLUME",
+      "features": "rv_slope_96b+volume_z_96b",
+      "best_target": "realized_over_range_width_ge_1",
+      "best_horizon": "24H",
+      "best_n": 745,
+      "best_base_rate": 0.884450784593438,
+      "best_conditioned_rate": 0.7503355704697987,
+      "best_abs_lift": -0.13411521412363925,
+      "best_incremental_abs_lift": 0.05327831445649711,
+      "best_rank_score": 57.747220055706094,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 32,
+      "chronological_hits": 49,
+      "nonoverlap_hits": 14,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_atr_pct_and_falling_atr_slope",
+      "family": "VOL_LEVEL_X_VOL_SLOPE",
+      "features": "atr_pct_12b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 886,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8645598194130926,
+      "best_abs_lift": 0.18267679516202262,
+      "best_incremental_abs_lift": 0.004020992154772474,
+      "best_rank_score": 56.7307688226747,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 21,
+      "chronological_hits": 48,
+      "nonoverlap_hits": 10,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "low_adx_and_falling_atr",
+      "family": "VOLATILITY_X_PATH_EFFICIENCY",
+      "features": "adx_48b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 796,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8178391959798995,
+      "best_abs_lift": 0.13595617172882957,
+      "best_incremental_abs_lift": 0.057141890116191085,
+      "best_rank_score": 55.834083469401534,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 17,
+      "chronological_hits": 43,
+      "nonoverlap_hits": 8,
+      "classification": "CORE INTERACTION"
+    },
+    {
+      "interaction": "keltner_compressed_and_falling_atr_slope",
+      "family": "COMPRESSION_X_TREND_BREAKOUT",
+      "features": "keltner_width_20b+atr_slope_96b",
+      "best_target": "upside_breakout_occurred",
+      "best_horizon": "24H",
+      "best_n": 899,
+      "best_base_rate": 0.68188302425107,
+      "best_conditioned_rate": 0.8553948832035595,
+      "best_abs_lift": 0.17351185895248955,
+      "best_incremental_abs_lift": 0.00040280713382889743,
+      "best_rank_score": 55.08745275807167,
+      "useful_horizons": "1H,2H,4H,8H,12H,24H",
+      "horizon_class": "MULTI-HORIZON",
+      "strong_hits": 21,
+      "chronological_hits": 49,
+      "nonoverlap_hits": 11,
+      "classification": "CORE INTERACTION"
+    }
+  ],
+  "final_questions": {
+    "A_interactions_improve_over_individuals": true,
+    "B_strongest_vol_state_x_change": [
+      "high_atr_pct_and_rising_atr_slope",
+      "low_atr_pct_and_falling_atr_slope"
+    ],
+    "C_stable_low_vol_vs_pre_breakout": "Compare low_atr_pct_and_falling_atr_slope / low_rv_and_falling_rv_slope against low_atr_pct_and_rising_atr_slope / bb_compressed_and_rising_atr_slope.",
+    "D_high_quality_grid_environments": [
+      "high_atr_pct_and_rising_atr_slope",
+      "high_vwap_displacement_and_rising_atr",
+      "ema_spread_high_and_rising_atr",
+      "rising_atr_and_high_efficiency",
+      "high_adx_and_rising_atr"
+    ],
+    "E_dangerous_grid_runaway_states": [
+      "low_adx_and_falling_atr",
+      "ema_spread_low_and_falling_atr",
+      "falling_atr_and_low_efficiency",
+      "low_rv_and_falling_rv_slope",
+      "donchian_center_and_falling_rv"
+    ],
+    "F_better_iron_fly_containment_states": [
+      "high_atr_pct_and_rising_atr_slope",
+      "ema_spread_high_and_rising_atr",
+      "high_vwap_displacement_and_rising_atr",
+      "rising_atr_and_high_volume"
+    ],
+    "G_iron_fly_avoidance_states": [
+      "falling_atr_and_low_efficiency",
+      "ema_spread_low_and_falling_atr",
+      "low_adx_and_falling_atr",
+      "low_rv_and_falling_rv_slope",
+      "bb_compressed_and_falling_atr_slope"
+    ],
+    "H_defensive_long_option_hedge_states": [
+      "low_adx_and_falling_atr",
+      "ema_spread_low_and_falling_atr",
+      "falling_atr_and_low_efficiency",
+      "low_rv_and_falling_rv_slope",
+      "donchian_center_and_falling_rv"
+    ],
+    "I_survive_chronological": [
+      "high_atr_pct_and_rising_atr_slope",
+      "ema_spread_high_and_rising_atr",
+      "low_vwap_displacement_and_low_atr",
+      "high_vwap_displacement_and_rising_atr",
+      "low_atr_and_mid_donchian",
+      "rising_atr_and_high_volume",
+      "rising_rv_and_high_volume",
+      "low_atr_pct_and_falling_atr_slope",
+      "low_adx_and_falling_atr",
+      "keltner_compressed_and_falling_atr_slope"
+    ],
+    "J_survive_less_overlapping": [
+      "high_atr_pct_and_rising_atr_slope",
+      "ema_spread_high_and_rising_atr",
+      "low_vwap_displacement_and_low_atr",
+      "high_vwap_displacement_and_rising_atr",
+      "low_atr_and_mid_donchian",
+      "rising_atr_and_high_volume",
+      "rising_rv_and_high_volume",
+      "low_atr_pct_and_falling_atr_slope",
+      "low_adx_and_falling_atr",
+      "keltner_compressed_and_falling_atr_slope"
+    ],
+    "K_redundant_versions": [
+      {
+        "interaction_a": "low_atr_pct_and_falling_atr_slope",
+        "interaction_b": "keltner_compressed_and_falling_atr_slope",
+        "phi_corr": 0.8812819919602429,
+        "redundancy": "HIGH"
+      },
+      {
+        "interaction_a": "rising_atr_and_high_volume",
+        "interaction_b": "rising_rv_and_high_volume",
+        "phi_corr": 0.8727651743589643,
+        "redundancy": "HIGH"
+      },
+      {
+        "interaction_a": "keltner_compressed_and_rising_atr_slope",
+        "interaction_b": "low_atr_pct_and_rising_atr_slope",
+        "phi_corr": 0.8592308202817421,
+        "redundancy": "HIGH"
+      },
+      {
+        "interaction_a": "low_vwap_displacement_and_low_atr",
+        "interaction_b": "low_atr_and_mid_donchian",
+        "phi_corr": 0.7789551478991382,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "ema_spread_high_and_rising_atr",
+        "interaction_b": "high_vwap_displacement_and_rising_atr",
+        "phi_corr": 0.7636738056714443,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "low_atr_and_low_efficiency",
+        "interaction_b": "bb_compressed_and_low_efficiency",
+        "phi_corr": 0.7503483484558562,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "low_atr_pct_and_falling_atr_slope",
+        "interaction_b": "bb_compressed_and_falling_atr_slope",
+        "phi_corr": 0.7409587590805145,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "keltner_compressed_and_falling_atr_slope",
+        "interaction_b": "bb_compressed_and_falling_atr_slope",
+        "phi_corr": 0.7274459909449777,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "low_atr_pct_and_falling_atr_slope",
+        "interaction_b": "low_rv_and_falling_rv_slope",
+        "phi_corr": 0.721247370301318,
+        "redundancy": "MODERATE"
+      },
+      {
+        "interaction_a": "low_atr_and_high_efficiency",
+        "interaction_b": "bb_compressed_and_high_efficiency",
+        "phi_corr": 0.7106132080381109,
+        "redundancy": "MODERATE"
+      }
+    ],
+    "L_step13_features": [
+      "atr_slope_96b",
+      "rv_slope_96b",
+      "atr_pct_12b",
+      "bollinger_bandwidth_20b",
+      "keltner_width_20b",
+      "rv_12b",
+      "price_efficiency_96b",
+      "rolling_vwap_z_96b",
+      "donchian_pos_96b",
+      "volume_z_96b",
+      "high_atr_pct_and_rising_atr_slope",
+      "ema_spread_high_and_rising_atr",
+      "low_vwap_displacement_and_low_atr",
+      "high_vwap_displacement_and_rising_atr",
+      "low_atr_and_mid_donchian",
+      "rising_atr_and_high_volume",
+      "low_atr_pct_and_falling_atr_slope",
+      "low_adx_and_falling_atr"
+    ]
+  },
+  "limitations": [
+    "Primary data is BACKTEST probability_v1/label_v2/historical_reconstructible_v1 only.",
+    "The persisted dataset has 25,186 joined predictions/outcomes, not the 25,236 count stated in the prompt; 4H and 8H have 4,181 each.",
+    "Targets with base rates <=2% or >=98% are marked saturated and penalized.",
+    "Non-overlap checks use every horizon/5m-th row as a simple secondary robustness diagnostic.",
+    "No Probability V2, Feature Bridge, scheduler, production table, schema, collector, Grid, Iron Fly, or futures logic was changed."
+  ],
+  "recommended_next_step": "Step 13 should carry forward the compact individual/interactions list and test a frozen challenger design offline only.",
+  "final_verdict": "STEP 12 COMPLETE \u2014 ROBUST STRATEGY-STATE INTERACTIONS IDENTIFIED"
+}

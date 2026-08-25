@@ -1,0 +1,498 @@
+import os
+from copy import deepcopy
+from typing import Any
+
+import requests
+
+import storage
+from .models import new_id, utc_now
+
+
+ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSED", "REGRID_PENDING"}
+
+
+class SupabasePersistenceError(RuntimeError):
+    pass
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    return value
+
+
+class SupabaseGridRepository:
+    def __init__(self, url: str | None = None, key: str | None = None, timeout: int = 15):
+        self.url = (url or storage.SUPABASE_URL or "").rstrip("/")
+        self.key = key or storage.SUPABASE_KEY
+        self.timeout = timeout
+        self.enabled = bool(self.url and self.key)
+
+    @property
+    def headers(self) -> dict:
+        return {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
+
+    def _request(self, method: str, table: str, *, params: dict | None = None, json: Any = None, prefer: str | None = None) -> Any:
+        if not self.enabled:
+            raise SupabasePersistenceError("Supabase credentials are not configured.")
+        headers = self.headers
+        if prefer:
+            headers = {**headers, "Prefer": prefer}
+        response = requests.request(
+            method,
+            f"{self.url}/rest/v1/{table}",
+            headers=headers,
+            params=params,
+            json=_jsonable(json),
+            timeout=self.timeout,
+        )
+        if response.status_code not in {200, 201, 202, 204}:
+            raise SupabasePersistenceError(f"Supabase {method} {table} failed: {response.status_code} {response.text[:500]}")
+        if response.text:
+            try:
+                return response.json()
+            except ValueError:
+                return None
+        return None
+
+    def select(self, table: str, params: dict | None = None) -> list[dict]:
+        return self._request("GET", table, params=params or {"select": "*"}) or []
+
+    def upsert(self, table: str, payload: dict | list[dict], on_conflict: str | None = None) -> None:
+        params = {"on_conflict": on_conflict} if on_conflict else None
+        self._request("POST", table, params=params, json=payload, prefer="resolution=merge-duplicates,return=minimal")
+
+    def insert_once(self, table: str, payload: dict, on_conflict: str | None = None) -> bool:
+        params = {"on_conflict": on_conflict} if on_conflict else None
+        try:
+            self._request("POST", table, params=params, json=payload, prefer="resolution=ignore-duplicates,return=minimal")
+            return True
+        except SupabasePersistenceError as exc:
+            if "duplicate key" in str(exc).lower() or "23505" in str(exc):
+                return False
+            raise
+
+    def patch(self, table: str, filters: dict, payload: dict) -> None:
+        params = {key: f"eq.{value}" for key, value in filters.items()}
+        self._request("PATCH", table, params=params, json=payload, prefer="return=minimal")
+
+    def active_run(self) -> dict | None:
+        rows = self.select(
+            "grid_runs",
+            {
+                "select": "*",
+                "status": f"in.({','.join(sorted(ACTIVE_STATUSES))})",
+                "order": "started_at.desc",
+                "limit": 1,
+            },
+        )
+        return rows[0] if rows else None
+
+    def acquire_active_run_guard(self, run_id: str) -> None:
+        self.insert_once(
+            "grid_active_run_locks",
+            {"lock_name": "gridbot_v01_active_run", "run_id": run_id, "created_at": utc_now()},
+            on_conflict="lock_name",
+        )
+        rows = self.select(
+            "grid_active_run_locks",
+            {"select": "run_id", "lock_name": "eq.gridbot_v01_active_run", "limit": 1},
+        )
+        if not rows or rows[0].get("run_id") != run_id:
+            raise SupabasePersistenceError("Another DeltaGridBot V0.1 run is already active.")
+
+    def release_active_run_guard(self, run_id: str) -> None:
+        self._request(
+            "DELETE",
+            "grid_active_run_locks",
+            params={"lock_name": "eq.gridbot_v01_active_run", "run_id": f"eq.{run_id}"},
+            prefer="return=minimal",
+        )
+
+    def persist_run_state(self, run: dict, status: str | None = None) -> None:
+        config = run.get("config") or {}
+        product = run.get("product") or {}
+        bot_id = run["bot_id"]
+        run_id = run["run_id"]
+        now = utc_now()
+        self.upsert(
+            "grid_bots",
+            {
+                "bot_id": bot_id,
+                "bot_name": config.get("bot_name") or "DeltaGridBot V0.1",
+                "product_symbol": config.get("product_symbol") or product.get("symbol") or "ETHUSD",
+                "product_id": product.get("product_id"),
+                "environment": "testnet",
+                "status": status or run.get("status"),
+                "current_status": status or run.get("status"),
+                "updated_at": now,
+            },
+            on_conflict="bot_id",
+        )
+        self.upsert(
+            "grid_runs",
+            {
+                "run_id": run_id,
+                "bot_id": bot_id,
+                "status": status or run.get("status"),
+                "config_version": int(config.get("config_version") or run.get("config_version") or 1),
+                "execution_event_mode": run.get("execution_event_mode"),
+                "operational_state": run.get("operational_state"),
+                "started_at": run.get("started_at"),
+                "stopped_at": run.get("stopped_at"),
+                "starting_config_version": 1,
+                "active_config_version": int(config.get("config_version") or run.get("config_version") or 1),
+                "ending_config_version": int(config.get("config_version") or run.get("config_version") or 1),
+                "starting_market_price": run.get("reference_price"),
+                "ending_market_price": run.get("ending_market_price"),
+                "stop_reason": run.get("stop_reason"),
+                "updated_at": now,
+            },
+            on_conflict="run_id",
+        )
+        self.persist_config(run)
+        self.persist_levels(run)
+        for order in (run.get("orders") or {}).values():
+            self.persist_order(run, order)
+        for fill_id, fill in (run.get("fills") or {}).items():
+            self.persist_fill(run, fill_id, fill)
+
+    def persist_config(self, run: dict, reason: str = "start") -> None:
+        config = deepcopy(run.get("config") or {})
+        version = int(config.get("config_version") or 1)
+        self.upsert(
+            "grid_config_versions",
+            {
+                "run_id": run["run_id"],
+                "bot_id": run["bot_id"],
+                "config_version": version,
+                "effective_from": run.get("started_at") or utc_now(),
+                "grid_type": config.get("grid_type"),
+                "lower_price": config.get("lower_price"),
+                "upper_price": config.get("upper_price"),
+                "grid_count": config.get("grid_count"),
+                "spacing_type": config.get("spacing_type"),
+                "lot_size": config.get("lot_size"),
+                "max_inventory_lots": config.get("max_inventory_lots"),
+                "allocated_capital": config.get("allocated_capital"),
+                "risk_capital": config.get("risk_capital"),
+                "risk_thresholds": config.get("risk_thresholds") or {},
+                "reason": reason,
+                "regrid_required": False,
+                "config": config,
+            },
+            on_conflict="run_id,config_version",
+        )
+
+    def retire_config(self, run_id: str, config_version: int) -> None:
+        self.patch("grid_config_versions", {"run_id": run_id, "config_version": config_version}, {"effective_to": utc_now(), "regrid_required": True})
+        self.patch("grid_levels", {"run_id": run_id, "config_version": config_version}, {"state": "retired", "retired_at": utc_now()})
+
+    def persist_levels(self, run: dict) -> None:
+        config = run.get("config") or {}
+        version = int(config.get("config_version") or 1)
+        levels = run.get("levels") or []
+        if not levels:
+            return
+        prices = [level.get("price") for level in levels]
+        rows = []
+        for index, level in enumerate(levels):
+            prev_price = prices[index - 1] if index else None
+            spacing_abs = None
+            spacing_pct = None
+            try:
+                if prev_price is not None:
+                    spacing_abs = str(float(level["price"]) - float(prev_price))
+                    spacing_pct = str((float(level["price"]) / float(prev_price)) - 1) if float(prev_price) else None
+            except Exception:
+                pass
+            rows.append(
+                {
+                    "run_id": run["run_id"],
+                    "config_version": version,
+                    "level_id": level["level_id"],
+                    "level_index": level.get("index"),
+                    "side": level.get("side"),
+                    "price": level.get("price"),
+                    "spacing_absolute": spacing_abs,
+                    "spacing_percentage": spacing_pct,
+                    "state": level.get("state") or "active",
+                    "quantity": level.get("quantity"),
+                }
+            )
+        self.upsert("grid_levels", rows, on_conflict="run_id,config_version,level_id")
+
+    def persist_order_proposal(self, run: dict, proposal: Any, order_kind: str) -> None:
+        self.upsert(
+            "grid_order_proposals",
+            {
+                "proposal_id": proposal.client_order_id,
+                "run_id": run["run_id"],
+                "bot_id": run["bot_id"],
+                "config_version": int((run.get("config") or {}).get("config_version") or 1),
+                "level_id": proposal.level_id,
+                "client_order_id": proposal.client_order_id,
+                "side": proposal.side.value,
+                "price": str(proposal.price),
+                "quantity": str(proposal.quantity),
+                "order_kind": order_kind,
+                "status": "PROPOSED",
+                "created_at": utc_now(),
+            },
+            on_conflict="proposal_id",
+        )
+
+    def persist_order(self, run: dict, order: dict) -> None:
+        submitted_at = order.get("submitted_at") or order.get("created_at") or utc_now()
+        self.upsert(
+            "grid_orders",
+            {
+                "order_id": order.get("order_key") or order.get("client_order_id"),
+                "run_id": run["run_id"],
+                "bot_id": run["bot_id"],
+                "config_version": int(order.get("config_version") or (run.get("config") or {}).get("config_version") or 1),
+                "level_id": order.get("level_id"),
+                "client_order_id": order.get("client_order_id"),
+                "exchange_order_id": order.get("exchange_order_id"),
+                "side": order.get("side"),
+                "price": order.get("price"),
+                "requested_quantity": order.get("requested_quantity"),
+                "filled_quantity": order.get("filled_quantity") or "0",
+                "remaining_quantity": order.get("remaining_quantity"),
+                "order_type": "limit_order",
+                "time_in_force": "gtc",
+                "post_only": True,
+                "reduce_only": False,
+                "status": order.get("status"),
+                "submitted_at": submitted_at,
+                "updated_at": utc_now(),
+                "cancelled_at": order.get("cancelled_at"),
+                "rejection_reason": order.get("rejection_reason") or order.get("cancel_error"),
+                "order_kind": order.get("order_kind"),
+                "raw": order.get("raw") or {},
+            },
+            on_conflict="client_order_id",
+        )
+
+    def persist_fill(self, run: dict, fill_id: str, fill: dict) -> bool:
+        client_order_id = str(fill.get("client_order_id") or "")
+        order = (run.get("orders") or {}).get(client_order_id) or {}
+        price = fill.get("price") or fill.get("fill_price") or order.get("price")
+        quantity = fill.get("size") or fill.get("quantity")
+        exchange_fill_id = str(fill.get("id") or fill_id)
+        exchange_timestamp = fill.get("created_at") if isinstance(fill.get("created_at"), str) else None
+        inserted = self.insert_once(
+            "grid_fills",
+            {
+                "fill_id": fill_id,
+                "run_id": run["run_id"],
+                "bot_id": run["bot_id"],
+                "order_id": order.get("order_key") or client_order_id,
+                "level_id": order.get("level_id"),
+                "exchange_fill_id": exchange_fill_id,
+                "side": str(fill.get("side") or "").lower(),
+                "price": price,
+                "quantity": quantity,
+                "notional": None,
+                "liquidity_role": fill.get("liquidity") or fill.get("liquidity_role") or "unknown",
+                "fee": fill.get("commission") or fill.get("fee") or "0",
+                "exchange_fee": fill.get("commission") or fill.get("fee") or "0",
+                "exchange_timestamp": exchange_timestamp,
+                "detected_at": utc_now(),
+                "rest_detection_latency": None,
+                "raw": fill,
+            },
+            on_conflict="exchange_fill_id",
+        )
+        if inserted:
+            fee = fill.get("commission") or fill.get("fee")
+            if fee not in [None, "", "0", 0]:
+                self.insert_once(
+                    "grid_exchange_costs",
+                    {
+                        "cost_id": new_id("cost"),
+                        "run_id": run["run_id"],
+                        "order_id": order.get("order_key") or client_order_id,
+                        "fill_id": fill_id,
+                        "cost_type": "trading_fee",
+                        "amount": fee,
+                        "currency": fill.get("commission_asset") or "USD",
+                        "direction": "debit",
+                        "exchange_transaction_id": exchange_fill_id,
+                        "exchange_timestamp": exchange_timestamp,
+                        "raw": fill,
+                    },
+                    on_conflict="cost_id",
+                )
+        return inserted
+
+    def persist_snapshot(self, run: dict, risk: dict, summary: dict | None = None) -> None:
+        payload = {
+            "snapshot_id": new_id("snap"),
+            "run_id": run["run_id"],
+            "timestamp": risk.get("created_at") or utc_now(),
+            "eth_price": run.get("reference_price"),
+            "active_config_version": int((run.get("config") or {}).get("config_version") or 1),
+            "inventory": risk.get("position"),
+            "pending_exposure": None,
+            "open_orders": risk.get("open_gridbot_orders"),
+            "gross_grid_pnl": (summary or {}).get("gross_pnl"),
+            "net_grid_pnl": (summary or {}).get("NET_TRADING_PNL_BEFORE_INCOME_TAX"),
+            "inventory_pnl": None,
+            "exchange_fees": (summary or {}).get("delta_fees"),
+            "funding": (summary or {}).get("funding"),
+            "account_equity": None,
+            "margin_metrics": risk,
+            "grr": None,
+            "drawdown": None,
+            "risk_state": "GREEN",
+            "execution_mode": run.get("execution_event_mode"),
+            "payload": {"run": {"status": run.get("status")}, "risk": risk},
+        }
+        self.insert_once("grid_bot_snapshots", payload, on_conflict="snapshot_id")
+        self.insert_once(
+            "grid_risk_snapshots",
+            {
+                "run_id": run["run_id"],
+                "timestamp": payload["timestamp"],
+                "risk_state": "GREEN",
+                "margin_state": risk,
+                "current_exposure": {"position": risk.get("position")},
+                "projected_exposure": {"open_gridbot_orders": risk.get("open_gridbot_orders")},
+                "risk_thresholds": (run.get("config") or {}).get("risk_thresholds") or {},
+            },
+            on_conflict="snapshot_id",
+        )
+
+    def log_event(self, run: dict | None, event_type: str, payload: dict | None = None) -> None:
+        self.insert_once(
+            "grid_events",
+            {
+                "event_id": new_id("evt"),
+                "bot_id": (run or {}).get("bot_id"),
+                "run_id": (run or {}).get("run_id"),
+                "event_type": event_type,
+                "payload": payload or {},
+                "created_at": utc_now(),
+            },
+            on_conflict="event_id",
+        )
+
+    def persist_summary(self, run: dict, summary: dict) -> None:
+        self.insert_once(
+            "grid_run_summaries",
+            {
+                "summary_id": summary["summary_id"],
+                "run_id": run["run_id"],
+                "bot_id": run["bot_id"],
+                "gridbot_version": summary.get("gridbot_version") or "0.1",
+                "summary": summary,
+                "immutable": True,
+                "created_at": summary.get("created_at") or utc_now(),
+                "finalised_at": summary.get("stopped_at") or utc_now(),
+            },
+            on_conflict="run_id",
+        )
+
+    def load_run_state(self, run_id: str) -> dict:
+        run_rows = self.select("grid_runs", {"select": "*", "run_id": f"eq.{run_id}", "limit": 1})
+        if not run_rows:
+            raise SupabasePersistenceError(f"Grid run not found in Supabase: {run_id}")
+        run_row = run_rows[0]
+        bot = (self.select("grid_bots", {"select": "*", "bot_id": f"eq.{run_row['bot_id']}", "limit": 1}) or [{}])[0]
+        config_rows = self.select(
+            "grid_config_versions",
+            {"select": "*", "run_id": f"eq.{run_id}", "config_version": f"eq.{run_row.get('active_config_version')}", "limit": 1},
+        )
+        config = (config_rows[0].get("config") if config_rows else None) or {}
+        config.setdefault("bot_id", run_row["bot_id"])
+        config.setdefault("bot_name", bot.get("bot_name"))
+        config.setdefault("product_symbol", bot.get("product_symbol") or "ETHUSD")
+        config.setdefault("config_version", run_row.get("active_config_version") or 1)
+        levels = self.select(
+            "grid_levels",
+            {
+                "select": "level_id,level_index,side,price,quantity,state",
+                "run_id": f"eq.{run_id}",
+                "config_version": f"eq.{config.get('config_version')}",
+                "order": "level_index.asc",
+            },
+        )
+        orders = self.select("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "submitted_at.asc"})
+        fills = self.select("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
+        snapshots = self.select("grid_risk_snapshots", {"select": "*", "run_id": f"eq.{run_id}", "order": "timestamp.asc", "limit": 50})
+        summary_rows = self.select("grid_run_summaries", {"select": "summary", "run_id": f"eq.{run_id}", "limit": 1})
+        product_id = bot.get("product_id") or 1699
+        return {
+            "run_id": run_id,
+            "bot_id": run_row["bot_id"],
+            "status": run_row.get("status"),
+            "gridbot_version": "0.1",
+            "config": config,
+            "levels": [
+                {
+                    "level_id": row["level_id"],
+                    "index": row.get("level_index"),
+                    "side": row.get("side"),
+                    "price": str(row.get("price")),
+                    "quantity": str(row.get("quantity") or config.get("lot_size") or "1"),
+                    "state": row.get("state"),
+                }
+                for row in levels
+            ],
+            "product": {"product_id": product_id, "symbol": bot.get("product_symbol") or "ETHUSD", "contract_multiplier": "1"},
+            "reference_price": str(run_row.get("starting_market_price") or "0"),
+            "execution_event_mode": run_row.get("execution_event_mode") or "REST_FALLBACK",
+            "private_ws_status": "BLOCKED_403",
+            "operational_state": run_row.get("operational_state") or "DEGRADED",
+            "sequence": len(orders) + 1,
+            "orders": {
+                row["client_order_id"]: {
+                    "order_key": row.get("order_id") or row["client_order_id"],
+                    "run_id": run_id,
+                    "level_id": row.get("level_id"),
+                    "side": row.get("side"),
+                    "price": str(row.get("price")),
+                    "requested_quantity": str(row.get("requested_quantity")),
+                    "filled_quantity": str(row.get("filled_quantity") or "0"),
+                    "remaining_quantity": str(row.get("remaining_quantity") or "0"),
+                    "client_order_id": row["client_order_id"],
+                    "exchange_order_id": str(row.get("exchange_order_id") or ""),
+                    "status": row.get("status"),
+                    "order_kind": row.get("order_kind"),
+                    "config_version": row.get("config_version"),
+                    "raw": row.get("raw") or {},
+                    "created_at": row.get("submitted_at"),
+                    "cancelled_at": row.get("cancelled_at"),
+                }
+                for row in orders
+            },
+            "fills": {str(row.get("exchange_fill_id") or row.get("fill_id")): row.get("raw") or row for row in fills},
+            "replacement_keys": {},
+            "risk_snapshots": [row.get("margin_state") or row for row in snapshots],
+            "started_at": run_row.get("started_at"),
+            "stopped_at": run_row.get("stopped_at"),
+            "stop_reason": run_row.get("stop_reason"),
+            "summary": summary_rows[0].get("summary") if summary_rows else None,
+            "last_reconciled_at": None,
+        }
+
+    def status_payload(self) -> dict:
+        active = self.active_run()
+        active_state = self.load_run_state(active["run_id"]) if active else None
+        runs = self.select("grid_runs", {"select": "*", "order": "created_at.desc", "limit": 25})
+        events = self.select("grid_events", {"select": "*", "order": "created_at.desc", "limit": 50})
+        return {
+            "ok": True,
+            "source_of_truth": "supabase",
+            "active_run_id": active_state.get("run_id") if active_state else None,
+            "active_run": active_state,
+            "runs": runs,
+            "events": list(reversed(events)),
+        }
