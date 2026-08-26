@@ -428,7 +428,35 @@ class SupabaseGridRepository:
         fills = self.select("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
         snapshots = self.select("grid_risk_snapshots", {"select": "*", "run_id": f"eq.{run_id}", "order": "timestamp.asc", "limit": 50})
         summary_rows = self.select("grid_run_summaries", {"select": "summary", "run_id": f"eq.{run_id}", "limit": 1})
+        event_rows = self.select(
+            "grid_events",
+            {"select": "event_type,payload,created_at", "run_id": f"eq.{run_id}", "order": "created_at.desc", "limit": 25},
+        )
+        latest_stage = next(
+            (
+                (row.get("payload") or {}).get("start_stage")
+                for row in event_rows
+                if row.get("event_type") == "GRID_RUN_START_STAGE" and (row.get("payload") or {}).get("start_stage")
+            ),
+            None,
+        )
+        latest_failure = next(
+            (
+                (row.get("payload") or {}).get("error")
+                for row in event_rows
+                if row.get("event_type") == "GRID_RUN_START_FAILED" and (row.get("payload") or {}).get("error")
+            ),
+            None,
+        )
         product_id = bot.get("product_id") or 1699
+        startup_stage = latest_stage or ("RUNNING" if run_row.get("status") == "RUNNING" else run_row.get("status"))
+        startup = {
+            "start_stage": startup_stage,
+            "orders_expected": len(levels),
+            "orders_submitted": len(orders),
+            "orders_verified": len([row for row in orders if row.get("exchange_order_id")]),
+            "last_error": latest_failure,
+        }
         return {
             "run_id": run_id,
             "bot_id": run_row["bot_id"],
@@ -481,6 +509,8 @@ class SupabaseGridRepository:
             "stop_reason": run_row.get("stop_reason"),
             "summary": summary_rows[0].get("summary") if summary_rows else None,
             "last_reconciled_at": None,
+            "start_stage": startup_stage,
+            "startup": startup,
         }
 
     def status_payload(self) -> dict:

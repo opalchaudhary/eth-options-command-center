@@ -28,6 +28,7 @@ class SpacingType(str, Enum):
 class GridStatus(str, Enum):
     CREATED = "CREATED"
     STARTING = "STARTING"
+    START_FAILED = "START_FAILED"
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
     REGRID_PENDING = "REGRID_PENDING"

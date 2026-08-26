@@ -2,7 +2,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import pandas as pd
+import requests
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 from api_client import api_get, api_post, backend_url
 from ui_styles import load_css
@@ -159,19 +164,56 @@ def summary_line(label, value):
     st.markdown(f"<div class='summary-row'><span>{label}</span><span>{value}</span></div>", unsafe_allow_html=True)
 
 
+def refresh_live_status():
+    status = api_get("/api/grid/v01/live/status")
+    st.session_state["gridbot_live_status"] = status
+    return status
+
+
+def safe_post(path, payload=None, timeout=15):
+    try:
+        return api_post(path, payload, timeout=timeout)
+    except requests.Timeout:
+        if path == "/api/grid/v01/live/start":
+            st.warning("Grid start is taking longer than expected. Checking current run status...")
+            status = refresh_live_status()
+            active_run = status.get("active_run")
+            if active_run:
+                return {"ok": True, "run": active_run, "attached_after_timeout": True}
+        st.error("GridBot request timed out.")
+        st.stop()
+    except requests.ConnectionError as exc:
+        st.error(f"GridBot API connection failed: {exc}")
+        st.stop()
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.response.json().get("detail")
+        except Exception:
+            detail = str(exc)
+        st.error(f"GridBot API request failed: {detail}")
+        st.stop()
+
+
 with st.sidebar:
     st.caption(f"Backend: {backend_url()}")
     if st.button("Refresh"):
+        st.session_state.pop("gridbot_history_runs", None)
+        st.session_state.pop("gridbot_history_summaries", None)
         st.rerun()
 
 try:
-    live_status = api_get("/api/grid/v01/live/status")
+    live_status = refresh_live_status()
 except Exception as exc:
     st.error(f"GridBot API unavailable: {exc}")
     st.stop()
 
 active = live_status.get("active_run") or {}
 active_status = active.get("status") or "STOPPED"
+if active_status == "STARTING" and st_autorefresh:
+    st_autorefresh(interval=2000, key="gridbot_starting_refresh")
+elif active_status == "RUNNING" and st_autorefresh:
+    st_autorefresh(interval=10000, key="gridbot_running_refresh")
 
 try:
     health = api_get("/api/grid/v01/live/market-account", {"product_symbol": "ETHUSD"}, timeout=15)
@@ -237,9 +279,10 @@ if active:
         unsafe_allow_html=True,
     )
     orders = list((active.get("orders") or {}).values())
-    open_orders = [row for row in orders if row.get("status") not in ["cancelled", "closed", "filled", "not_open"]]
+    open_orders = [row for row in orders if row.get("status") not in ["cancelled", "closed", "filled", "not_open", "manual_cancelled"]]
     fills = list((active.get("fills") or {}).values())
     summary = active.get("summary") or {}
+    startup = active.get("startup") or {}
     metric_cols = st.columns(6)
     with metric_cols[0]:
         card("Net Inventory", (active.get("risk_snapshots") or [{}])[-1].get("position", account.get("current_position") or "0"), "lots")
@@ -254,10 +297,16 @@ if active:
     with metric_cols[5]:
         card("Net Trading P&L", summary.get("NET_TRADING_PNL_BEFORE_INCOME_TAX", "0"), "Before tax")
 
+    if active_status == "STARTING":
+        st.info(
+            f"Startup: {startup.get('start_stage') or active.get('start_stage') or 'STARTING'} | "
+            f"orders {startup.get('orders_submitted', 0)}/{startup.get('orders_expected', len(active.get('levels') or []))}"
+        )
+
     bcols = st.columns([1, 1, 1, 1, 5])
     if active_status == "RUNNING":
         if bcols[0].button("Pause"):
-            api_post("/api/grid/v01/live/pause", timeout=15)
+            safe_post("/api/grid/v01/live/pause", timeout=15)
             st.rerun()
         if bcols[1].button("Regrid"):
             st.session_state["show_regrid"] = True
@@ -265,7 +314,7 @@ if active:
             st.session_state["confirm_stop"] = True
     elif active_status == "PAUSED":
         if bcols[0].button("Resume"):
-            api_post("/api/grid/v01/live/resume", timeout=15)
+            safe_post("/api/grid/v01/live/resume", timeout=15)
             st.rerun()
         if bcols[1].button("Regrid"):
             st.session_state["show_regrid"] = True
@@ -282,8 +331,10 @@ if active:
                 st.session_state["confirm_stop"] = False
                 st.rerun()
             if scol2.button("Confirm Stop", type="primary"):
-                api_post("/api/grid/v01/live/stop", {"reason": "dashboard_operator"}, timeout=15)
+                safe_post("/api/grid/v01/live/stop", {"reason": "dashboard_operator"}, timeout=15)
                 st.session_state["confirm_stop"] = False
+                st.session_state.pop("gridbot_history_runs", None)
+                st.session_state.pop("gridbot_history_summaries", None)
                 st.rerun()
 
     if st.session_state.get("show_regrid"):
@@ -305,7 +356,7 @@ if active:
                 st.session_state["show_regrid"] = False
                 st.rerun()
             if rcol2.button("Confirm Regrid", type="primary"):
-                api_post("/api/grid/v01/live/regrid", {"reason": "dashboard_operator"}, timeout=15)
+                safe_post("/api/grid/v01/live/regrid", {"reason": "dashboard_operator"}, timeout=15)
                 st.session_state["show_regrid"] = False
                 st.rerun()
 
@@ -344,7 +395,7 @@ if active:
         st.dataframe(pd.DataFrame(health_rows.items(), columns=["Metric", "Value"]), use_container_width=True, hide_index=True)
 
 st.markdown("<div class='df-section-title'>Create Grid</div>", unsafe_allow_html=True)
-with st.container(border=True):
+with st.form("gridbot_create_grid_form", border=True):
     c1, c2 = st.columns([1, 1])
     with c1:
         bot_name = st.text_input("Bot Name", value="ETH Testnet Grid")
@@ -370,8 +421,9 @@ with st.container(border=True):
         "lot_size": str(Decimal(str(lot_size))),
         "max_inventory_lots": str(Decimal(str(max_inventory))),
     }
-    if st.button("Preview Grid", type="primary"):
-        st.session_state["gridbot_preview"] = api_post("/api/grid/v01/live/preview", preview_payload, timeout=15)
+    preview_submitted = st.form_submit_button("Preview Grid", type="primary")
+    if preview_submitted:
+        st.session_state["gridbot_preview"] = safe_post("/api/grid/v01/live/preview", preview_payload, timeout=15)
         st.session_state["gridbot_preview_payload"] = preview_payload
         st.rerun()
 
@@ -404,15 +456,24 @@ if preview_state:
         if risk.get("warnings"):
             for warning in risk["warnings"]:
                 st.warning(warning)
-        if not active and st.button("Start Grid", type="primary"):
-            result = api_post("/api/grid/v01/live/start", st.session_state["gridbot_preview_payload"], timeout=15)
+        start_disabled = bool(active) or not st.session_state.get("gridbot_preview_payload")
+        if st.button("Start Grid", type="primary", disabled=start_disabled):
+            result = safe_post("/api/grid/v01/live/start", st.session_state["gridbot_preview_payload"], timeout=15)
             st.session_state["gridbot_start_result"] = result
             st.rerun()
 
 st.markdown("<div class='df-section-title'>Historical Runs</div>", unsafe_allow_html=True)
 try:
-    runs = api_get("/api/grid/v01/history/grid_runs", {"limit": 25}).get("rows") or []
-    summaries = api_get("/api/grid/v01/history/grid_run_summaries", {"limit": 25}).get("rows") or []
+    if "gridbot_history_runs" not in st.session_state:
+        st.session_state["gridbot_history_runs"] = api_get("/api/grid/v01/history/grid_runs", {"limit": 25}).get("rows") or []
+    if "gridbot_history_summaries" not in st.session_state:
+        st.session_state["gridbot_history_summaries"] = api_get("/api/grid/v01/history/grid_run_summaries", {"limit": 25}).get("rows") or []
+    if st.button("Refresh History"):
+        st.session_state["gridbot_history_runs"] = api_get("/api/grid/v01/history/grid_runs", {"limit": 25}).get("rows") or []
+        st.session_state["gridbot_history_summaries"] = api_get("/api/grid/v01/history/grid_run_summaries", {"limit": 25}).get("rows") or []
+        st.rerun()
+    runs = st.session_state["gridbot_history_runs"]
+    summaries = st.session_state["gridbot_history_summaries"]
 except Exception as exc:
     runs, summaries = [], []
     st.warning(f"Historical runs unavailable: {exc}")
@@ -452,10 +513,10 @@ with st.expander("Advanced / Developer Tools", expanded=False):
     if dcols[0].button("Preview Tiny"):
         st.session_state["durable_preview_tiny"] = api_get("/api/grid/v01/live/preview-tiny")
     if dcols[1].button("Start Tiny"):
-        st.session_state["durable_start_tiny"] = api_post("/api/grid/v01/live/start-tiny", timeout=15)
+        st.session_state["durable_start_tiny"] = safe_post("/api/grid/v01/live/start-tiny", timeout=15)
         st.rerun()
     if dcols[2].button("Reconcile"):
-        st.session_state["durable_reconcile"] = api_post("/api/grid/v01/live/reconcile", timeout=15)
+        st.session_state["durable_reconcile"] = safe_post("/api/grid/v01/live/reconcile", timeout=15)
         st.rerun()
     if st.checkbox("Show diagnostics"):
         st.write("Live status")

@@ -257,7 +257,7 @@ def durable_preview_operator_grid(payload: OperatorGridRequest):
 @router.post("/v01/live/start")
 def durable_start_operator_grid(payload: OperatorGridRequest):
     try:
-        return DurableGridBotLifecycle().start_operator_grid(_model_payload(payload))
+        return DurableGridBotLifecycle().start_operator_grid_background(_model_payload(payload))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:

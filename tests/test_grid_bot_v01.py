@@ -1,4 +1,5 @@
 from decimal import Decimal
+import time
 
 import pytest
 
@@ -388,6 +389,16 @@ class _FakeLifecycleClient:
         return {"success": True, "result": {"portfolio_margin": True}}
 
 
+def _wait_for(predicate, timeout=3):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    return predicate()
+
+
 def test_durable_lifecycle_active_run_survives_restart_and_blocks_second_start(tmp_path):
     client = _FakeLifecycleClient()
     path = tmp_path / "grid_state.json"
@@ -496,6 +507,104 @@ def test_operator_start_uses_supplied_grid_without_manual_capital_fields(tmp_pat
     assert len(started["run"]["levels"]) == 4
     assert len(started["run"]["orders"]) == 4
     assert all(order["config_version"] == 1 for order in started["run"]["orders"].values())
+
+
+def test_operator_background_start_returns_starting_then_reaches_running(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_operator_grid_background(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    assert started["run"]["status"] == "STARTING"
+    assert started["start_stage"] == "PERSISTING"
+
+    def running_status():
+        active_run = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()["active_run"] or {}
+        return active_run if active_run.get("status") == "RUNNING" else None
+
+    status = _wait_for(running_status)
+    assert status["status"] == "RUNNING"
+    assert status["startup"]["orders_expected"] == 4
+    assert status["startup"]["orders_submitted"] == 4
+
+
+def test_duplicate_background_start_attaches_to_starting_run(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Operator Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 4,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "2",
+    }
+    first = lifecycle.begin_operator_grid_start(payload)
+    second = lifecycle.start_operator_grid_background(payload)
+    assert second["attached"] is True
+    assert second["run"]["run_id"] == first["run"]["run_id"]
+    lifecycle.complete_operator_grid_start(first["run"]["run_id"])
+    third = lifecycle.start_operator_grid_background(payload)
+    assert third["attached"] is True
+    assert third["run"]["run_id"] == first["run"]["run_id"]
+    assert len(client.orders) == 4
+
+
+def test_background_start_failure_persists_start_failed(tmp_path):
+    class FailingClient(_FakeLifecycleClient):
+        def place_order(self, payload):
+            raise RuntimeError("exchange unavailable")
+
+    client = FailingClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+    status = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()
+    failed = status["runs"][0]
+    assert failed["status"] == "START_FAILED"
+    assert status["active_run_id"] is None
+    assert failed["startup"]["start_stage"] == "START_FAILED"
+
+
+def test_manual_exchange_cancellation_reconciliation_marks_orders_terminal(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    for row in client.orders:
+        row["state"] = "cancelled"
+        row["unfilled_size"] = "0"
+
+    reconciled = lifecycle.reconcile(run_id)
+    assert reconciled["open_gridbot_orders"] == 0
+    assert {order["status"] for order in reconciled["run"]["orders"].values()} == {"manual_cancelled"}
+    stopped = lifecycle.stop(run_id, "manual_exchange_cancel_reconciled")
+    assert stopped["summary"]["stray_gridbot_orders"] == 0
 
 
 class _MemorySupabaseGridRepository(SupabaseGridRepository):
