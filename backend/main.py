@@ -9,6 +9,7 @@ from backend.config import log_startup_config
 from backend.routers import grid, health, market, mobile, strategy, system
 from backend.services.rich_orderflow_ws_service import start_orderflow_ws_service, stop_orderflow_ws_service
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
+from grid_bot.continuous_worker import start_continuous_gridbot_worker, stop_continuous_gridbot_worker
 from probability_engine.routers import probability_router
 
 
@@ -53,10 +54,12 @@ app.include_router(probability_router.public_shadow_router)
 @app.on_event("startup")
 def startup_event():
     start_scheduler()
+    start_continuous_gridbot_worker()
     start_orderflow_ws_service()
 
 
 @app.on_event("shutdown")
 def shutdown_event():
     stop_orderflow_ws_service()
+    stop_continuous_gridbot_worker()
     stop_scheduler()

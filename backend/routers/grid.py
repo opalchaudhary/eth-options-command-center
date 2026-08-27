@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from grid_bot.config import DEFAULT_RISK_THRESHOLDS
+from grid_bot.continuous_worker import gridbot_live_state, start_continuous_gridbot_worker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
 from grid_bot.engine import engine
@@ -257,7 +258,9 @@ def durable_preview_operator_grid(payload: OperatorGridRequest):
 @router.post("/v01/live/start")
 def durable_start_operator_grid(payload: OperatorGridRequest):
     try:
-        return DurableGridBotLifecycle().start_operator_grid_background(_model_payload(payload))
+        result = DurableGridBotLifecycle().start_operator_grid_background(_model_payload(payload))
+        start_continuous_gridbot_worker()
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -275,7 +278,9 @@ def durable_preview_tiny_grid():
 @router.post("/v01/live/start-tiny")
 def durable_start_tiny_grid():
     try:
-        return DurableGridBotLifecycle().start_tiny_grid()
+        result = DurableGridBotLifecycle().start_tiny_grid()
+        start_continuous_gridbot_worker()
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -285,7 +290,7 @@ def durable_start_tiny_grid():
 @router.post("/v01/live/reconcile")
 def durable_reconcile():
     try:
-        return DurableGridBotLifecycle().reconcile()
+        return DurableGridBotLifecycle().reconcile(process_replacements=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -301,7 +306,9 @@ def durable_pause():
 @router.post("/v01/live/resume")
 def durable_resume():
     try:
-        return DurableGridBotLifecycle().resume()
+        result = DurableGridBotLifecycle().resume()
+        start_continuous_gridbot_worker()
+        return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -318,6 +325,14 @@ def durable_regrid(_payload: RegridRequest | None = None):
 def durable_stop(payload: StopRequest):
     try:
         return DurableGridBotLifecycle().stop(reason=payload.reason)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/v01/live/state")
+def durable_live_state():
+    try:
+        return gridbot_live_state()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

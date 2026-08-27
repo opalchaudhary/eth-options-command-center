@@ -72,6 +72,16 @@ def _gridbot_orders(rows: list[dict]) -> list[dict]:
     return [row for row in rows if str(row.get("client_order_id", "")).startswith(GRIDBOT_ORDER_PREFIX)]
 
 
+def _find_exchange_order_by_client_id(client: DeltaTestnetClient, product_id: int, client_order_id: str) -> dict | None:
+    for row in _result_rows(client.open_orders(product_id)):
+        if str(row.get("client_order_id") or "") == client_order_id:
+            return row
+    for row in _result_rows(client.order_history(product_id, page_size=50)):
+        if str(row.get("client_order_id") or "") == client_order_id:
+            return row
+    return None
+
+
 def _gross_pnl(fills: list[dict], multiplier: Decimal) -> Decimal:
     total = Decimal("0")
     for fill in fills:
@@ -90,6 +100,15 @@ def _first_number(payload: dict, keys: list[str]) -> Decimal | None:
         if value not in [None, ""]:
             return _decimal(value)
     return None
+
+
+def _fill_identity(fill: dict, fallback: str = "") -> str:
+    return str(fill.get("id") or fill.get("fill_id") or fill.get("trade_id") or fill.get("execution_id") or fallback)
+
+
+def _replacement_client_order_id(run_id: str, level_id: str, side: Side, source_fill_id: str) -> str:
+    stable = "".join(ch for ch in source_fill_id if ch.isalnum())[-8:] or "fill"
+    return f"DGB01-{run_id[-8:]}-{level_id}-{side.value[0].upper()}-R{stable}"[:32]
 
 
 class DurableGridBotLifecycle:
@@ -509,7 +528,14 @@ class DurableGridBotLifecycle:
         if open_orders:
             raise RuntimeError(f"Refusing to start GridBot: {len(open_orders)} GridBot-owned open orders already exist.")
 
-    def _proposal_for_level(self, run_id: str, level: dict, sequence: int, quantity: Decimal | None = None) -> OrderProposal:
+    def _proposal_for_level(
+        self,
+        run_id: str,
+        level: dict,
+        sequence: int,
+        quantity: Decimal | None = None,
+        client_order_id: str | None = None,
+    ) -> OrderProposal:
         side = Side(level["side"])
         return OrderProposal(
             run_id=run_id,
@@ -517,10 +543,18 @@ class DurableGridBotLifecycle:
             side=side,
             price=_decimal(level["price"]),
             quantity=quantity or _decimal(level["quantity"]),
-            client_order_id=make_client_order_id(run_id, level["level_id"], side, sequence),
+            client_order_id=client_order_id or make_client_order_id(run_id, level["level_id"], side, sequence),
         )
 
-    def _defer_proposal(self, run: dict, proposal: OrderProposal, order_kind: str, reason_codes: list[str], normalized_price: Decimal | None = None) -> dict:
+    def _defer_proposal(
+        self,
+        run: dict,
+        proposal: OrderProposal,
+        order_kind: str,
+        reason_codes: list[str],
+        normalized_price: Decimal | None = None,
+        source_fill_id: str | None = None,
+    ) -> dict:
         record = {
             "order_key": proposal.client_order_id,
             "run_id": run["run_id"],
@@ -536,9 +570,13 @@ class DurableGridBotLifecycle:
             "order_kind": order_kind,
             "config_version": run["config"]["config_version"],
             "rejection_reason": ",".join(reason_codes),
+            "source_fill_id": source_fill_id,
             "created_at": utc_now(),
         }
         run.setdefault("deferred_orders", {})[proposal.client_order_id] = record
+        if self._db_enabled():
+            self.db.persist_order_proposal(run, proposal, order_kind, source_fill_id)
+            self.db.persist_order(run, record)
         return record
 
     def _open_order_records(self, run: dict) -> list[dict]:
@@ -548,9 +586,18 @@ class DurableGridBotLifecycle:
             if order.get("status") not in START_TERMINAL_ORDER_STATUSES
         ]
 
-    def _place_proposal(self, run: dict, product_id: int, proposal: OrderProposal, order_kind: str) -> dict:
+    def _place_proposal(
+        self,
+        run: dict,
+        product_id: int,
+        proposal: OrderProposal,
+        order_kind: str,
+        *,
+        current_inventory: Decimal | None = None,
+        source_fill_id: str | None = None,
+    ) -> dict:
         spec = self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
-        position = _position_size(self.client, product_id)
+        position = current_inventory if current_inventory is not None else _position_size(self.client, product_id)
         normalized_price = round_price_for_side(proposal.price, spec.tick_size, proposal.side)
         semantic = evaluate_order_semantics(
             GridType(run["config"]["grid_type"]),
@@ -562,8 +609,13 @@ class DurableGridBotLifecycle:
         )
         post_only = validate_post_only_price(proposal.side, normalized_price, spec.best_bid, spec.best_ask)
         reason_codes = [*semantic.reason_codes, *post_only.reason_codes]
+        lower_price = _decimal(run.get("config", {}).get("lower_price"))
+        upper_price = _decimal(run.get("config", {}).get("upper_price"))
+        market_price = spec.mark_price or spec.last_price
+        if semantic.opens_inventory and market_price and (market_price < lower_price or market_price > upper_price):
+            reason_codes.append("MARKET_OUTSIDE_CONFIGURED_GRID_RANGE")
         if reason_codes:
-            return self._defer_proposal(run, proposal, order_kind, reason_codes, normalized_price)
+            return self._defer_proposal(run, proposal, order_kind, reason_codes, normalized_price, source_fill_id)
         if normalized_price != proposal.price:
             proposal = OrderProposal(
                 run_id=proposal.run_id,
@@ -577,9 +629,11 @@ class DurableGridBotLifecycle:
                 reduce_only=proposal.reduce_only,
             )
         if self._db_enabled():
-            self.db.persist_order_proposal(run, proposal, order_kind)
-        response = self.client.place_order(order_payload(product_id, proposal))
-        exchange_order = response.get("result") or {}
+            self.db.persist_order_proposal(run, proposal, order_kind, source_fill_id)
+        exchange_order = _find_exchange_order_by_client_id(self.client, product_id, proposal.client_order_id)
+        if not exchange_order:
+            response = self.client.place_order(order_payload(product_id, proposal))
+            exchange_order = response.get("result") or {}
         record = {
             "order_key": proposal.client_order_id,
             "run_id": run["run_id"],
@@ -594,6 +648,7 @@ class DurableGridBotLifecycle:
             "status": exchange_order.get("state") or "open",
             "order_kind": order_kind,
             "config_version": run["config"]["config_version"],
+            "source_fill_id": source_fill_id,
             "opens_inventory": semantic.opens_inventory,
             "projected_inventory_if_filled": str(semantic.projected_inventory),
             "reserved_long_after": str(semantic.reserved_long_after),
@@ -680,12 +735,27 @@ class DurableGridBotLifecycle:
             order["cancel_error"] = str(exc)[:300]
             return False
 
-    def reconcile(self, run_id: str | None = None) -> dict:
+    def reconcile(
+        self,
+        run_id: str | None = None,
+        *,
+        process_replacements: bool = False,
+        persist_snapshot: bool = True,
+        log_reconcile_event: bool = True,
+        persist_order_updates: bool = True,
+    ) -> dict:
         state = self._load()
         run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
         if not run:
             raise RuntimeError("No durable DeltaGridBot run found.")
-        result = reconcile_exchange_truth(run, self.client, self.db if self._db_enabled() else None, suppress_replacements=True)
+        result = reconcile_exchange_truth(
+            run,
+            self.client,
+            self.db if self._db_enabled() else None,
+            suppress_replacements=True,
+            persist_order_updates=persist_order_updates,
+        )
+        replacement_result = self.process_replacements(run, result) if process_replacements else {"created": 0, "deferred": 0, "skipped": 0}
         risk = {
             "created_at": utc_now(),
             "position": result.get("delta_position"),
@@ -694,12 +764,14 @@ class DurableGridBotLifecycle:
             "position_mismatches": result.get("position_mismatches"),
             "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
             "reconciliation": result,
+            "replacements": replacement_result,
         }
         run.setdefault("risk_snapshots", []).append(risk)
         for event in result.get("events", []):
             self._event(state, run["run_id"], event["event_type"], event.get("payload") or {})
-        self._event(state, run["run_id"], "REST_RECONCILED", result)
-        if self._db_enabled():
+        if log_reconcile_event:
+            self._event(state, run["run_id"], "REST_RECONCILED", {**result, "replacements": replacement_result})
+        if self._db_enabled() and persist_snapshot:
             self.db.persist_snapshot(run, risk, run.get("summary"))
         self._save(state)
         return {
@@ -709,27 +781,86 @@ class DurableGridBotLifecycle:
             "position": result.get("delta_position"),
             "open_gridbot_orders": result.get("exchange_open_orders"),
             "reconciliation": result,
+            "replacements": replacement_result,
         }
 
-    def _place_replacement_for_fill(self, run: dict, fill: dict, product_id: int, fill_id: str) -> None:
+    def process_replacements(self, run: dict, reconciliation: dict | None = None) -> dict:
+        product_id = int(run["product"]["product_id"])
+        outcome = {"created": 0, "deferred": 0, "skipped": 0, "existing": 0, "items": []}
+        fills = run.get("fills") or {}
+        inventory = _decimal((reconciliation or {}).get("gridbot_inventory"), str(_position_size(self.client, product_id)))
+        for fill_id, fill in list(fills.items()):
+            raw = fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill
+            result = self._place_replacement_for_fill(run, raw, product_id, str(fill_id), inventory)
+            if result:
+                outcome[result["state"]] = outcome.get(result["state"], 0) + 1
+                outcome["items"].append(result)
+        return outcome
+
+    def _place_replacement_for_fill(
+        self,
+        run: dict,
+        fill: dict,
+        product_id: int,
+        fill_id: str,
+        current_inventory: Decimal | None = None,
+    ) -> dict | None:
         key = f"{fill_id}:replacement"
         if key in run.setdefault("replacement_keys", {}):
-            return
-        order = run["orders"][str(fill.get("client_order_id"))]
+            return {**run["replacement_keys"][key], "state": "existing", "source_fill_id": fill_id}
+        order = run["orders"].get(str(fill.get("client_order_id")))
+        if not order:
+            order = next((row for row in run.get("orders", {}).values() if str(row.get("exchange_order_id")) == str(fill.get("order_id"))), None)
+        if not order:
+            run["replacement_keys"][key] = {"skipped": True, "reason": "source_order_not_found"}
+            return {"state": "skipped", "source_fill_id": fill_id, "reason": "source_order_not_found"}
         levels = run["levels"]
         current_index = next((index for index, level in enumerate(levels) if level["level_id"] == order["level_id"]), None)
         if current_index is None:
-            return
+            run["replacement_keys"][key] = {"skipped": True, "reason": "source_level_not_found"}
+            return {"state": "skipped", "source_fill_id": fill_id, "reason": "source_level_not_found"}
         fill_side = Side(str(fill.get("side")).lower())
         target_index = current_index + 1 if fill_side == Side.BUY else current_index - 1
         if target_index < 0 or target_index >= len(levels):
             run["replacement_keys"][key] = {"skipped": True, "reason": "edge_level"}
-            return
+            return {"state": "skipped", "source_fill_id": fill_id, "reason": "edge_level"}
         target = deepcopy(levels[target_index])
         target["side"] = Side.SELL.value if fill_side == Side.BUY else Side.BUY.value
-        proposal = self._proposal_for_level(run["run_id"], target, int(run["sequence"]), quantity=_decimal(fill.get("size")))
-        created = self._place_proposal(run, product_id, proposal, "replacement")
-        run["replacement_keys"][key] = {"client_order_id": created["client_order_id"], "created_at": utc_now()}
+        source_fill_id = _fill_identity(fill, fill_id)
+        client_order_id = _replacement_client_order_id(run["run_id"], target["level_id"], Side(target["side"]), source_fill_id)
+        existing = run.get("orders", {}).get(client_order_id) or run.get("deferred_orders", {}).get(client_order_id)
+        if existing:
+            run["replacement_keys"][key] = {
+                "client_order_id": client_order_id,
+                "exchange_order_id": existing.get("exchange_order_id"),
+                "state": existing.get("status"),
+                "source_fill_id": source_fill_id,
+            }
+            return {"state": "existing", "source_fill_id": source_fill_id, "client_order_id": client_order_id}
+        proposal = self._proposal_for_level(
+            run["run_id"],
+            target,
+            int(run["sequence"]),
+            quantity=_decimal(fill.get("size")),
+            client_order_id=client_order_id,
+        )
+        created = self._place_proposal(
+            run,
+            product_id,
+            proposal,
+            "replacement",
+            current_inventory=current_inventory,
+            source_fill_id=source_fill_id,
+        )
+        state = "deferred" if created.get("status") == "deferred" else "created"
+        run["replacement_keys"][key] = {
+            "client_order_id": created["client_order_id"],
+            "exchange_order_id": created.get("exchange_order_id"),
+            "state": created.get("status"),
+            "source_fill_id": source_fill_id,
+            "created_at": utc_now(),
+        }
+        return {"state": state, "source_fill_id": source_fill_id, "client_order_id": created["client_order_id"], "level_id": target["level_id"]}
 
     def pause(self, run_id: str | None = None) -> dict:
         state = self._load()

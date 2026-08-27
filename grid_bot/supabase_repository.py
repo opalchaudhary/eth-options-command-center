@@ -68,6 +68,24 @@ class SupabaseGridRepository:
         params = {"on_conflict": on_conflict} if on_conflict else None
         self._request("POST", table, params=params, json=payload, prefer="resolution=merge-duplicates,return=minimal")
 
+    def upsert_with_optional_source_fill_id(self, table: str, payload: dict, on_conflict: str | None = None) -> None:
+        try:
+            self.upsert(table, payload, on_conflict)
+        except SupabasePersistenceError as exc:
+            missing_source_column = "source_fill_id" in str(exc) and ("42703" in str(exc) or "PGRST204" in str(exc))
+            if "source_fill_id" not in payload or not missing_source_column:
+                raise
+            fallback = dict(payload)
+            source_fill_id = fallback.get("source_fill_id")
+            if table == "grid_orders" and source_fill_id:
+                raw = fallback.get("raw") or {}
+                fallback["raw"] = {
+                    **raw,
+                    "gridbot": {**(raw.get("gridbot") or {}), "source_fill_id": source_fill_id},
+                }
+            fallback.pop("source_fill_id", None)
+            self.upsert(table, fallback, on_conflict)
+
     def insert_once(self, table: str, payload: dict, on_conflict: str | None = None) -> bool:
         params = {"on_conflict": on_conflict} if on_conflict else None
         try:
@@ -238,8 +256,8 @@ class SupabaseGridRepository:
             )
         self.upsert("grid_levels", rows, on_conflict="run_id,config_version,level_id")
 
-    def persist_order_proposal(self, run: dict, proposal: Any, order_kind: str) -> None:
-        self.upsert(
+    def persist_order_proposal(self, run: dict, proposal: Any, order_kind: str, source_fill_id: str | None = None) -> None:
+        self.upsert_with_optional_source_fill_id(
             "grid_order_proposals",
             {
                 "proposal_id": proposal.client_order_id,
@@ -253,6 +271,7 @@ class SupabaseGridRepository:
                 "quantity": str(proposal.quantity),
                 "order_kind": order_kind,
                 "status": "PROPOSED",
+                "source_fill_id": source_fill_id,
                 "created_at": utc_now(),
             },
             on_conflict="proposal_id",
@@ -260,7 +279,24 @@ class SupabaseGridRepository:
 
     def persist_order(self, run: dict, order: dict) -> None:
         submitted_at = order.get("submitted_at") or order.get("created_at") or utc_now()
-        self.upsert(
+        raw = order.get("raw") or {}
+        source_fill_id = order.get("source_fill_id") or (raw.get("gridbot") or {}).get("source_fill_id")
+        if not source_fill_id and order.get("client_order_id"):
+            try:
+                existing = self.select(
+                    "grid_orders",
+                    {
+                        "select": "raw",
+                        "client_order_id": f"eq.{order.get('client_order_id')}",
+                        "limit": 1,
+                    },
+                )
+                source_fill_id = (((existing[0] if existing else {}).get("raw") or {}).get("gridbot") or {}).get("source_fill_id")
+            except SupabasePersistenceError:
+                source_fill_id = None
+        if source_fill_id:
+            raw = {**raw, "gridbot": {**(raw.get("gridbot") or {}), "source_fill_id": source_fill_id}}
+        self.upsert_with_optional_source_fill_id(
             "grid_orders",
             {
                 "order_id": order.get("order_key") or order.get("client_order_id"),
@@ -278,14 +314,15 @@ class SupabaseGridRepository:
                 "order_type": "limit_order",
                 "time_in_force": "gtc",
                 "post_only": True,
-                "reduce_only": False,
+                "reduce_only": bool(order.get("reduce_only", False)),
                 "status": order.get("status"),
+                "source_fill_id": source_fill_id,
                 "submitted_at": submitted_at,
                 "updated_at": utc_now(),
                 "cancelled_at": order.get("cancelled_at"),
                 "rejection_reason": order.get("rejection_reason") or order.get("cancel_error"),
                 "order_kind": order.get("order_kind"),
-                "raw": order.get("raw") or {},
+                "raw": raw,
             },
             on_conflict="client_order_id",
         )

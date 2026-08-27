@@ -5,6 +5,7 @@ import pytest
 
 from grid_bot.accounting import ExchangeCost, gross_cycle_pnl, summarize_pnl
 from grid_bot.config import REST_URL, TestnetEndpointConfig, validate_testnet_endpoints
+from grid_bot.continuous_worker import ContinuousGridBotWorker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
 from grid_bot.engine import DeltaGridBotEngine
@@ -17,7 +18,7 @@ from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
 from grid_bot.risk import GridRiskController, RiskInputs, RiskState, grid_risk_ratio, inventory_utilisation
 from grid_bot.semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
-from grid_bot.supabase_repository import SupabaseGridRepository
+from grid_bot.supabase_repository import SupabaseGridRepository, SupabasePersistenceError
 
 
 def _config(bot_id="bot_a", grid_type=GridType.NEUTRAL, spacing=SpacingType.ARITHMETIC):
@@ -836,6 +837,65 @@ def _fill(fill_id="fill-1", size="5", side="buy", price="2400", order_id="ex-1")
     }
 
 
+def _replacement_run(grid_type="neutral", source_level="L002", source_side="buy", fill_id="fill-1", fill_size="1"):
+    client_order_id = f"DGB01-truth-{source_level}-{source_side[0].upper()}-1"
+    exchange_order_id = f"ex-{source_level}"
+    return {
+        "run_id": "run_truth",
+        "bot_id": "bot_truth",
+        "status": "RUNNING",
+        "config": {
+            "bot_id": "bot_truth",
+            "config_version": 3,
+            "grid_type": grid_type,
+            "product_symbol": "ETHUSD",
+            "lower_price": "2490",
+            "upper_price": "2510",
+            "max_inventory_lots": "2",
+        },
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
+        "levels": [
+            {"level_id": "L001", "index": 1, "side": "buy", "price": "2490", "quantity": "1", "state": "active"},
+            {"level_id": "L002", "index": 2, "side": "buy", "price": "2495", "quantity": "1", "state": "active"},
+            {"level_id": "L003", "index": 3, "side": "sell", "price": "2505", "quantity": "1", "state": "active"},
+            {"level_id": "L004", "index": 4, "side": "sell", "price": "2510", "quantity": "1", "state": "active"},
+        ],
+        "orders": {
+            client_order_id: {
+                "order_key": client_order_id,
+                "run_id": "run_truth",
+                "level_id": source_level,
+                "side": source_side,
+                "price": "2495" if source_level == "L002" else "2505",
+                "requested_quantity": fill_size,
+                "filled_quantity": fill_size,
+                "remaining_quantity": "0",
+                "client_order_id": client_order_id,
+                "exchange_order_id": exchange_order_id,
+                "status": "filled",
+                "order_kind": "initial_grid",
+                "config_version": 3,
+                "opens_inventory": True,
+            }
+        },
+        "fills": {
+            fill_id: {
+                "id": fill_id,
+                "order_id": exchange_order_id,
+                "client_order_id": client_order_id,
+                "side": source_side,
+                "price": "2495" if source_side == "buy" else "2505",
+                "size": fill_size,
+                "commission": "0",
+            }
+        },
+        "deferred_orders": {},
+        "replacement_keys": {},
+        "risk_snapshots": [],
+        "sequence": 2,
+    }
+
+
 def test_exchange_truth_open_order_remains_open():
     run = _truth_run()
     result = reconcile_exchange_truth(run, _TruthClient(open_orders=[_open_exchange_order()], position="0"))
@@ -927,6 +987,270 @@ def test_exchange_truth_discovers_fill_on_later_page_once():
 
 def test_inventory_from_fills_uses_signed_fill_ledger():
     assert inventory_from_fills([_fill("f1", "5", "buy"), _fill("f2", "5", "buy"), _fill("f3", "5", "sell")]) == Decimal("5")
+
+
+def test_replacement_semantics_neutral_buy_to_adjacent_sell_and_idempotent(tmp_path):
+    client = _FakeLifecycleClient()
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-buy")
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+
+    first = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    second = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert first["created"] == 1
+    assert second["existing"] == 1
+    assert len(replacements) == 1
+    assert replacements[0]["level_id"] == "L003"
+    assert replacements[0]["side"] == "sell"
+    assert replacements[0]["requested_quantity"] == "1"
+    assert replacements[0]["source_fill_id"] == "fill-buy"
+
+
+def test_replacement_semantics_neutral_sell_to_adjacent_buy(tmp_path):
+    client = _FakeLifecycleClient()
+    run = _replacement_run(source_level="L003", source_side="sell", fill_id="fill-sell")
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "-1"})
+    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+
+    assert result["created"] == 1
+    assert replacement["level_id"] == "L002"
+    assert replacement["side"] == "buy"
+    assert replacement["source_fill_id"] == "fill-sell"
+
+
+def test_long_and_short_replacements_are_risk_reducing_and_restore_opening_opportunity(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    long_run = _replacement_run(grid_type="long_bias", source_level="L002", source_side="buy", fill_id="long-entry")
+    short_run = _replacement_run(grid_type="short_bias", source_level="L003", source_side="sell", fill_id="short-entry")
+
+    long_result = lifecycle.process_replacements(long_run, {"gridbot_inventory": "1"})
+    short_result = lifecycle.process_replacements(short_run, {"gridbot_inventory": "-1"})
+
+    long_replacement = [order for order in long_run["orders"].values() if order.get("order_kind") == "replacement"][0]
+    short_replacement = [order for order in short_run["orders"].values() if order.get("order_kind") == "replacement"][0]
+    assert long_result["created"] == 1
+    assert long_replacement["side"] == "sell"
+    assert long_replacement["opens_inventory"] is False
+    assert short_result["created"] == 1
+    assert short_replacement["side"] == "buy"
+    assert short_replacement["opens_inventory"] is False
+
+    long_run["fills"]["long-close"] = {
+        "id": "long-close",
+        "order_id": long_replacement["exchange_order_id"],
+        "client_order_id": long_replacement["client_order_id"],
+        "side": "sell",
+        "price": long_replacement["price"],
+        "size": "1",
+        "commission": "0",
+    }
+    long_replacement["status"] = "filled"
+    long_replacement["filled_quantity"] = "1"
+    long_replacement["remaining_quantity"] = "0"
+    long_cycle = lifecycle.process_replacements(long_run, {"gridbot_inventory": "0"})
+    restored = [order for order in long_run["orders"].values() if order.get("source_fill_id") == "long-close"][0]
+    assert long_cycle["created"] == 1
+    assert restored["side"] == "buy"
+    assert restored["level_id"] == "L002"
+    assert restored["opens_inventory"] is True
+
+
+def test_boundary_fill_has_no_out_of_range_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    buy_at_top = _replacement_run(source_level="L004", source_side="buy", fill_id="edge-buy")
+    sell_at_bottom = _replacement_run(source_level="L001", source_side="sell", fill_id="edge-sell")
+
+    assert lifecycle.process_replacements(buy_at_top, {"gridbot_inventory": "1"})["skipped"] == 1
+    assert lifecycle.process_replacements(sell_at_bottom, {"gridbot_inventory": "-1"})["skipped"] == 1
+    assert buy_at_top["replacement_keys"]["edge-buy:replacement"]["reason"] == "edge_level"
+    assert sell_at_bottom["replacement_keys"]["edge-sell:replacement"]["reason"] == "edge_level"
+
+
+def test_inventory_cap_blocks_risk_increasing_but_allows_risk_reducing_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    blocked = _replacement_run(grid_type="long_bias", source_level="L002", source_side="buy", fill_id="bad-short")
+    allowed = _replacement_run(grid_type="long_bias", source_level="L002", source_side="buy", fill_id="good-close")
+
+    blocked_result = lifecycle.process_replacements(blocked, {"gridbot_inventory": "0"})
+    allowed_result = lifecycle.process_replacements(allowed, {"gridbot_inventory": "1"})
+
+    assert blocked_result["deferred"] == 1
+    assert "LONG_BIAS_CANNOT_OPEN_NET_SHORT" in next(iter(blocked["deferred_orders"].values()))["rejection_reason"]
+    assert allowed_result["created"] == 1
+    assert [order for order in allowed["orders"].values() if order.get("order_kind") == "replacement"][0]["side"] == "sell"
+
+
+def test_ambiguous_replacement_submission_recovers_existing_exchange_order(tmp_path):
+    class RecoveringClient(_FakeLifecycleClient):
+        def place_order(self, payload):
+            raise AssertionError("duplicate submission should not occur")
+
+    client = RecoveringClient()
+    client.orders.append(
+        {
+            "id": "accepted-before-crash",
+            "client_order_id": "DGB01-un_truth-L003-S-Rillcrash",
+            "side": "sell",
+            "size": "1",
+            "unfilled_size": "1",
+            "limit_price": "2505",
+            "state": "open",
+        }
+    )
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-crash")
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+
+    assert result["created"] == 1
+    assert replacement["exchange_order_id"] == "accepted-before-crash"
+    assert replacement["client_order_id"] == "DGB01-un_truth-L003-S-Rillcrash"
+
+
+def test_out_of_range_blocks_opening_replenishment_but_allows_closing(tmp_path):
+    class OutOfRangeClient(_FakeLifecycleClient):
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            return ProductSpec(**{**spec.__dict__, "mark_price": Decimal("2605")})
+
+    client = OutOfRangeClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    opening = _replacement_run(grid_type="long_bias", source_level="L003", source_side="sell", fill_id="cycle-close")
+    closing = _replacement_run(grid_type="long_bias", source_level="L002", source_side="buy", fill_id="entry-fill")
+
+    opening_result = lifecycle.process_replacements(opening, {"gridbot_inventory": "0"})
+    closing_result = lifecycle.process_replacements(closing, {"gridbot_inventory": "1"})
+
+    assert opening_result["deferred"] == 1
+    assert "MARKET_OUTSIDE_CONFIGURED_GRID_RANGE" in next(iter(opening["deferred_orders"].values()))["rejection_reason"]
+    assert closing_result["created"] == 1
+
+
+class _CountingSupabaseGridRepository(SupabaseGridRepository):
+    def __init__(self):
+        self.enabled = True
+        self.tables = {}
+        self.write_counts = {"upsert": 0, "insert_once": 0, "patch": 0}
+        self.read_count = 0
+
+    def select(self, table, params=None):
+        self.read_count += 1
+        rows = list(self.tables.get(table, {}).values())
+        params = params or {}
+        for key, value in params.items():
+            if key in {"select", "order", "limit"}:
+                continue
+            if isinstance(value, str) and value.startswith("eq."):
+                expected = value[3:]
+                rows = [row for row in rows if str(row.get(key)) == expected]
+            elif isinstance(value, str) and value.startswith("in."):
+                allowed = set(value[3:].strip("()").split(","))
+                rows = [row for row in rows if str(row.get(key)) in allowed]
+        if "order" in params:
+            key = params["order"].split(".")[0]
+            reverse = params["order"].endswith(".desc")
+            rows = sorted(rows, key=lambda row: str(row.get(key) or ""), reverse=reverse)
+        if "limit" in params:
+            rows = rows[: int(params["limit"])]
+        return rows
+
+    def upsert(self, table, payload, on_conflict=None):
+        self.write_counts["upsert"] += len(payload if isinstance(payload, list) else [payload])
+        rows = payload if isinstance(payload, list) else [payload]
+        self.tables.setdefault(table, {})
+        for row in rows:
+            if on_conflict:
+                key = tuple(str(row.get(col)) for col in on_conflict.split(","))
+            else:
+                key = (str(row.get("id") or row.get(f"{table[:-1]}_id") or len(self.tables[table])),)
+            self.tables[table][key] = {**self.tables[table].get(key, {}), **row}
+
+    def insert_once(self, table, payload, on_conflict=None):
+        if on_conflict:
+            key = tuple(str(payload.get(col)) for col in on_conflict.split(","))
+        else:
+            key = (str(payload.get("id") or payload.get(f"{table[:-1]}_id") or len(self.tables.get(table, {}))),)
+        self.tables.setdefault(table, {})
+        inserted = key not in self.tables[table]
+        if inserted:
+            self.tables[table][key] = dict(payload)
+            self.write_counts["insert_once"] += 1
+        return inserted
+
+    def insert_once_with_optional_config_version(self, table, payload, on_conflict=None):
+        return self.insert_once(table, payload, on_conflict)
+
+    def patch(self, table, filters, payload):
+        self.write_counts["patch"] += 1
+        for key, row in self.tables.get(table, {}).items():
+            if all(str(row.get(name)) == str(value) for name, value in filters.items()):
+                self.tables[table][key] = {**row, **payload}
+
+    def _request(self, method, table, *, params=None, json=None, prefer=None):
+        if method == "DELETE":
+            return None
+        raise AssertionError(method)
+
+
+def test_continuous_worker_no_change_polls_do_not_write_per_loop(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+    before = dict(db.write_counts)
+
+    for _ in range(5):
+        worker._poll_once(worker._run)
+
+    after = db.write_counts
+    assert after["insert_once"] == before["insert_once"] + 2
+    assert after["upsert"] == before["upsert"]
+    assert after["patch"] == before["patch"]
+
+
+def test_supabase_order_source_fill_fallback_preserves_raw_link():
+    class MissingSourceFillColumnRepository(_MemorySupabaseGridRepository):
+        def upsert(self, table, payload, on_conflict=None):
+            rows = payload if isinstance(payload, list) else [payload]
+            if table == "grid_orders" and any("source_fill_id" in row for row in rows):
+                raise SupabasePersistenceError(
+                    "Supabase POST grid_orders failed: 400 "
+                    '{"code":"PGRST204","message":"Could not find the source_fill_id column"}'
+                )
+            return super().upsert(table, payload, on_conflict)
+
+    db = MissingSourceFillColumnRepository()
+    run = {"run_id": "run-source", "bot_id": "bot-source", "config": {"config_version": 1}}
+    db.persist_order(
+        run,
+        {
+            "order_key": "order-source",
+            "client_order_id": "order-source",
+            "exchange_order_id": "exchange-source",
+            "level_id": "L003",
+            "side": "sell",
+            "price": "2501",
+            "requested_quantity": "1",
+            "remaining_quantity": "1",
+            "status": "open",
+            "order_kind": "replacement",
+            "source_fill_id": "fill-source",
+            "raw": {"id": "exchange-source"},
+        },
+    )
+
+    row = next(iter(db.tables["grid_orders"].values()))
+    assert row["raw"]["gridbot"]["source_fill_id"] == "fill-source"
+    assert "source_fill_id" not in row
 
 
 class _MemorySupabaseGridRepository(SupabaseGridRepository):

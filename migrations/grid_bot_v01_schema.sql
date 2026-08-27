@@ -91,6 +91,7 @@ create table if not exists grid_order_proposals (
     price numeric not null,
     quantity numeric not null,
     order_kind text,
+    source_fill_id text,
     status text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -119,6 +120,7 @@ create table if not exists grid_orders (
     cancelled_at timestamptz,
     rejection_reason text,
     order_kind text,
+    source_fill_id text,
     raw jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -280,6 +282,12 @@ create unique index if not exists idx_grid_orders_client_order_id
 create unique index if not exists idx_grid_orders_exchange_order_id
     on grid_orders (exchange_order_id)
     where exchange_order_id is not null and exchange_order_id <> '';
+
+create index if not exists idx_grid_order_proposals_source_fill
+    on grid_order_proposals (run_id, source_fill_id);
+
+create index if not exists idx_grid_orders_source_fill
+    on grid_orders (run_id, source_fill_id);
 
 create unique index if not exists idx_grid_fills_exchange_fill_id
     on grid_fills (exchange_fill_id)

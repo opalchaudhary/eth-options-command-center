@@ -188,7 +188,14 @@ def _event(result: ExchangeTruthResult, event_type: str, payload: dict) -> None:
     result.events.append({"event_type": event_type, "payload": payload})
 
 
-def reconcile_exchange_truth(run: dict, client: Any, db: Any | None = None, *, suppress_replacements: bool = True) -> dict:
+def reconcile_exchange_truth(
+    run: dict,
+    client: Any,
+    db: Any | None = None,
+    *,
+    suppress_replacements: bool = True,
+    persist_order_updates: bool = True,
+) -> dict:
     del suppress_replacements
     result = ExchangeTruthResult()
     product = run.get("product") or {}
@@ -256,6 +263,9 @@ def reconcile_exchange_truth(run: dict, client: Any, db: Any | None = None, *, s
             result.fill_ledger_mismatches += 1
             _event(result, "FILL_LEDGER_MISMATCH", {"client_order_id": cid, "executed": str(executed), "requested": str(requested)})
 
+        previous_status = str(order.get("status") or "").lower()
+        previous_filled = str(order.get("filled_quantity") or "0")
+        previous_remaining = str(order.get("remaining_quantity") or "")
         order["filled_quantity"] = str(executed)
         order["remaining_quantity"] = str(remaining)
         order["status"] = state.lower()
@@ -263,7 +273,12 @@ def reconcile_exchange_truth(run: dict, client: Any, db: Any | None = None, *, s
         order["last_reconciled_at"] = utc_now()
         if evidence:
             order["raw"] = evidence
-        if db and getattr(db, "enabled", False):
+        changed = (
+            previous_status != order["status"]
+            or previous_filled != order["filled_quantity"]
+            or previous_remaining != order["remaining_quantity"]
+        )
+        if db and getattr(db, "enabled", False) and (persist_order_updates or changed):
             db.persist_order(run, order)
 
         result.orders_resolved += 1
