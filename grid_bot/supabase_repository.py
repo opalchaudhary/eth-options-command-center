@@ -29,6 +29,29 @@ class SupabaseGridRepository:
         self.key = key or storage.SUPABASE_KEY
         self.timeout = timeout
         self.enabled = bool(self.url and self.key)
+        self.request_counts = {
+            "select": 0,
+            "upsert_rows": 0,
+            "insert_once": 0,
+            "patch": 0,
+            "delete": 0,
+            "by_table": {},
+        }
+
+    def _count(self, operation: str, table: str, amount: int = 1) -> None:
+        self.request_counts[operation] = self.request_counts.get(operation, 0) + amount
+        by_table = self.request_counts.setdefault("by_table", {})
+        table_counts = by_table.setdefault(table, {})
+        table_counts[operation] = table_counts.get(operation, 0) + amount
+
+    def stats(self) -> dict:
+        return {
+            **{key: value for key, value in self.request_counts.items() if key != "by_table"},
+            "by_table": {
+                table: dict(counts)
+                for table, counts in self.request_counts.get("by_table", {}).items()
+            },
+        }
 
     @property
     def headers(self) -> dict:
@@ -62,9 +85,11 @@ class SupabaseGridRepository:
         return None
 
     def select(self, table: str, params: dict | None = None) -> list[dict]:
+        self._count("select", table)
         return self._request("GET", table, params=params or {"select": "*"}) or []
 
     def upsert(self, table: str, payload: dict | list[dict], on_conflict: str | None = None) -> None:
+        self._count("upsert_rows", table, len(payload if isinstance(payload, list) else [payload]))
         params = {"on_conflict": on_conflict} if on_conflict else None
         self._request("POST", table, params=params, json=payload, prefer="resolution=merge-duplicates,return=minimal")
 
@@ -87,6 +112,7 @@ class SupabaseGridRepository:
             self.upsert(table, fallback, on_conflict)
 
     def insert_once(self, table: str, payload: dict, on_conflict: str | None = None) -> bool:
+        self._count("insert_once", table)
         params = {"on_conflict": on_conflict} if on_conflict else None
         try:
             self._request("POST", table, params=params, json=payload, prefer="resolution=ignore-duplicates,return=minimal")
@@ -107,6 +133,7 @@ class SupabaseGridRepository:
             return self.insert_once(table, fallback, on_conflict)
 
     def patch(self, table: str, filters: dict, payload: dict) -> None:
+        self._count("patch", table)
         params = {key: f"eq.{value}" for key, value in filters.items()}
         self._request("PATCH", table, params=params, json=payload, prefer="return=minimal")
 
@@ -136,6 +163,7 @@ class SupabaseGridRepository:
             raise SupabasePersistenceError("Another DeltaGridBot V0.1 run is already active.")
 
     def release_active_run_guard(self, run_id: str) -> None:
+        self._count("delete", "grid_active_run_locks")
         self._request(
             "DELETE",
             "grid_active_run_locks",

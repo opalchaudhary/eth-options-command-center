@@ -1137,10 +1137,19 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
     def __init__(self):
         self.enabled = True
         self.tables = {}
+        self.request_counts = {
+            "select": 0,
+            "upsert_rows": 0,
+            "insert_once": 0,
+            "patch": 0,
+            "delete": 0,
+            "by_table": {},
+        }
         self.write_counts = {"upsert": 0, "insert_once": 0, "patch": 0}
         self.read_count = 0
 
     def select(self, table, params=None):
+        self._count("select", table)
         self.read_count += 1
         rows = list(self.tables.get(table, {}).values())
         params = params or {}
@@ -1162,6 +1171,7 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
         return rows
 
     def upsert(self, table, payload, on_conflict=None):
+        self._count("upsert_rows", table, len(payload if isinstance(payload, list) else [payload]))
         self.write_counts["upsert"] += len(payload if isinstance(payload, list) else [payload])
         rows = payload if isinstance(payload, list) else [payload]
         self.tables.setdefault(table, {})
@@ -1173,6 +1183,7 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
             self.tables[table][key] = {**self.tables[table].get(key, {}), **row}
 
     def insert_once(self, table, payload, on_conflict=None):
+        self._count("insert_once", table)
         if on_conflict:
             key = tuple(str(payload.get(col)) for col in on_conflict.split(","))
         else:
@@ -1188,6 +1199,7 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
         return self.insert_once(table, payload, on_conflict)
 
     def patch(self, table, filters, payload):
+        self._count("patch", table)
         self.write_counts["patch"] += 1
         for key, row in self.tables.get(table, {}).items():
             if all(str(row.get(name)) == str(value) for name, value in filters.items()):
@@ -1221,6 +1233,15 @@ def test_continuous_worker_default_snapshot_cadence_is_five_minutes():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     assert worker.state()["snapshot_interval_seconds"] == 300.0
     assert worker.state()["supabase_write_policy"]["snapshots"] == "approximately every 300 seconds while running"
+
+
+def test_continuous_worker_exposes_supabase_request_counts():
+    db = _CountingSupabaseGridRepository()
+    db.select("grid_runs", {"select": "*", "limit": 1})
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=db)
+    counts = worker.state()["supabase_request_counts"]
+    assert counts["select"] == 1
+    assert counts["by_table"]["grid_runs"]["select"] == 1
 
 
 def test_supabase_order_source_fill_fallback_preserves_raw_link():
@@ -1263,8 +1284,17 @@ class _MemorySupabaseGridRepository(SupabaseGridRepository):
     def __init__(self):
         self.enabled = True
         self.tables = {}
+        self.request_counts = {
+            "select": 0,
+            "upsert_rows": 0,
+            "insert_once": 0,
+            "patch": 0,
+            "delete": 0,
+            "by_table": {},
+        }
 
     def select(self, table, params=None):
+        self._count("select", table)
         rows = list(self.tables.get(table, {}).values())
         params = params or {}
         for key, value in params.items():
@@ -1285,6 +1315,7 @@ class _MemorySupabaseGridRepository(SupabaseGridRepository):
         return rows
 
     def upsert(self, table, payload, on_conflict=None):
+        self._count("upsert_rows", table, len(payload if isinstance(payload, list) else [payload]))
         rows = payload if isinstance(payload, list) else [payload]
         self.tables.setdefault(table, {})
         for row in rows:
@@ -1295,6 +1326,7 @@ class _MemorySupabaseGridRepository(SupabaseGridRepository):
             self.tables[table][key] = {**self.tables[table].get(key, {}), **row}
 
     def insert_once(self, table, payload, on_conflict=None):
+        self._count("insert_once", table)
         if on_conflict:
             key = tuple(str(payload.get(col)) for col in on_conflict.split(","))
         else:
@@ -1306,6 +1338,7 @@ class _MemorySupabaseGridRepository(SupabaseGridRepository):
         return True
 
     def patch(self, table, filters, payload):
+        self._count("patch", table)
         for key, row in self.tables.get(table, {}).items():
             if all(str(row.get(name)) == str(value) for name, value in filters.items()):
                 self.tables[table][key] = {**row, **payload}

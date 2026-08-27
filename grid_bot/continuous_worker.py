@@ -89,6 +89,7 @@ class ContinuousGridBotWorker:
                 "snapshots": f"approximately every {int(self.snapshot_interval_seconds)} seconds while running",
                 "idle_heartbeat_rows": "none",
             },
+            "supabase_request_counts": {},
         }
 
     def start(self) -> dict:
@@ -137,6 +138,8 @@ class ContinuousGridBotWorker:
                     }
                 )
             state["thread_alive"] = bool(self._thread and self._thread.is_alive())
+            if hasattr(self.db, "stats"):
+                state["supabase_request_counts"] = self.db.stats()
             return state
 
     def ensure_active_worker(self) -> dict:
