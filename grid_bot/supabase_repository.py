@@ -577,6 +577,7 @@ class SupabaseGridRepository:
                     "status": row.get("status"),
                     "order_kind": row.get("order_kind"),
                     "config_version": row.get("config_version"),
+                    "source_fill_id": row.get("source_fill_id") or ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"),
                     "raw": row.get("raw") or {},
                     "created_at": row.get("submitted_at"),
                     "cancelled_at": row.get("cancelled_at"),

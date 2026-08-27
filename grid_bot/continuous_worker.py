@@ -179,6 +179,13 @@ class ContinuousGridBotWorker:
         if run and run.get("status") in EXECUTABLE_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
             return run
         self._last_active_refresh_monotonic = now
+        active = self.db.active_run()
+        if not active:
+            with self._lock:
+                self._run = None
+            return None
+        if run and active.get("run_id") == run.get("run_id") and active.get("status") in EXECUTABLE_STATUSES:
+            return run
         return self._recover_active_run()
 
     def _loop(self) -> None:

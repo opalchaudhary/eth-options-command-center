@@ -1244,6 +1244,22 @@ def test_continuous_worker_exposes_supabase_request_counts():
     assert counts["by_table"]["grid_runs"]["select"] == 1
 
 
+def test_continuous_worker_active_refresh_does_not_reload_same_running_run(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    db.request_counts = {"select": 0, "upsert_rows": 0, "insert_once": 0, "patch": 0, "delete": 0, "by_table": {}}
+    worker = ContinuousGridBotWorker(client=client, db=db)
+    worker._run = started["run"]
+
+    refreshed = worker._refresh_active_run_if_due()
+
+    assert refreshed["run_id"] == started["run"]["run_id"]
+    assert db.stats()["select"] == 1
+    assert db.stats()["by_table"] == {"grid_runs": {"select": 1}}
+
+
 def test_supabase_order_source_fill_fallback_preserves_raw_link():
     class MissingSourceFillColumnRepository(_MemorySupabaseGridRepository):
         def upsert(self, table, payload, on_conflict=None):
