@@ -18,6 +18,7 @@ class ExchangeCost:
     exchange_transaction_id: Optional[str] = None
     timestamp: Optional[str] = None
     raw_reference: dict | None = None
+    config_version: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -75,4 +76,3 @@ def summarize_pnl(
         net_trading_pnl_before_income_tax=net,
         effective_cost_bps=effective_cost_bps,
     )
-

@@ -78,6 +78,16 @@ class SupabaseGridRepository:
                 return False
             raise
 
+    def insert_once_with_optional_config_version(self, table: str, payload: dict, on_conflict: str | None = None) -> bool:
+        try:
+            return self.insert_once(table, payload, on_conflict)
+        except SupabasePersistenceError as exc:
+            if "config_version" not in payload or "config_version" not in str(exc) or "42703" not in str(exc):
+                raise
+            fallback = dict(payload)
+            fallback.pop("config_version", None)
+            return self.insert_once(table, fallback, on_conflict)
+
     def patch(self, table: str, filters: dict, payload: dict) -> None:
         params = {key: f"eq.{value}" for key, value in filters.items()}
         self._request("PATCH", table, params=params, json=payload, prefer="return=minimal")
@@ -287,7 +297,7 @@ class SupabaseGridRepository:
         quantity = fill.get("size") or fill.get("quantity")
         exchange_fill_id = str(fill.get("id") or fill_id)
         exchange_timestamp = fill.get("created_at") if isinstance(fill.get("created_at"), str) else None
-        inserted = self.insert_once(
+        inserted = self.insert_once_with_optional_config_version(
             "grid_fills",
             {
                 "fill_id": fill_id,
@@ -295,6 +305,7 @@ class SupabaseGridRepository:
                 "bot_id": run["bot_id"],
                 "order_id": order.get("order_key") or client_order_id,
                 "level_id": order.get("level_id"),
+                "config_version": int(order.get("config_version") or (run.get("config") or {}).get("config_version") or 1),
                 "exchange_fill_id": exchange_fill_id,
                 "side": str(fill.get("side") or "").lower(),
                 "price": price,
@@ -313,13 +324,14 @@ class SupabaseGridRepository:
         if inserted:
             fee = fill.get("commission") or fill.get("fee")
             if fee not in [None, "", "0", 0]:
-                self.insert_once(
-                    "grid_exchange_costs",
+                    self.insert_once_with_optional_config_version(
+                        "grid_exchange_costs",
                     {
                         "cost_id": new_id("cost"),
                         "run_id": run["run_id"],
                         "order_id": order.get("order_key") or client_order_id,
                         "fill_id": fill_id,
+                        "config_version": int(order.get("config_version") or (run.get("config") or {}).get("config_version") or 1),
                         "cost_type": "trading_fee",
                         "amount": fee,
                         "currency": fill.get("commission_asset") or "USD",

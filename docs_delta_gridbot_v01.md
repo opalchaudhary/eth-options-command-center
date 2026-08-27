@@ -53,6 +53,40 @@ Inventory Utilisation v0.1:
 
 `abs(net inventory) / max inventory`
 
+Grid nature defines the permitted net inventory range:
+
+- Neutral: `-MaxInventory <= inventory <= +MaxInventory`
+- Long / Bullish Bias: `0 <= inventory <= +MaxInventory`
+- Short / Bearish Bias: `-MaxInventory <= inventory <= 0`
+
+Max Inventory is net inventory capacity, not the sum of all mathematical grid
+levels. Outstanding opening orders reserve capacity before they fill. For
+example, in Long mode, filled long inventory plus remaining outstanding opening
+BUY quantity must stay within Max Inventory. In Short mode, filled short
+inventory plus remaining outstanding opening SELL quantity must stay within Max
+Inventory. Neutral mode tracks long-side and short-side opening capacity
+separately; opposite outstanding risk is not treated as safe netting.
+
+Risk-reducing orders remain allowed when they do not cross through the permitted
+inventory range. Max Inventory is an accumulation brake, not a trap.
+
+Arithmetic and Geometric level generation is independent of grid nature:
+
+- Arithmetic: `(upper - lower) / (grid_count - 1)`
+- Geometric: `(upper / lower) ** (1 / (grid_count - 1))`
+
+`grid_count = N` means N total mathematical price levels. The number of active
+opening orders can be lower than N when grid nature, inventory reservation, or
+post-only safety defers some levels. Long mode does not force a market long at
+startup; it only places eligible opening BUY orders below market. Short mode
+does not force a market short at startup; it only places eligible opening SELL
+orders above market.
+
+Post-only execution safety is separate from the mathematical grid level. BUY
+execution prices are rounded down to the valid Delta tick, SELL execution prices
+are rounded up, and orders that would cross the current best ask/bid are
+deferred rather than converted into taker orders.
+
 Grid Risk Ratio v0.1:
 
 `projected adverse grid exposure / configured risk capital`

@@ -14,6 +14,7 @@ from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .grid_builder import build_grid_levels, preview_grid, quantize_price
 from .models import GridConfig, GridStatus, GridType, OrderProposal, Side, SpacingType, new_id, to_record_dict, utc_now
+from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 from .supabase_repository import SupabaseGridRepository, SupabasePersistenceError
 
 
@@ -104,6 +105,7 @@ class DurableGridBotLifecycle:
         if use_supabase is None:
             use_supabase = not pytest_running and os.getenv("GRIDBOT_V01_SUPABASE_ENABLED", "1") != "0"
         self.db = db or (SupabaseGridRepository() if use_supabase else None)
+        self._save_lock = threading.Lock()
 
     def _db_enabled(self) -> bool:
         return bool(self.db and self.db.enabled)
@@ -119,13 +121,21 @@ class DurableGridBotLifecycle:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
     def _save(self, state: dict) -> None:
-        if self._db_enabled():
-            for run in (state.get("runs") or {}).values():
-                self.db.persist_run_state(run)
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(_jsonable(state), indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.state_path)
+        with self._save_lock:
+            if self._db_enabled():
+                for run in (state.get("runs") or {}).values():
+                    self.db.persist_run_state(run)
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(_jsonable(state), indent=2, sort_keys=True), encoding="utf-8")
+            for attempt in range(5):
+                try:
+                    tmp.replace(self.state_path)
+                    return
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
 
     def _event(self, state: dict, run_id: str | None, event_type: str, payload: dict | None = None) -> None:
         run = (state.get("runs") or {}).get(run_id) if run_id else None
@@ -256,9 +266,10 @@ class DurableGridBotLifecycle:
         spec = self.client.product_spec(product_symbol)
         reference = _decimal(health["market"]["reference_price"])
         config = self._config_from_operator_payload(payload, spec, reference, health)
-        preview = preview_grid(config, reference, spec.tick_size)
-        max_inventory = _decimal(preview["max_potential_long_inventory"]) + _decimal(preview["max_potential_short_inventory"])
-        projected_exposure = max_inventory * reference * spec.contract_multiplier
+        position = _position_size(self.client, spec.product_id)
+        preview = preview_grid(config, reference, spec.tick_size, spec.best_bid, spec.best_ask, position)
+        reserved_inventory = _decimal(preview.get("reserved_long_exposure")) + _decimal(preview.get("reserved_short_exposure"))
+        projected_exposure = reserved_inventory * reference * spec.contract_multiplier
         equity = _decimal(health["account"].get("account_equity"), "0")
         grr = projected_exposure / equity if equity > 0 else None
         risk_state = "UNKNOWN"
@@ -313,7 +324,8 @@ class DurableGridBotLifecycle:
             risk_capital=Decimal("50"),
             risk_thresholds=DEFAULT_RISK_THRESHOLDS,
         )
-        preview = preview_grid(config, reference, spec.tick_size)
+        position = _position_size(self.client, spec.product_id)
+        preview = preview_grid(config, reference, spec.tick_size, spec.best_bid, spec.best_ask, position)
         return {"ok": True, "product": to_record_dict(spec), "config": to_record_dict(config), "preview": to_record_dict(preview)}
 
     def start_operator_grid(self, payload: dict) -> dict:
@@ -341,6 +353,7 @@ class DurableGridBotLifecycle:
             "operational_state": "DEGRADED",
             "sequence": 1,
             "orders": {},
+            "deferred_orders": {},
             "fills": {},
             "replacement_keys": {},
             "risk_snapshots": [],
@@ -399,6 +412,7 @@ class DurableGridBotLifecycle:
             "operational_state": "DEGRADED",
             "sequence": 1,
             "orders": {},
+            "deferred_orders": {},
             "fills": {},
             "replacement_keys": {},
             "risk_snapshots": [],
@@ -505,7 +519,62 @@ class DurableGridBotLifecycle:
             client_order_id=make_client_order_id(run_id, level["level_id"], side, sequence),
         )
 
+    def _defer_proposal(self, run: dict, proposal: OrderProposal, order_kind: str, reason_codes: list[str], normalized_price: Decimal | None = None) -> dict:
+        record = {
+            "order_key": proposal.client_order_id,
+            "run_id": run["run_id"],
+            "level_id": proposal.level_id,
+            "side": proposal.side.value,
+            "price": str(normalized_price or proposal.price),
+            "requested_quantity": str(proposal.quantity),
+            "filled_quantity": "0",
+            "remaining_quantity": "0",
+            "client_order_id": proposal.client_order_id,
+            "exchange_order_id": "",
+            "status": "deferred",
+            "order_kind": order_kind,
+            "config_version": run["config"]["config_version"],
+            "rejection_reason": ",".join(reason_codes),
+            "created_at": utc_now(),
+        }
+        run.setdefault("deferred_orders", {})[proposal.client_order_id] = record
+        return record
+
+    def _open_order_records(self, run: dict) -> list[dict]:
+        return [
+            order
+            for order in (run.get("orders") or {}).values()
+            if order.get("status") not in START_TERMINAL_ORDER_STATUSES
+        ]
+
     def _place_proposal(self, run: dict, product_id: int, proposal: OrderProposal, order_kind: str) -> dict:
+        spec = self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
+        position = _position_size(self.client, product_id)
+        normalized_price = round_price_for_side(proposal.price, spec.tick_size, proposal.side)
+        semantic = evaluate_order_semantics(
+            GridType(run["config"]["grid_type"]),
+            position,
+            _decimal(run["config"]["max_inventory_lots"]),
+            proposal.side,
+            proposal.quantity,
+            self._open_order_records(run),
+        )
+        post_only = validate_post_only_price(proposal.side, normalized_price, spec.best_bid, spec.best_ask)
+        reason_codes = [*semantic.reason_codes, *post_only.reason_codes]
+        if reason_codes:
+            return self._defer_proposal(run, proposal, order_kind, reason_codes, normalized_price)
+        if normalized_price != proposal.price:
+            proposal = OrderProposal(
+                run_id=proposal.run_id,
+                level_id=proposal.level_id,
+                side=proposal.side,
+                price=normalized_price,
+                quantity=proposal.quantity,
+                client_order_id=proposal.client_order_id,
+                post_only=proposal.post_only,
+                time_in_force=proposal.time_in_force,
+                reduce_only=proposal.reduce_only,
+            )
         if self._db_enabled():
             self.db.persist_order_proposal(run, proposal, order_kind)
         response = self.client.place_order(order_payload(product_id, proposal))
@@ -524,6 +593,10 @@ class DurableGridBotLifecycle:
             "status": exchange_order.get("state") or "open",
             "order_kind": order_kind,
             "config_version": run["config"]["config_version"],
+            "opens_inventory": semantic.opens_inventory,
+            "projected_inventory_if_filled": str(semantic.projected_inventory),
+            "reserved_long_after": str(semantic.reserved_long_after),
+            "reserved_short_after": str(semantic.reserved_short_after),
             "raw": exchange_order,
             "created_at": utc_now(),
             "submitted_at": utc_now(),
@@ -562,6 +635,7 @@ class DurableGridBotLifecycle:
             "operational_state": "DEGRADED",
             "sequence": 1,
             "orders": {},
+            "deferred_orders": {},
             "fills": {},
             "replacement_keys": {},
             "risk_snapshots": [],

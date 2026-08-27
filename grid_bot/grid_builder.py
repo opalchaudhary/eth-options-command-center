@@ -1,6 +1,7 @@
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP, getcontext
 
 from .models import GridConfig, GridLevel, GridType, Side, SpacingType
+from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 
 getcontext().prec = 28
 
@@ -58,12 +59,7 @@ def build_grid_levels(config: GridConfig, reference_price: Decimal, tick_size: D
     levels: list[GridLevel] = []
 
     for index, price in enumerate(prices):
-        if config.grid_type == GridType.LONG_BIAS:
-            side = Side.BUY if price <= reference_price else Side.SELL
-        elif config.grid_type == GridType.SHORT_BIAS:
-            side = Side.SELL if price >= reference_price else Side.BUY
-        else:
-            side = Side.BUY if price < reference_price else Side.SELL
+        side = Side.BUY if price < reference_price else Side.SELL
 
         levels.append(
             GridLevel(
@@ -78,10 +74,64 @@ def build_grid_levels(config: GridConfig, reference_price: Decimal, tick_size: D
     return levels
 
 
-def preview_grid(config: GridConfig, reference_price: Decimal, tick_size: Decimal) -> dict:
+def preview_grid(
+    config: GridConfig,
+    reference_price: Decimal,
+    tick_size: Decimal,
+    best_bid: Decimal | None = None,
+    best_ask: Decimal | None = None,
+    current_inventory: Decimal = Decimal("0"),
+    open_orders: list[dict] | None = None,
+) -> dict:
     levels = build_grid_levels(config, reference_price, tick_size)
     buy_levels = [level for level in levels if level.side == Side.BUY]
     sell_levels = [level for level in levels if level.side == Side.SELL]
+    opening_buy_levels = []
+    opening_sell_levels = []
+    deferred_levels = []
+    simulated_open_orders = list(open_orders or [])
+    reserved_long = max(Decimal("0"), current_inventory)
+    reserved_short = max(Decimal("0"), -current_inventory)
+    for level in levels:
+        normalized_price = round_price_for_side(level.price, tick_size, level.side)
+        post_only = validate_post_only_price(level.side, normalized_price, best_bid, best_ask)
+        semantic = evaluate_order_semantics(
+            config.grid_type,
+            current_inventory,
+            config.max_inventory_lots,
+            level.side,
+            level.quantity,
+            simulated_open_orders,
+        )
+        preview_level = {
+            "level_id": level.level_id,
+            "index": level.index,
+            "side": level.side.value,
+            "price": level.price,
+            "execution_price": normalized_price,
+            "quantity": level.quantity,
+            "post_only_safe": post_only.allowed,
+            "semantic_allowed": semantic.allowed,
+            "opens_inventory": semantic.opens_inventory,
+            "reason_codes": [*semantic.reason_codes, *post_only.reason_codes],
+        }
+        if semantic.allowed and post_only.allowed:
+            if level.side == Side.BUY:
+                opening_buy_levels.append(preview_level)
+            else:
+                opening_sell_levels.append(preview_level)
+            simulated_open_orders.append(
+                {
+                    "side": level.side.value,
+                    "remaining_quantity": str(level.quantity),
+                    "status": "open",
+                    "opens_inventory": semantic.opens_inventory,
+                }
+            )
+            reserved_long = semantic.reserved_long_after
+            reserved_short = semantic.reserved_short_after
+        else:
+            deferred_levels.append(preview_level)
     prices = [level.price for level in levels]
     absolute_spacing = None
     pct_spacing = None
@@ -97,6 +147,19 @@ def preview_grid(config: GridConfig, reference_price: Decimal, tick_size: Decima
         "levels": levels,
         "buy_levels": buy_levels,
         "sell_levels": sell_levels,
+        "total_grid_levels": len(levels),
+        "opening_buy_orders_eligible": len(opening_buy_levels),
+        "opening_sell_orders_eligible": len(opening_sell_levels),
+        "opening_buy_levels": opening_buy_levels,
+        "opening_sell_levels": opening_sell_levels,
+        "deferred_levels": deferred_levels,
+        "reserved_long_exposure": reserved_long,
+        "reserved_short_exposure": reserved_short,
+        "nature_semantics": {
+            GridType.NEUTRAL.value: "inventory may range from -MaxInventory to +MaxInventory",
+            GridType.LONG_BIAS.value: "inventory may range from 0 to +MaxInventory; BUY opens, SELL closes",
+            GridType.SHORT_BIAS.value: "inventory may range from -MaxInventory to 0; SELL opens, BUY closes",
+        }[config.grid_type.value],
         "absolute_spacing": absolute_spacing,
         "percentage_spacing": pct_spacing,
         "lot_size": config.lot_size,
@@ -107,4 +170,3 @@ def preview_grid(config: GridConfig, reference_price: Decimal, tick_size: Decima
         "risk_capital": config.risk_capital,
         "risk_thresholds": config.risk_thresholds,
     }
-

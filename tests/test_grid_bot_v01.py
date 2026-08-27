@@ -15,6 +15,7 @@ from grid_bot.reconciliation import reconcile_orders
 from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
 from grid_bot.risk import GridRiskController, RiskInputs, RiskState, grid_risk_ratio, inventory_utilisation
+from grid_bot.semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 from grid_bot.supabase_repository import SupabaseGridRepository
 
 
@@ -100,6 +101,93 @@ def test_geometric_grid_generation_is_deterministic_and_unique():
     assert prices[0] == Decimal("2800.0")
     assert prices[-1] == Decimal("3200.0")
     assert len(set(prices)) == 5
+
+
+def test_grid_count_is_total_price_levels_for_arithmetic_and_geometric():
+    for spacing in [SpacingType.ARITHMETIC, SpacingType.GEOMETRIC]:
+        for count in [4, 10, 20, 30]:
+            config = GridConfig(**{**_config(spacing=spacing).__dict__, "grid_count": count})
+            assert len(generate_prices(config, Decimal("0.05"))) == count
+
+
+def test_narrow_range_duplicate_levels_are_rejected_after_tick_rounding():
+    config = GridConfig(
+        **{
+            **_config().__dict__,
+            "lower_price": Decimal("2500"),
+            "upper_price": Decimal("2500.5"),
+            "grid_count": 30,
+        }
+    )
+    with pytest.raises(ValueError, match="not unique"):
+        generate_prices(config, Decimal("0.1"))
+
+
+def test_grid_nature_does_not_change_arithmetic_or_geometric_prices():
+    for spacing in [SpacingType.ARITHMETIC, SpacingType.GEOMETRIC]:
+        neutral = generate_prices(_config(grid_type=GridType.NEUTRAL, spacing=spacing), Decimal("0.05"))
+        long = generate_prices(_config(grid_type=GridType.LONG_BIAS, spacing=spacing), Decimal("0.05"))
+        short = generate_prices(_config(grid_type=GridType.SHORT_BIAS, spacing=spacing), Decimal("0.05"))
+        assert long == neutral
+        assert short == neutral
+
+
+@pytest.mark.parametrize(
+    "grid_type,current,side,qty,allowed",
+    [
+        (GridType.NEUTRAL, "0", Side.BUY, "5", True),
+        (GridType.NEUTRAL, "0", Side.SELL, "5", True),
+        (GridType.NEUTRAL, "50", Side.BUY, "5", False),
+        (GridType.NEUTRAL, "50", Side.SELL, "5", True),
+        (GridType.NEUTRAL, "-50", Side.SELL, "5", False),
+        (GridType.NEUTRAL, "-50", Side.BUY, "5", True),
+        (GridType.NEUTRAL, "45", Side.BUY, "10", False),
+        (GridType.LONG_BIAS, "0", Side.BUY, "5", True),
+        (GridType.LONG_BIAS, "0", Side.SELL, "5", False),
+        (GridType.LONG_BIAS, "5", Side.SELL, "5", True),
+        (GridType.LONG_BIAS, "5", Side.SELL, "10", False),
+        (GridType.LONG_BIAS, "45", Side.BUY, "5", True),
+        (GridType.LONG_BIAS, "45", Side.BUY, "10", False),
+        (GridType.LONG_BIAS, "50", Side.BUY, "5", False),
+        (GridType.LONG_BIAS, "50", Side.SELL, "5", True),
+        (GridType.SHORT_BIAS, "0", Side.SELL, "5", True),
+        (GridType.SHORT_BIAS, "0", Side.BUY, "5", False),
+        (GridType.SHORT_BIAS, "-5", Side.BUY, "5", True),
+        (GridType.SHORT_BIAS, "-5", Side.BUY, "10", False),
+        (GridType.SHORT_BIAS, "-45", Side.SELL, "5", True),
+        (GridType.SHORT_BIAS, "-45", Side.SELL, "10", False),
+        (GridType.SHORT_BIAS, "-50", Side.SELL, "5", False),
+        (GridType.SHORT_BIAS, "-50", Side.BUY, "5", True),
+    ],
+)
+def test_nature_specific_projected_inventory_limits(grid_type, current, side, qty, allowed):
+    decision = evaluate_order_semantics(grid_type, Decimal(current), Decimal("50"), side, Decimal(qty))
+    assert decision.allowed is allowed
+
+
+def test_outstanding_opening_order_reservation_blocks_only_new_openers():
+    long_reserved = [{"side": "buy", "remaining_quantity": "5", "status": "open", "opens_inventory": True} for _ in range(10)]
+    assert not evaluate_order_semantics(GridType.LONG_BIAS, Decimal("0"), Decimal("50"), Side.BUY, Decimal("5"), long_reserved).allowed
+    assert evaluate_order_semantics(GridType.LONG_BIAS, Decimal("5"), Decimal("50"), Side.SELL, Decimal("5"), long_reserved).allowed
+
+    short_reserved = [{"side": "sell", "remaining_quantity": "5", "status": "open", "opens_inventory": True} for _ in range(10)]
+    assert not evaluate_order_semantics(GridType.SHORT_BIAS, Decimal("0"), Decimal("50"), Side.SELL, Decimal("5"), short_reserved).allowed
+    assert evaluate_order_semantics(GridType.SHORT_BIAS, Decimal("-5"), Decimal("50"), Side.BUY, Decimal("5"), short_reserved).allowed
+
+    neutral_buys = [{"side": "buy", "remaining_quantity": "5", "status": "open", "opens_inventory": True} for _ in range(10)]
+    assert not evaluate_order_semantics(GridType.NEUTRAL, Decimal("0"), Decimal("50"), Side.BUY, Decimal("5"), neutral_buys).allowed
+    assert evaluate_order_semantics(GridType.NEUTRAL, Decimal("0"), Decimal("50"), Side.SELL, Decimal("5"), neutral_buys).allowed
+
+
+def test_side_aware_tick_rounding_and_post_only_guard():
+    assert round_price_for_side(Decimal("2500.074"), Decimal("0.05"), Side.BUY) == Decimal("2500.05")
+    assert round_price_for_side(Decimal("2500.076"), Decimal("0.05"), Side.BUY) == Decimal("2500.05")
+    assert round_price_for_side(Decimal("2500.074"), Decimal("0.05"), Side.SELL) == Decimal("2500.10")
+    assert round_price_for_side(Decimal("2500.075"), Decimal("0.05"), Side.SELL) == Decimal("2500.10")
+    assert validate_post_only_price(Side.BUY, Decimal("2500.00"), Decimal("2499.95"), Decimal("2500.05")).allowed
+    assert not validate_post_only_price(Side.BUY, Decimal("2500.05"), Decimal("2499.95"), Decimal("2500.05")).allowed
+    assert validate_post_only_price(Side.SELL, Decimal("2500.05"), Decimal("2499.95"), Decimal("2500.05")).allowed
+    assert not validate_post_only_price(Side.SELL, Decimal("2499.95"), Decimal("2499.95"), Decimal("2500.05")).allowed
 
 
 def test_grid_validation_rejects_invalid_range_and_count():
@@ -432,10 +520,13 @@ def test_durable_lifecycle_fill_dedupe_places_one_replacement_for_partial_fill(t
     first = lifecycle.reconcile(started["run"]["run_id"])
     second = lifecycle.reconcile(started["run"]["run_id"])
     replacement_orders = [order for order in first["run"]["orders"].values() if order["order_kind"] == "replacement"]
+    deferred_replacements = [order for order in first["run"].get("deferred_orders", {}).values() if order["order_kind"] == "replacement"]
     assert first["new_fills"] == 1
     assert second["new_fills"] == 0
-    assert len(replacement_orders) == 1
-    assert replacement_orders[0]["requested_quantity"] == "0.5"
+    assert replacement_orders == []
+    assert len(deferred_replacements) == 1
+    assert deferred_replacements[0]["requested_quantity"] == "0.5"
+    assert "POST_ONLY_SELL_WOULD_CROSS_BID" in deferred_replacements[0]["rejection_reason"]
 
 
 def test_durable_lifecycle_pause_resume_regrid_stop_summary(tmp_path):
@@ -484,6 +575,59 @@ def test_operator_preview_derives_reference_tick_and_account_risk(tmp_path):
     assert preview["risk"]["version"] == "gridbot_v01_account_health_grr_v1"
     assert preview["risk"]["formula"] == "projected_grid_exposure / account_equity"
     assert "allocated_capital" in preview["config"]
+
+
+def test_bias_initial_ladder_uses_nature_specific_opening_orders(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    base = {
+        "bot_name": "Operator Grid",
+        "product_symbol": "ETHUSD",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 30,
+        "spacing_type": "arithmetic",
+        "lot_size": "5",
+        "max_inventory_lots": "50",
+    }
+
+    neutral = lifecycle.preview_operator_grid({**base, "grid_type": "neutral"})["preview"]
+    long = lifecycle.preview_operator_grid({**base, "grid_type": "long_bias"})["preview"]
+    short = lifecycle.preview_operator_grid({**base, "grid_type": "short_bias"})["preview"]
+
+    assert neutral["total_grid_levels"] == 30
+    assert neutral["opening_buy_orders_eligible"] == 10
+    assert neutral["opening_sell_orders_eligible"] == 10
+    assert long["opening_buy_orders_eligible"] == 10
+    assert long["opening_sell_orders_eligible"] == 0
+    assert short["opening_buy_orders_eligible"] == 0
+    assert short["opening_sell_orders_eligible"] == 10
+    assert len(long["deferred_levels"]) == 20
+    assert len(short["deferred_levels"]) == 20
+
+
+def test_durable_start_defers_inventory_capped_orders_without_placing_them(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_operator_grid(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "long_bias",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 30,
+            "spacing_type": "arithmetic",
+            "lot_size": "5",
+            "max_inventory_lots": "50",
+        }
+    )
+
+    assert len(started["run"]["levels"]) == 30
+    assert len(started["run"]["orders"]) == 10
+    assert len(client.orders) == 10
+    assert all(order["side"] == "buy" for order in started["run"]["orders"].values())
+    assert len(started["run"]["deferred_orders"]) == 20
 
 
 def test_operator_start_uses_supplied_grid_without_manual_capital_fields(tmp_path):

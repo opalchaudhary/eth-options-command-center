@@ -165,6 +165,7 @@ class FillRecord:
     exchange_fill_id: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
+    config_version: Optional[int] = None
 
 
 def to_record_dict(value: Any) -> Any:
