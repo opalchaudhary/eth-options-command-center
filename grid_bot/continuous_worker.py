@@ -308,9 +308,12 @@ def stop_continuous_gridbot_worker() -> dict:
 
 def gridbot_live_state() -> dict:
     state = worker.state()
-    if not state.get("account_risk_state"):
-        try:
-            state["account_risk_state"] = account_telemetry_cache.get("ETHUSD").as_dict()
-        except Exception as exc:
-            state["account_risk_state_error"] = str(exc)[:300]
+    try:
+        if state.get("run_id"):
+            telemetry = worker.account_telemetry.get("ETHUSD")
+        else:
+            telemetry = account_telemetry_cache.get("ETHUSD")
+        state["account_risk_state"] = telemetry.as_dict()
+    except Exception as exc:
+        state["account_risk_state_error"] = str(exc)[:300]
     return state

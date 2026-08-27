@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -169,6 +169,16 @@ def _status_from_syncs(syncs: dict[str, TelemetrySync], stale_after_seconds: flo
     if critical_unavailable.intersection(unavailable_fields):
         return TelemetryStatus.DEGRADED.value
     return TelemetryStatus.HEALTHY.value
+
+
+def _sync_age(sync_at: str | None, now: datetime | None = None) -> float | None:
+    if not sync_at:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(str(sync_at).replace("Z", "+00:00"))
+        return max(0.0, ((now or datetime.now(timezone.utc)) - timestamp).total_seconds())
+    except Exception:
+        return None
 
 
 def _side_from_lots(lots: Decimal | None) -> str | None:
@@ -371,15 +381,33 @@ class AccountTelemetryCache:
         self.request_counts = {"wallet": 0, "positions": 0, "orders": 0, "ticker": 0, "product_spec": 0}
 
     def snapshot(self) -> dict | None:
-        return self._state.as_dict() if self._state else None
+        return self._with_current_ages(self._state).as_dict() if self._state else None
 
     def get(self, product_symbol: str = "ETHUSD", force: bool = False) -> AccountRiskState:
         now = time.monotonic()
         if self._state and not force and now - self._last_refresh_monotonic < self.refresh_interval_seconds:
-            return self._state
+            return self._with_current_ages(self._state)
         self._state = self.refresh(product_symbol)
         self._last_refresh_monotonic = time.monotonic()
         return self._state
+
+    def _with_current_ages(self, state: AccountRiskState) -> AccountRiskState:
+        now = datetime.now(timezone.utc)
+        syncs = {
+            "account": TelemetrySync(state.last_account_sync, _sync_age(state.last_account_sync, now), bool(state.last_account_sync)),
+            "position": TelemetrySync(state.last_position_sync, _sync_age(state.last_position_sync, now), bool(state.last_position_sync)),
+            "orders": TelemetrySync(state.last_order_sync, _sync_age(state.last_order_sync, now), bool(state.last_order_sync)),
+            "market": TelemetrySync(state.last_market_sync, _sync_age(state.last_market_sync, now), bool(state.last_market_sync)),
+        }
+        return replace(
+            state,
+            timestamp=utc_now(),
+            telemetry_status=_status_from_syncs(syncs, self.stale_after_seconds, state.unavailable_fields),
+            account_age_seconds=syncs["account"].age_seconds,
+            position_age_seconds=syncs["position"].age_seconds,
+            order_age_seconds=syncs["orders"].age_seconds,
+            market_age_seconds=syncs["market"].age_seconds,
+        )
 
     def refresh(self, product_symbol: str = "ETHUSD") -> AccountRiskState:
         errors: list[str] = []

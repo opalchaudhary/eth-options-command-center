@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from grid_bot.account_telemetry import (
+    AccountTelemetryCache,
     TelemetrySync,
     normalize_account_risk_state,
     risk_increasing_action_allowed,
@@ -153,3 +154,36 @@ def test_telemetry_action_gates_fail_closed_for_risk_increasing_only():
     assert risk_increasing_action_allowed(unavailable_account)[0] is False
     assert risk_reducing_action_allowed(unavailable_account) == (True, [])
     assert risk_reducing_action_allowed(no_position)[0] is False
+
+
+def test_cache_advances_age_without_delta_reads_until_refresh_interval():
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def product_spec(self, symbol):
+            self.calls += 1
+            return _product()
+
+        def wallet(self):
+            return _wallet()
+
+        def positions(self, underlying_asset_symbol="ETH"):
+            return {"success": True, "result": []}
+
+        def open_orders(self, product_id=None):
+            return {"success": True, "result": []}
+
+        def ticker(self, symbol):
+            return {"success": True, "result": {"mark_price": "2500"}}
+
+    cache = AccountTelemetryCache(Client(), refresh_interval_seconds=1000, stale_after_seconds=1000)
+    first = cache.get()
+    second = cache.get()
+    cache._last_refresh_monotonic = 0
+    third = cache.get()
+
+    assert first.request_counts == {"wallet": 1, "positions": 1, "orders": 1, "ticker": 1, "product_spec": 1}
+    assert second.request_counts == first.request_counts
+    assert second.account_age_seconds is not None
+    assert third.request_counts == {"wallet": 2, "positions": 2, "orders": 2, "ticker": 2, "product_spec": 2}
