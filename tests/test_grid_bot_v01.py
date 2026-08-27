@@ -1217,6 +1217,12 @@ def test_continuous_worker_no_change_polls_do_not_write_per_loop(tmp_path):
     assert after["patch"] == before["patch"]
 
 
+def test_continuous_worker_default_snapshot_cadence_is_five_minutes():
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
+    assert worker.state()["snapshot_interval_seconds"] == 300.0
+    assert worker.state()["supabase_write_policy"]["snapshots"] == "approximately every 300 seconds while running"
+
+
 def test_supabase_order_source_fill_fallback_preserves_raw_link():
     class MissingSourceFillColumnRepository(_MemorySupabaseGridRepository):
         def upsert(self, table, payload, on_conflict=None):
