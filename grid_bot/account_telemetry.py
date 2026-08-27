@@ -92,7 +92,68 @@ class AccountRiskState:
                 return {key: convert(item) for key, item in value.items()}
             return value
 
-        return convert(asdict(self))
+        payload = convert(asdict(self))
+        payload["sections"] = {
+            "account": {
+                "wallet_balance": payload.get("wallet_balance"),
+                "account_equity": payload.get("account_equity"),
+                "source": "wallet/balances",
+            },
+            "margin": {
+                "available_margin": payload.get("available_margin"),
+                "used_margin": payload.get("used_margin"),
+                "margin_utilisation_pct": payload.get("margin_utilisation_pct"),
+                "initial_margin": payload.get("initial_margin"),
+                "maintenance_margin": payload.get("maintenance_margin"),
+                "margin_mode": payload.get("margin_mode"),
+            },
+            "position": {
+                "product": payload.get("position_product"),
+                "lots": payload.get("position_lots"),
+                "base_quantity": payload.get("position_base_quantity"),
+                "side": payload.get("position_side"),
+                "average_entry_price": payload.get("average_entry_price"),
+                "mark_price": payload.get("mark_price"),
+                "notional": payload.get("position_notional"),
+                "unrealized_pnl": payload.get("unrealized_pnl"),
+                "realized_pnl": payload.get("realized_pnl"),
+                "liquidation_price": payload.get("liquidation_price"),
+            },
+            "orders": {
+                "open_order_count": payload.get("open_order_count"),
+                "open_buy_order_count": payload.get("open_buy_order_count"),
+                "open_sell_order_count": payload.get("open_sell_order_count"),
+                "open_buy_quantity_lots": payload.get("open_buy_quantity_lots"),
+                "open_sell_quantity_lots": payload.get("open_sell_quantity_lots"),
+                "open_buy_notional": payload.get("open_buy_notional"),
+                "open_sell_notional": payload.get("open_sell_notional"),
+            },
+            "inventory": {
+                "position_lots": payload.get("position_lots"),
+                "position_base_quantity": payload.get("position_base_quantity"),
+                "open_buy_quantity_lots": payload.get("open_buy_quantity_lots"),
+                "open_sell_quantity_lots": payload.get("open_sell_quantity_lots"),
+            },
+            "risk": {
+                "account_equity": payload.get("account_equity"),
+                "position_notional": payload.get("position_notional"),
+                "margin_utilisation_pct": payload.get("margin_utilisation_pct"),
+            },
+            "telemetry_health": {
+                "status": payload.get("telemetry_status"),
+                "last_account_sync": payload.get("last_account_sync"),
+                "last_position_sync": payload.get("last_position_sync"),
+                "last_order_sync": payload.get("last_order_sync"),
+                "last_market_sync": payload.get("last_market_sync"),
+                "account_age_seconds": payload.get("account_age_seconds"),
+                "position_age_seconds": payload.get("position_age_seconds"),
+                "order_age_seconds": payload.get("order_age_seconds"),
+                "market_age_seconds": payload.get("market_age_seconds"),
+                "errors": payload.get("errors"),
+                "unavailable_fields": payload.get("unavailable_fields"),
+            },
+        }
+        return payload
 
 
 CAPABILITY_MATRIX = {
@@ -378,6 +439,9 @@ class AccountTelemetryCache:
         self.stale_after_seconds = stale_after_seconds if stale_after_seconds is not None else float(os.getenv("GRIDBOT_V01_TELEMETRY_STALE_SECONDS", "90"))
         self._last_refresh_monotonic = 0.0
         self._state: AccountRiskState | None = None
+        self._last_payloads: dict[str, dict | None] = {"wallet": None, "positions": None, "orders": None, "ticker": None}
+        self._last_syncs: dict[str, TelemetrySync] = {}
+        self._last_product: ProductSpec | None = None
         self.request_counts = {"wallet": 0, "positions": 0, "orders": 0, "ticker": 0, "product_spec": 0}
 
     def snapshot(self) -> dict | None:
@@ -414,26 +478,36 @@ class AccountTelemetryCache:
         syncs: dict[str, TelemetrySync] = {}
         payloads: dict[str, dict | None] = {"wallet": None, "positions": None, "orders": None, "ticker": None}
         product = None
+        now = datetime.now(timezone.utc)
 
         def capture(name: str, callback):
             sync_name = {"wallet": "account", "positions": "position", "ticker": "market"}.get(name, name)
             try:
                 payload = callback()
                 self.request_counts[name] = self.request_counts.get(name, 0) + 1
-                syncs[sync_name] = TelemetrySync(utc_now(), 0.0, True)
+                sync = TelemetrySync(utc_now(), 0.0, True)
+                syncs[sync_name] = sync
+                self._last_payloads[name] = payload
+                self._last_syncs[sync_name] = sync
                 return payload
             except Exception as exc:
                 message = f"{name}: {type(exc).__name__}: {str(exc)[:200]}"
                 errors.append(message)
+                previous_sync = self._last_syncs.get(sync_name)
+                previous_payload = self._last_payloads.get(name)
+                if previous_sync and previous_payload is not None:
+                    syncs[sync_name] = TelemetrySync(previous_sync.last_sync, _sync_age(previous_sync.last_sync, now), True, message)
+                    return previous_payload
                 syncs[sync_name] = TelemetrySync(None, None, False, message)
                 return None
 
         try:
             product = self.client.product_spec(product_symbol)
             self.request_counts["product_spec"] += 1
+            self._last_product = product
         except Exception as exc:
             errors.append(f"product_spec: {type(exc).__name__}: {str(exc)[:200]}")
-            product = ProductSpec(0, product_symbol, "", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("0.1"), 1, 0, Decimal("0"))
+            product = self._last_product or ProductSpec(0, product_symbol, "", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("0.1"), 1, 0, Decimal("0"))
 
         payloads["wallet"] = capture("wallet", lambda: self.client.wallet())
         payloads["positions"] = capture("positions", lambda: self.client.positions("ETH"))

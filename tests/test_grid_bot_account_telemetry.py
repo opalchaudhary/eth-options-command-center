@@ -187,3 +187,50 @@ def test_cache_advances_age_without_delta_reads_until_refresh_interval():
     assert second.request_counts == first.request_counts
     assert second.account_age_seconds is not None
     assert third.request_counts == {"wallet": 2, "positions": 2, "orders": 2, "ticker": 2, "product_spec": 2}
+
+
+def test_cache_retains_last_known_values_after_endpoint_timeout_and_marks_stale():
+    class FlakyClient:
+        def __init__(self):
+            self.fail_positions = False
+
+        def product_spec(self, symbol):
+            return _product()
+
+        def wallet(self):
+            return _wallet(equity="123", available="100")
+
+        def positions(self, underlying_asset_symbol="ETH"):
+            if self.fail_positions:
+                raise TimeoutError("position timeout")
+            return {"success": True, "result": [{"product_id": 1699, "size": "10"}]}
+
+        def open_orders(self, product_id=None):
+            return {"success": True, "result": []}
+
+        def ticker(self, symbol):
+            return {"success": True, "result": {"mark_price": "2500"}}
+
+    client = FlakyClient()
+    cache = AccountTelemetryCache(client, refresh_interval_seconds=0, stale_after_seconds=0)
+    fresh = cache.get()
+    cache._last_syncs["position"] = TelemetrySync("2026-08-27T00:00:00+00:00", 999, True)
+    client.fail_positions = True
+    stale = cache.get(force=True)
+
+    assert fresh.position_lots == Decimal("10")
+    assert stale.position_lots == Decimal("10")
+    assert stale.telemetry_status == "STALE"
+    assert stale.errors == ["positions: TimeoutError: position timeout"]
+    assert stale.position_age_seconds is not None
+
+
+def test_serialized_state_exposes_normalized_live_state_sections():
+    state = _state().as_dict()
+
+    assert set(state["sections"]) >= {"account", "margin", "position", "orders", "inventory", "risk", "telemetry_health"}
+    assert state["sections"]["account"]["account_equity"] == "100"
+    assert state["sections"]["margin"]["available_margin"] == "80"
+    assert state["sections"]["position"]["side"] == "FLAT"
+    assert state["sections"]["orders"]["open_order_count"] == 0
+    assert state["sections"]["telemetry_health"]["status"] == "HEALTHY"
