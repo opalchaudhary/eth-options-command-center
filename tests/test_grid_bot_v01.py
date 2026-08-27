@@ -685,6 +685,47 @@ def test_operator_background_start_returns_starting_then_reaches_running(tmp_pat
     assert status["startup"]["orders_submitted"] == 4
 
 
+def test_operator_grid_start_does_not_resurrect_run_when_stop_races_placement(tmp_path):
+    class StopDuringPlacementClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.on_place = None
+            self._stopped_once = False
+
+        def place_order(self, payload):
+            if self.on_place and not self._stopped_once:
+                self._stopped_once = True
+                self.on_place()
+            return super().place_order(payload)
+
+    client = StopDuringPlacementClient()
+    path = tmp_path / "state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    run_id = begun["run"]["run_id"]
+    client.on_place = lambda: DurableGridBotLifecycle(client, path, use_supabase=False).stop(run_id, "race_stop")
+
+    result = lifecycle.complete_operator_grid_start(run_id)
+    final_status = DurableGridBotLifecycle(client, path, use_supabase=False).status()
+
+    assert result["run"]["status"] == GridStatus.STOPPED.value
+    assert final_status["active_run_id"] is None
+    assert client.open_orders(1699)["result"] == []
+    assert client.cancelled == ["100"]
+
+
 def test_duplicate_background_start_attaches_to_starting_run(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -989,6 +1030,33 @@ def test_inventory_from_fills_uses_signed_fill_ledger():
     assert inventory_from_fills([_fill("f1", "5", "buy"), _fill("f2", "5", "buy"), _fill("f3", "5", "sell")]) == Decimal("5")
 
 
+def test_deferred_replacement_without_exchange_id_does_not_become_unresolved():
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-deferred")
+    deferred = {
+        "order_key": "DGB01-truth-L003-S-Rdeferred",
+        "run_id": run["run_id"],
+        "level_id": "L003",
+        "side": "sell",
+        "price": "2505",
+        "requested_quantity": "1",
+        "filled_quantity": "0",
+        "remaining_quantity": "0",
+        "client_order_id": "DGB01-truth-L003-S-Rdeferred",
+        "exchange_order_id": "",
+        "status": "deferred",
+        "order_kind": "replacement",
+        "source_fill_id": "fill-deferred",
+    }
+    run["orders"][deferred["client_order_id"]] = deferred
+    run["deferred_orders"][deferred["client_order_id"]] = deferred
+
+    result = reconcile_exchange_truth(run, _TruthClient(position="1"))
+
+    assert result["unresolved_orders"] == 0
+    assert not [event for event in result["events"] if event["type"] == "ORDER_UNRESOLVED"]
+    assert run["orders"][deferred["client_order_id"]]["status"] == "deferred"
+
+
 def test_replacement_semantics_neutral_buy_to_adjacent_sell_and_idempotent(tmp_path):
     client = _FakeLifecycleClient()
     run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-buy")
@@ -1019,6 +1087,88 @@ def test_replacement_semantics_neutral_sell_to_adjacent_buy(tmp_path):
     assert replacement["level_id"] == "L002"
     assert replacement["side"] == "buy"
     assert replacement["source_fill_id"] == "fill-sell"
+
+
+def test_deferred_replacement_submits_when_post_only_becomes_eligible(tmp_path):
+    class MovingBookClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.best_bid = Decimal("2505")
+
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            return ProductSpec(**{**spec.__dict__, "best_bid": self.best_bid})
+
+    client = MovingBookClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-retry")
+
+    deferred = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    client.best_bid = Decimal("2499.95")
+    submitted = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+
+    assert deferred["deferred"] == 1
+    assert submitted["created"] == 1
+    assert replacement["status"] == "open"
+    assert replacement["exchange_order_id"]
+    assert replacement["client_order_id"] == client.orders[0]["client_order_id"]
+    assert run["deferred_orders"] == {}
+
+
+def test_stop_terminalizes_never_submitted_deferred_replacement_without_unresolved_noise(tmp_path):
+    class CrossingBookClient(_FakeLifecycleClient):
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            return ProductSpec(**{**spec.__dict__, "best_bid": Decimal("2505")})
+
+    client = CrossingBookClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-stop")
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    deferred_id = next(iter(run["deferred_orders"]))
+    state = {"runs": {run["run_id"]: run}, "active_run_id": run["run_id"], "events": []}
+    lifecycle._save(state)
+
+    stopped = lifecycle.stop(run["run_id"], "test_stop_deferred")
+    order = stopped["run"]["orders"][deferred_id]
+
+    assert result["deferred"] == 1
+    assert order["status"] == "abandoned_by_stop"
+    assert order["exchange_order_id"] == ""
+    assert not [event for event in stopped["run"].get("events", []) if event.get("event_type") == "ORDER_UNRESOLVED"]
+    assert client.cancelled == []
+
+
+def test_terminalized_deferred_replacement_does_not_reserve_inventory(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(grid_type="long_bias", source_level="L003", source_side="sell", fill_id="fill-terminal")
+    order = {
+        "client_order_id": "deferred-buy",
+        "order_key": "deferred-buy",
+        "level_id": "L002",
+        "side": "buy",
+        "requested_quantity": "1",
+        "remaining_quantity": "0",
+        "exchange_order_id": "",
+        "status": "abandoned_by_stop",
+        "opens_inventory": True,
+    }
+    run["orders"][order["client_order_id"]] = order
+
+    semantic = evaluate_order_semantics(
+        GridType.LONG_BIAS,
+        Decimal("0"),
+        Decimal("1"),
+        Side.BUY,
+        Decimal("1"),
+        lifecycle._open_order_records(run),
+    )
+
+    assert lifecycle._open_order_records(run) == []
+    assert semantic.allowed
+    assert semantic.projected_inventory == Decimal("1")
 
 
 def test_long_and_short_replacements_are_risk_reducing_and_restore_opening_opportunity(tmp_path):

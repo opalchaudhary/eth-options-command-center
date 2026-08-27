@@ -8,7 +8,7 @@ import storage
 from .models import new_id, utc_now
 
 
-ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSED", "REGRID_PENDING"}
+ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSED", "REGRID_PENDING", "STOPPING"}
 
 
 class SupabasePersistenceError(RuntimeError):

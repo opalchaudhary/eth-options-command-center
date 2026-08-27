@@ -19,10 +19,22 @@ from .semantics import evaluate_order_semantics, round_price_for_side, validate_
 from .supabase_repository import SupabaseGridRepository, SupabasePersistenceError
 
 
-ACTIVE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value}
+ACTIVE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value, GridStatus.STOPPING.value}
 GRIDBOT_ORDER_PREFIX = "DGB01-"
 DEFAULT_STATE_PATH = Path(os.getenv("GRIDBOT_V01_STATE_PATH", "grid_bot_state_v01.json"))
-START_TERMINAL_ORDER_STATUSES = {"cancelled", "closed", "filled", "not_open", "manual_cancelled"}
+START_TERMINAL_ORDER_STATUSES = {
+    "cancelled",
+    "closed",
+    "filled",
+    "not_open",
+    "manual_cancelled",
+    "deferred",
+    "blocked",
+    "abandoned_by_stop",
+    "cancelled_before_submission",
+    "superseded",
+}
+DEFERRED_ORDER_STATUSES = {"deferred", "blocked"}
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
 
@@ -461,6 +473,10 @@ class DurableGridBotLifecycle:
         self._set_start_stage(state, run, "PLACING_ORDERS")
         try:
             for level in run.get("levels") or []:
+                state = self._load()
+                run = state.get("runs", {}).get(run_id)
+                if not run or run.get("status") != GridStatus.STARTING.value:
+                    return {"ok": True, "run": deepcopy(run or {}), **self._startup_progress(run or {})}
                 existing = [
                     order
                     for order in run.get("orders", {}).values()
@@ -469,13 +485,29 @@ class DurableGridBotLifecycle:
                 if existing:
                     continue
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
-                self._place_proposal(run, product_id, proposal, "initial_grid")
+                created = self._place_proposal(run, product_id, proposal, "initial_grid")
+                latest_state = self._load()
+                latest_run = latest_state.get("runs", {}).get(run_id)
+                if not latest_run or latest_run.get("status") != GridStatus.STARTING.value:
+                    if created.get("status") not in START_TERMINAL_ORDER_STATUSES:
+                        self._cancel_order_safely(product_id, created)
+                    if latest_run:
+                        latest_run.setdefault("orders", {})[created["client_order_id"]] = created
+                        latest_run["startup"] = self._startup_progress(latest_run)
+                        self._save(latest_state)
+                    return {"ok": True, "run": deepcopy(latest_run or {}), **self._startup_progress(latest_run or {})}
                 run["startup"] = self._startup_progress(run, "PLACING_ORDERS")
                 self._save(state)
+            state = self._load()
+            run = state.get("runs", {}).get(run_id)
+            if not run or run.get("status") != GridStatus.STARTING.value:
+                return {"ok": True, "run": deepcopy(run or {}), **self._startup_progress(run or {})}
             self._set_start_stage(state, run, "VERIFYING_ORDERS")
             self.reconcile(run_id)
             state = self._load()
             run = state["runs"][run_id]
+            if run.get("status") != GridStatus.STARTING.value:
+                return {"ok": True, "run": deepcopy(run), **self._startup_progress(run)}
             self._set_start_stage(state, run, "RECONCILING")
             run["status"] = GridStatus.RUNNING.value
             run["start_stage"] = "RUNNING"
@@ -578,6 +610,30 @@ class DurableGridBotLifecycle:
             self.db.persist_order_proposal(run, proposal, order_kind, source_fill_id)
             self.db.persist_order(run, record)
         return record
+
+    def _terminalize_never_submitted_orders(self, run: dict, status: str = "abandoned_by_stop", reason: str = "run_stop_before_submission") -> int:
+        count = 0
+        now = utc_now()
+        candidates = list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
+        seen: set[str] = set()
+        for order in candidates:
+            client_order_id = str(order.get("client_order_id") or order.get("order_key") or "")
+            if not client_order_id or client_order_id in seen:
+                continue
+            seen.add(client_order_id)
+            order_status = str(order.get("status") or "").lower()
+            if order.get("exchange_order_id") or order_status not in DEFERRED_ORDER_STATUSES:
+                continue
+            order["status"] = status
+            order["remaining_quantity"] = "0"
+            order["terminal_reason"] = reason
+            order["cancelled_at"] = now
+            run.setdefault("orders", {})[client_order_id] = order
+            run.setdefault("deferred_orders", {})[client_order_id] = order
+            if self._db_enabled():
+                self.db.persist_order(run, order)
+            count += 1
+        return count
 
     def _open_order_records(self, run: dict) -> list[dict]:
         return [
@@ -807,7 +863,18 @@ class DurableGridBotLifecycle:
     ) -> dict | None:
         key = f"{fill_id}:replacement"
         if key in run.setdefault("replacement_keys", {}):
-            return {**run["replacement_keys"][key], "state": "existing", "source_fill_id": fill_id}
+            existing_key = run["replacement_keys"][key]
+            existing_client_order_id = existing_key.get("client_order_id")
+            existing_order = (run.get("orders") or {}).get(str(existing_client_order_id)) or (run.get("deferred_orders") or {}).get(str(existing_client_order_id))
+            if (
+                str(existing_key.get("state") or "").lower() in DEFERRED_ORDER_STATUSES
+                and existing_order
+                and not existing_order.get("exchange_order_id")
+                and str(existing_order.get("status") or "").lower() in DEFERRED_ORDER_STATUSES
+            ):
+                run["replacement_keys"].pop(key, None)
+            else:
+                return {**run["replacement_keys"][key], "state": "existing", "source_fill_id": fill_id}
         order = run["orders"].get(str(fill.get("client_order_id")))
         if not order:
             order = next((row for row in run.get("orders", {}).values() if str(row.get("exchange_order_id")) == str(fill.get("order_id"))), None)
@@ -830,6 +897,34 @@ class DurableGridBotLifecycle:
         client_order_id = _replacement_client_order_id(run["run_id"], target["level_id"], Side(target["side"]), source_fill_id)
         existing = run.get("orders", {}).get(client_order_id) or run.get("deferred_orders", {}).get(client_order_id)
         if existing:
+            existing_status = str(existing.get("status") or "").lower()
+            if existing_status in DEFERRED_ORDER_STATUSES and not existing.get("exchange_order_id"):
+                proposal = self._proposal_for_level(
+                    run["run_id"],
+                    target,
+                    int(run["sequence"]),
+                    quantity=_decimal(fill.get("size")),
+                    client_order_id=client_order_id,
+                )
+                run.setdefault("orders", {}).pop(client_order_id, None)
+                run.setdefault("deferred_orders", {}).pop(client_order_id, None)
+                created = self._place_proposal(
+                    run,
+                    product_id,
+                    proposal,
+                    "replacement",
+                    current_inventory=current_inventory,
+                    source_fill_id=source_fill_id,
+                )
+                state = "deferred" if created.get("status") == "deferred" else "created"
+                run["replacement_keys"][key] = {
+                    "client_order_id": created["client_order_id"],
+                    "exchange_order_id": created.get("exchange_order_id"),
+                    "state": created.get("status"),
+                    "source_fill_id": source_fill_id,
+                    "created_at": utc_now(),
+                }
+                return {"state": state, "source_fill_id": source_fill_id, "client_order_id": created["client_order_id"], "level_id": target["level_id"]}
             run["replacement_keys"][key] = {
                 "client_order_id": client_order_id,
                 "exchange_order_id": existing.get("exchange_order_id"),
@@ -955,9 +1050,15 @@ class DurableGridBotLifecycle:
         if not run:
             raise RuntimeError("No active durable DeltaGridBot run found.")
         product_id = int(run["product"]["product_id"])
+        if run.get("status") == GridStatus.STARTING.value:
+            run["status"] = GridStatus.STOPPING.value
+            run["start_stage"] = "STOPPING"
+            run["startup"] = self._startup_progress(run, "STOPPING")
+            self._save(state)
         for order in run.get("orders", {}).values():
             if order.get("status") not in START_TERMINAL_ORDER_STATUSES:
                 self._cancel_order_safely(product_id, order)
+        self._terminalize_never_submitted_orders(run)
         self._save(state)
         self.reconcile(run["run_id"])
         state = self._load()

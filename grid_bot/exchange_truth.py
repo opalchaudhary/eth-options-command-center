@@ -9,7 +9,20 @@ from .models import GridType, Side, utc_now
 
 
 GRIDBOT_ORDER_PREFIX = "DGB01-"
-TERMINAL_STATES = {"FILLED", "CANCELLED", "MANUAL_CANCELLED", "REJECTED", "UNKNOWN", "UNRESOLVED"}
+TERMINAL_STATES = {
+    "FILLED",
+    "CANCELLED",
+    "MANUAL_CANCELLED",
+    "REJECTED",
+    "UNKNOWN",
+    "UNRESOLVED",
+    "DEFERRED",
+    "BLOCKED",
+    "ABANDONED_BY_STOP",
+    "CANCELLED_BEFORE_SUBMISSION",
+    "SUPERSEDED",
+    "NOT_SUBMITTED",
+}
 
 
 @dataclass
@@ -244,6 +257,8 @@ def reconcile_exchange_truth(
 
     result.orders_checked = len(orders)
     for cid, order in orders.items():
+        if not order.get("exchange_order_id") and str(order.get("status") or "").upper() in TERMINAL_STATES:
+            continue
         if str(order.get("status") or "").upper() in TERMINAL_STATES and order.get("status") != "open":
             continue
         exchange = open_by_client.get(cid)
