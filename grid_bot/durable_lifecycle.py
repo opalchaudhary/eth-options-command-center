@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DEFAULT_RISK_THRESHOLDS, GRIDBOT_VERSION
+from .account_telemetry import AccountTelemetryCache
 from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .exchange_truth import reconcile_exchange_truth
@@ -138,6 +139,7 @@ class DurableGridBotLifecycle:
             use_supabase = not pytest_running and os.getenv("GRIDBOT_V01_SUPABASE_ENABLED", "1") != "0"
         self.db = db or (SupabaseGridRepository() if use_supabase else None)
         self._save_lock = threading.Lock()
+        self.account_telemetry = AccountTelemetryCache(client=self.client)
 
     def _db_enabled(self) -> bool:
         return bool(self.db and self.db.enabled)
@@ -221,31 +223,12 @@ class DurableGridBotLifecycle:
         self._save(state)
 
     def product_account_health(self, product_symbol: str = "ETHUSD") -> dict:
+        telemetry = self.account_telemetry.get(product_symbol)
         spec = self.client.product_spec(product_symbol)
-        bid = spec.best_bid or spec.mark_price
-        ask = spec.best_ask or spec.mark_price
+        bid = spec.best_bid or telemetry.mark_price or spec.mark_price
+        ask = spec.best_ask or telemetry.mark_price or spec.mark_price
         reference = quantize_price((bid + ask) / Decimal("2"), spec.tick_size)
-        position = _position_size(self.client, spec.product_id)
-        open_gridbot_orders = len(_gridbot_orders(_result_rows(self.client.open_orders(spec.product_id))))
-        margin_payload = self.client.account_margin()
-        margin_result = margin_payload.get("result") if isinstance(margin_payload.get("result"), dict) else margin_payload
-        account_equity = _first_number(
-            margin_result,
-            ["account_equity", "equity", "net_equity", "balance", "portfolio_value", "collateral"],
-        )
-        available_margin = _first_number(
-            margin_result,
-            ["available_margin", "available_balance", "free_margin", "available_collateral"],
-        )
-        margin_used = _first_number(
-            margin_result,
-            ["margin_used", "used_margin", "blocked_margin", "initial_margin", "total_margin"],
-        )
-        margin_utilisation = None
-        if account_equity and margin_used is not None and account_equity > 0:
-            margin_utilisation = margin_used / account_equity
-        elif account_equity and available_margin is not None and account_equity > 0:
-            margin_utilisation = max(Decimal("0"), (account_equity - available_margin) / account_equity)
+        margin_utilisation = telemetry.margin_utilisation_pct / Decimal("100") if telemetry.margin_utilisation_pct is not None else None
         return {
             "ok": True,
             "product": to_record_dict(spec),
@@ -257,15 +240,23 @@ class DurableGridBotLifecycle:
                 "updated_at": utc_now(),
             },
             "account": {
-                "account_equity": str(account_equity) if account_equity is not None else None,
-                "available_margin": str(available_margin) if available_margin is not None else None,
-                "margin_used": str(margin_used) if margin_used is not None else None,
+                "account_equity": str(telemetry.account_equity) if telemetry.account_equity is not None else None,
+                "available_margin": str(telemetry.available_margin) if telemetry.available_margin is not None else None,
+                "margin_used": str(telemetry.used_margin) if telemetry.used_margin is not None else None,
                 "margin_utilisation": str(margin_utilisation) if margin_utilisation is not None else None,
-                "current_position": str(position),
-                "open_gridbot_orders": open_gridbot_orders,
-                "portfolio_greeks": {"delta": None, "gamma": None, "vega": None, "theta": None},
-                "raw_available": bool(margin_payload.get("success", True)),
+                "current_position": str(telemetry.position_lots) if telemetry.position_lots is not None else None,
+                "open_gridbot_orders": telemetry.open_order_count,
+                "portfolio_greeks": {
+                    "delta": str(telemetry.portfolio_delta) if telemetry.portfolio_delta is not None else None,
+                    "gamma": str(telemetry.portfolio_gamma) if telemetry.portfolio_gamma is not None else None,
+                    "vega": str(telemetry.portfolio_vega) if telemetry.portfolio_vega is not None else None,
+                    "theta": str(telemetry.portfolio_theta) if telemetry.portfolio_theta is not None else None,
+                },
+                "raw_available": telemetry.telemetry_status != "UNAVAILABLE",
+                "telemetry_status": telemetry.telemetry_status,
+                "unavailable_fields": telemetry.unavailable_fields,
             },
+            "account_risk_state": telemetry.as_dict(),
         }
 
     def _config_from_operator_payload(self, payload: dict, spec, reference: Decimal, health: dict) -> GridConfig:

@@ -95,21 +95,61 @@ GRR is an experimental V0.1 telemetry metric, not an optimality claim.
 
 Risk states are `GREEN`, `YELLOW`, `ORANGE`, `RED`, and `CRITICAL`. RED/CRITICAL block new risk-increasing activity in the V0.1 controller. No automatic market liquidation is performed.
 
+## Account Telemetry V0.1
+
+Prompt 4 audited the Delta India Demo/Testnet endpoints supported by `grid_bot/delta_testnet_client.py` for GridBot credentials.
+
+Read-only endpoint capability:
+
+| Metric | Source | Status |
+| --- | --- | --- |
+| Account Equity | `/wallet/balances` `meta.net_equity` | DIRECT |
+| Wallet Balance | `/wallet/balances` USD `balance` | DIRECT |
+| Available Margin | `/wallet/balances` USD `available_balance` | DIRECT |
+| Used/Blocked Margin | `/wallet/balances` USD `blocked_margin`, `order_margin`, `position_margin` | DIRECT/DERIVED |
+| Margin Utilisation % | `used_margin / account_equity * 100` when both are USD values | DERIVED |
+| Initial Margin | `/products` exposes product-level `initial_margin`, not current account requirement | AMBIGUOUS |
+| Maintenance Margin | `/products` exposes product-level `maintenance_margin`, not current account requirement | AMBIGUOUS |
+| ETHUSD Position Lots | `/positions` `size`; successful empty list means flat | DIRECT |
+| Position Side | sign of ETHUSD `size` | DERIVED |
+| Base Quantity | `lots * contract_multiplier` | DERIVED |
+| Mark Price | `/tickers/ETHUSD` `mark_price` | DIRECT |
+| Position Notional | `abs(base_quantity) * mark_price` | DERIVED |
+| Average Entry Price | `/positions` entry/average price fields when a position row exists | DIRECT WHEN PRESENT |
+| Unrealized P&L | `/positions` unrealized P&L fields when present | DIRECT WHEN PRESENT |
+| Realized P&L | `/positions` realized P&L fields when present | DIRECT WHEN PRESENT |
+| Liquidation Price | `/positions` liquidation price fields when present | DIRECT WHEN PRESENT |
+| Open Order Exposure | `/orders` unfilled lots by side times contract multiplier and order/mark price | DERIVED |
+| Margin Mode | `/profile` returned 401; wallet `portfolio_margin` is not treated as account mode | UNAVAILABLE |
+| Leverage | ticker/product expose leverage/default leverage, not an account setting | AMBIGUOUS |
+| Portfolio Delta/Gamma/Vega/Theta | no GridBot Testnet account greek endpoint; futures base exposure is reported separately | UNAVAILABLE |
+
+Units:
+
+- wallet/equity/margin fields are USD for the USD wallet row
+- ETHUSD `size` is lots/contracts
+- ETH-equivalent base exposure is `lots * contract_multiplier`
+- notional exposure is USD: `ETH-equivalent exposure * mark/order price`
+- margin utilisation is exposed as percent in normalized telemetry and as a decimal ratio in the legacy dashboard compatibility field
+
+Normalized telemetry is exposed as `AccountRiskState` through `/api/grid/v01/live/market-account` and `/api/grid/v01/live/state`. Unknown values remain `null`; actual zero values remain `0`.
+
+Telemetry health states:
+
+- `HEALTHY`: account, position, order, and market critical reads are fresh; missing Greeks alone do not make the state unsafe.
+- `DEGRADED`: non-critical data, or account data, is unavailable/stale while position/order/market safety data remains fresh.
+- `STALE`: critical position/order/market sync age exceeds the configured threshold.
+- `UNAVAILABLE`: critical position/order/market telemetry has never been fetched or failed.
+
+Risk-increasing telemetry gates should fail closed on `STALE` or `UNAVAILABLE` critical telemetry, unknown position, or unknown account equity. Risk-reducing actions may remain available when exchange position and open-order state are known.
+
 ## Account-Health GRR V0.1a
 
-The operator-facing dashboard no longer asks for manual allocated capital or risk capital buckets. Preview uses exchange/product metadata and the current account response where available.
-
-Dashboard GRR v0.1a:
+Dashboard GRR v0.1a remains a coarse V0.1 operator-health metric:
 
 `projected_grid_exposure / account_equity`
 
-Where:
-
-- `projected_grid_exposure = (max potential long inventory + max potential short inventory) * reference ETH price * contract multiplier`
-- `reference ETH price` is derived from current Delta bid/ask and rounded to tick size
-- `account_equity` is read from Delta account/profile fields when available
-
-If account equity is unavailable, the dashboard shows `UNKNOWN` and treats the exposure estimate as informational. This is a transparent V0.1 operator-health metric, not an optimal portfolio margin model.
+Both numerator and denominator are USD notional/account values. If account equity is unavailable or zero, GRR is `UNKNOWN`; it is not converted to zero or an arbitrary large value. This is not an optimal portfolio-margin model and should not be interpreted as liquidation risk.
 
 ## Accounting
 

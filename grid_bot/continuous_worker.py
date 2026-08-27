@@ -8,6 +8,7 @@ from copy import deepcopy
 from decimal import Decimal
 from typing import Any
 
+from .account_telemetry import AccountTelemetryCache, account_telemetry_cache
 from .delta_testnet_client import DeltaTestnetClient
 from .durable_lifecycle import DurableGridBotLifecycle
 from .exchange_truth import reconcile_exchange_truth
@@ -21,6 +22,7 @@ EXECUTABLE_STATUSES = {GridStatus.RUNNING.value}
 POLL_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_POLL_SECONDS", "2"))
 SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS", "300"))
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
+ACCOUNT_TELEMETRY_SECONDS = float(os.getenv("GRIDBOT_V01_ACCOUNT_TELEMETRY_SECONDS", "30"))
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -45,6 +47,7 @@ class ContinuousGridBotWorker:
         self.poll_interval_seconds = poll_interval_seconds
         self.snapshot_interval_seconds = snapshot_interval_seconds
         self.active_run_refresh_seconds = ACTIVE_RUN_REFRESH_SECONDS
+        self.account_telemetry = AccountTelemetryCache(client=self.client, refresh_interval_seconds=ACCOUNT_TELEMETRY_SECONDS)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -61,6 +64,7 @@ class ContinuousGridBotWorker:
             "poll_interval_seconds": self.poll_interval_seconds,
             "snapshot_interval_seconds": self.snapshot_interval_seconds,
             "active_run_refresh_seconds": self.active_run_refresh_seconds,
+            "account_telemetry_refresh_seconds": ACCOUNT_TELEMETRY_SECONDS,
             "poll_count": 0,
             "successful_polls": 0,
             "rest_errors": 0,
@@ -90,6 +94,9 @@ class ContinuousGridBotWorker:
                 "idle_heartbeat_rows": "none",
             },
             "supabase_request_counts": {},
+            "account_risk_state": None,
+            "account_telemetry_refresh_count": 0,
+            "delta_account_telemetry_request_counts": {},
         }
 
     def start(self) -> dict:
@@ -140,6 +147,9 @@ class ContinuousGridBotWorker:
             state["thread_alive"] = bool(self._thread and self._thread.is_alive())
             if hasattr(self.db, "stats"):
                 state["supabase_request_counts"] = self.db.stats()
+            cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
+            if cached:
+                state["account_risk_state"] = cached
             return state
 
     def ensure_active_worker(self) -> dict:
@@ -248,6 +258,9 @@ class ContinuousGridBotWorker:
     def _poll_once(self, run: dict) -> dict:
         before_fills = set((run.get("fills") or {}).keys())
         result = reconcile_exchange_truth(run, self.client, self.db if self.db.enabled else None, persist_order_updates=False)
+        before_telemetry_counts = dict(self.account_telemetry.request_counts)
+        telemetry = self.account_telemetry.get("ETHUSD")
+        telemetry_refreshed = dict(self.account_telemetry.request_counts) != before_telemetry_counts
         replacement_result = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled).process_replacements(run, result)
         new_fill_ids = [fill_id for fill_id in (run.get("fills") or {}) if fill_id not in before_fills]
         if new_fill_ids:
@@ -272,6 +285,11 @@ class ContinuousGridBotWorker:
             self.db.persist_snapshot(run, risk, run.get("summary"))
             self._last_snapshot_monotonic = time.monotonic()
             self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
+        self._set_state(
+            account_risk_state=telemetry.as_dict(),
+            account_telemetry_refresh_count=self._state["account_telemetry_refresh_count"] + (1 if telemetry_refreshed else 0),
+            delta_account_telemetry_request_counts=dict(self.account_telemetry.request_counts),
+        )
         with self._lock:
             self._run = run
         return result
@@ -289,4 +307,10 @@ def stop_continuous_gridbot_worker() -> dict:
 
 
 def gridbot_live_state() -> dict:
-    return worker.state()
+    state = worker.state()
+    if not state.get("account_risk_state"):
+        try:
+            state["account_risk_state"] = account_telemetry_cache.get("ETHUSD").as_dict()
+        except Exception as exc:
+            state["account_risk_state_error"] = str(exc)[:300]
+    return state
