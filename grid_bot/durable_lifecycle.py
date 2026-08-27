@@ -12,6 +12,7 @@ from typing import Any
 from .config import DEFAULT_RISK_THRESHOLDS, GRIDBOT_VERSION
 from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
+from .exchange_truth import reconcile_exchange_truth
 from .grid_builder import build_grid_levels, preview_grid, quantize_price
 from .models import GridConfig, GridStatus, GridType, OrderProposal, Side, SpacingType, new_id, to_record_dict, utc_now
 from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
@@ -684,51 +685,31 @@ class DurableGridBotLifecycle:
         run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
         if not run:
             raise RuntimeError("No durable DeltaGridBot run found.")
-        product_id = int(run["product"]["product_id"])
-        open_rows = _result_rows(self.client.open_orders(product_id))
-        open_by_client_id = {str(row.get("client_order_id")): row for row in _gridbot_orders(open_rows)}
-        for client_order_id, order in run.get("orders", {}).items():
-            exchange = open_by_client_id.get(client_order_id)
-            if exchange:
-                order["status"] = exchange.get("state") or "open"
-                order["remaining_quantity"] = str(_decimal(exchange.get("unfilled_size"), order.get("remaining_quantity", "0")))
-                order["raw"] = exchange
-            elif order.get("status") not in START_TERMINAL_ORDER_STATUSES:
-                order["status"] = "manual_cancelled"
-                order["cancelled_at"] = utc_now()
-                order["rejection_reason"] = "Order no longer open on exchange during reconciliation; treated as external/manual cancellation."
-
-        start_us = int((time.time() - 24 * 60 * 60) * 1_000_000)
-        fills = _result_rows(self.client.fills(product_id, start_time=start_us, page_size=50))
-        new_fill_count = 0
-        for fill in fills:
-            client_order_id = str(fill.get("client_order_id") or "")
-            if client_order_id not in run.get("orders", {}):
-                continue
-            fill_id = _fill_id(fill)
-            if fill_id in run.setdefault("fills", {}):
-                continue
-            run["fills"][fill_id] = fill
-            if self._db_enabled():
-                self.db.persist_fill(run, fill_id, fill)
-            new_fill_count += 1
-            order = run["orders"][client_order_id]
-            order["filled_quantity"] = str(_decimal(order.get("filled_quantity")) + _decimal(fill.get("size")))
-            order["remaining_quantity"] = str(max(Decimal("0"), _decimal(order.get("requested_quantity")) - _decimal(order.get("filled_quantity"))))
-            if _decimal(order["remaining_quantity"]) == 0:
-                order["status"] = "filled"
-            self._place_replacement_for_fill(run, fill, product_id, fill_id)
-
-        position = _position_size(self.client, product_id)
-        margin = self.client.account_margin()
-        risk = {"created_at": utc_now(), "position": str(position), "margin_success": bool(margin.get("success")), "open_gridbot_orders": len(open_by_client_id)}
+        result = reconcile_exchange_truth(run, self.client, self.db if self._db_enabled() else None, suppress_replacements=True)
+        risk = {
+            "created_at": utc_now(),
+            "position": result.get("delta_position"),
+            "gridbot_inventory": result.get("gridbot_inventory"),
+            "open_gridbot_orders": result.get("exchange_open_orders"),
+            "position_mismatches": result.get("position_mismatches"),
+            "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
+            "reconciliation": result,
+        }
         run.setdefault("risk_snapshots", []).append(risk)
-        run["last_reconciled_at"] = utc_now()
-        self._event(state, run["run_id"], "REST_RECONCILED", {"new_fills": new_fill_count, "position": str(position)})
+        for event in result.get("events", []):
+            self._event(state, run["run_id"], event["event_type"], event.get("payload") or {})
+        self._event(state, run["run_id"], "REST_RECONCILED", result)
         if self._db_enabled():
             self.db.persist_snapshot(run, risk, run.get("summary"))
         self._save(state)
-        return {"ok": True, "run": deepcopy(run), "new_fills": new_fill_count, "position": str(position), "open_gridbot_orders": len(open_by_client_id)}
+        return {
+            "ok": not result.get("errors"),
+            "run": deepcopy(run),
+            "new_fills": result.get("new_fills"),
+            "position": result.get("delta_position"),
+            "open_gridbot_orders": result.get("exchange_open_orders"),
+            "reconciliation": result,
+        }
 
     def _place_replacement_for_fill(self, run: dict, fill: dict, product_id: int, fill_id: str) -> None:
         key = f"{fill_id}:replacement"

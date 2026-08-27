@@ -9,6 +9,7 @@ from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
 from grid_bot.engine import DeltaGridBotEngine
 from grid_bot.execution import make_client_order_id
+from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
 from grid_bot.grid_builder import build_grid_levels, generate_prices
 from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType
 from grid_bot.reconciliation import reconcile_orders
@@ -467,6 +468,9 @@ class _FakeLifecycleClient:
     def open_orders(self, product_id=None):
         return {"success": True, "result": [row for row in self.orders if row["state"] == "open"]}
 
+    def order_history(self, product_id=None, start_time=None, end_time=None, after=None, page_size=50):
+        return {"success": True, "result": [row for row in self.orders if row["state"] != "open"]}
+
     def fills(self, product_id, start_time=None, page_size=50, **_kwargs):
         return {"success": True, "result": self.fill_rows}
 
@@ -524,9 +528,7 @@ def test_durable_lifecycle_fill_dedupe_places_one_replacement_for_partial_fill(t
     assert first["new_fills"] == 1
     assert second["new_fills"] == 0
     assert replacement_orders == []
-    assert len(deferred_replacements) == 1
-    assert deferred_replacements[0]["requested_quantity"] == "0.5"
-    assert "POST_ONLY_SELL_WOULD_CROSS_BID" in deferred_replacements[0]["rejection_reason"]
+    assert deferred_replacements == []
 
 
 def test_durable_lifecycle_pause_resume_regrid_stop_summary(tmp_path):
@@ -749,6 +751,182 @@ def test_manual_exchange_cancellation_reconciliation_marks_orders_terminal(tmp_p
     assert {order["status"] for order in reconciled["run"]["orders"].values()} == {"manual_cancelled"}
     stopped = lifecycle.stop(run_id, "manual_exchange_cancel_reconciled")
     assert stopped["summary"]["stray_gridbot_orders"] == 0
+
+
+def _truth_run(grid_type="neutral", quantity="5", status="open"):
+    return {
+        "run_id": "run_truth",
+        "bot_id": "bot_truth",
+        "config": {
+            "bot_id": "bot_truth",
+            "config_version": 3,
+            "grid_type": grid_type,
+            "product_symbol": "ETHUSD",
+            "max_inventory_lots": "50",
+        },
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
+        "orders": {
+            "DGB01-truth-L001-B-1": {
+                "order_key": "DGB01-truth-L001-B-1",
+                "run_id": "run_truth",
+                "level_id": "L001",
+                "side": "buy",
+                "price": "2400",
+                "requested_quantity": quantity,
+                "filled_quantity": "0",
+                "remaining_quantity": quantity,
+                "client_order_id": "DGB01-truth-L001-B-1",
+                "exchange_order_id": "ex-1",
+                "status": status,
+                "order_kind": "initial_grid",
+                "config_version": 3,
+            }
+        },
+        "fills": {},
+        "risk_snapshots": [],
+    }
+
+
+class _TruthClient:
+    def __init__(self, open_orders=None, order_pages=None, fill_pages=None, position="0"):
+        self._open_orders = open_orders or []
+        self._order_pages = order_pages if order_pages is not None else [[]]
+        self._fill_pages = fill_pages if fill_pages is not None else [[]]
+        self._position = position
+
+    def open_orders(self, product_id=None):
+        return {"success": True, "result": self._open_orders}
+
+    def order_history(self, product_id=None, start_time=None, end_time=None, after=None, page_size=50):
+        index = int(after or 0)
+        next_after = str(index + 1) if index + 1 < len(self._order_pages) else None
+        return {"success": True, "result": self._order_pages[index], "meta": {"after": next_after}}
+
+    def fills(self, product_id=None, start_time=None, end_time=None, after=None, page_size=50):
+        index = int(after or 0)
+        next_after = str(index + 1) if index + 1 < len(self._fill_pages) else None
+        return {"success": True, "result": self._fill_pages[index], "meta": {"after": next_after}}
+
+    def positions(self, underlying_asset_symbol="ETH"):
+        return {"success": True, "result": [{"product_id": 1699, "symbol": "ETHUSD", "size": self._position}]}
+
+
+def _open_exchange_order(unfilled="5", state="open"):
+    return {
+        "id": "ex-1",
+        "client_order_id": "DGB01-truth-L001-B-1",
+        "side": "buy",
+        "size": "5",
+        "unfilled_size": unfilled,
+        "limit_price": "2400",
+        "state": state,
+    }
+
+
+def _fill(fill_id="fill-1", size="5", side="buy", price="2400", order_id="ex-1"):
+    return {
+        "id": fill_id,
+        "order_id": order_id,
+        "client_order_id": "DGB01-truth-L001-B-1",
+        "side": side,
+        "price": price,
+        "size": size,
+        "created_at": "1800000000000000",
+        "commission": "0",
+    }
+
+
+def test_exchange_truth_open_order_remains_open():
+    run = _truth_run()
+    result = reconcile_exchange_truth(run, _TruthClient(open_orders=[_open_exchange_order()], position="0"))
+    assert result["new_fills"] == 0
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "open"
+    assert result["unresolved_orders"] == 0
+
+
+def test_exchange_truth_full_fill_is_persisted_once_with_config_attribution():
+    run = _truth_run()
+    client = _TruthClient(order_pages=[[{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "filled"}]], fill_pages=[[_fill()]], position="5")
+    first = reconcile_exchange_truth(run, client)
+    second = reconcile_exchange_truth(run, client)
+    third = reconcile_exchange_truth(run, client)
+    assert first["new_fills"] == 1
+    assert second["new_fills"] == 0
+    assert third["new_fills"] == 0
+    assert len(run["fills"]) == 1
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "filled"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["remaining_quantity"] == "0"
+    assert first["gridbot_inventory"] == "5"
+    assert first["position_mismatches"] == 0
+
+
+def test_exchange_truth_partial_and_multiple_partial_fills():
+    run = _truth_run(quantity="10")
+    client = _TruthClient(open_orders=[_open_exchange_order(unfilled="5")], fill_pages=[[_fill("fill-1", "3"), _fill("fill-2", "2")]], position="5")
+    result = reconcile_exchange_truth(run, client)
+    assert result["new_fills"] == 2
+    assert result["partial_fills"] == 1
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "partially_filled"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["filled_quantity"] == "5"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["remaining_quantity"] == "5"
+
+
+def test_exchange_truth_partial_then_cancel_preserves_fill():
+    run = _truth_run(quantity="10")
+    history = [{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "cancelled"}]
+    result = reconcile_exchange_truth(run, _TruthClient(order_pages=[history], fill_pages=[[_fill("fill-1", "4")]], position="4"))
+    assert result["new_fills"] == 1
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "cancelled"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["filled_quantity"] == "4"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["remaining_quantity"] == "6"
+
+
+def test_exchange_truth_manual_cancel_no_fill_and_disappeared_unresolved():
+    run = _truth_run()
+    history = [{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "cancelled"}]
+    cancelled = reconcile_exchange_truth(run, _TruthClient(order_pages=[history], position="0"))
+    assert cancelled["new_fills"] == 0
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "manual_cancelled"
+
+    unresolved_run = _truth_run()
+    unresolved = reconcile_exchange_truth(unresolved_run, _TruthClient(position="0"))
+    assert unresolved_run["orders"]["DGB01-truth-L001-B-1"]["status"] == "unresolved"
+    assert unresolved["manual_cancelled_orders"] == 0
+    assert unresolved["unresolved_orders"] == 1
+
+
+def test_exchange_truth_position_and_fill_ledger_mismatches():
+    run = _truth_run()
+    position_mismatch = reconcile_exchange_truth(run, _TruthClient(fill_pages=[[_fill()]], position="10"))
+    assert position_mismatch["position_mismatches"] == 1
+    assert any(event["event_type"] == "POSITION_MISMATCH" for event in position_mismatch["events"])
+
+    bad_run = _truth_run()
+    bad = reconcile_exchange_truth(bad_run, _TruthClient(fill_pages=[[_fill("fill-big", "10")]], position="10"))
+    assert bad["fill_ledger_mismatches"] == 1
+    assert any(event["event_type"] == "FILL_LEDGER_MISMATCH" for event in bad["events"])
+
+
+def test_exchange_truth_grid_nature_sign_violations():
+    long_run = _truth_run(grid_type="long_bias")
+    long_result = reconcile_exchange_truth(long_run, _TruthClient(fill_pages=[[_fill(side="sell")]], position="-5"))
+    assert any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in long_result["events"])
+
+    short_run = _truth_run(grid_type="short_bias")
+    short_result = reconcile_exchange_truth(short_run, _TruthClient(fill_pages=[[_fill(side="buy")]], position="5"))
+    assert any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in short_result["events"])
+
+
+def test_exchange_truth_discovers_fill_on_later_page_once():
+    run = _truth_run()
+    client = _TruthClient(fill_pages=[[], [_fill()]], order_pages=[[], [{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "filled"}]], position="5")
+    result = reconcile_exchange_truth(run, client)
+    assert result["new_fills"] == 1
+    assert len(run["fills"]) == 1
+
+
+def test_inventory_from_fills_uses_signed_fill_ledger():
+    assert inventory_from_fills([_fill("f1", "5", "buy"), _fill("f2", "5", "buy"), _fill("f3", "5", "sell")]) == Decimal("5")
 
 
 class _MemorySupabaseGridRepository(SupabaseGridRepository):

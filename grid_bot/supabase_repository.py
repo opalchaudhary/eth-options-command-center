@@ -292,7 +292,12 @@ class SupabaseGridRepository:
 
     def persist_fill(self, run: dict, fill_id: str, fill: dict) -> bool:
         client_order_id = str(fill.get("client_order_id") or "")
-        order = (run.get("orders") or {}).get(client_order_id) or {}
+        orders = run.get("orders") or {}
+        exchange_order_id = str(fill.get("order_id") or fill.get("exchange_order_id") or "")
+        order = orders.get(client_order_id) or next(
+            (row for row in orders.values() if str(row.get("exchange_order_id") or "") == exchange_order_id),
+            {},
+        )
         price = fill.get("price") or fill.get("fill_price") or order.get("price")
         quantity = fill.get("size") or fill.get("quantity")
         exchange_fill_id = str(fill.get("id") or fill_id)
@@ -311,7 +316,7 @@ class SupabaseGridRepository:
                 "price": price,
                 "quantity": quantity,
                 "notional": None,
-                "liquidity_role": fill.get("liquidity") or fill.get("liquidity_role") or "unknown",
+                "liquidity_role": fill.get("role") or fill.get("liquidity") or fill.get("liquidity_role") or "unknown",
                 "fee": fill.get("commission") or fill.get("fee") or "0",
                 "exchange_fee": fill.get("commission") or fill.get("fee") or "0",
                 "exchange_timestamp": exchange_timestamp,

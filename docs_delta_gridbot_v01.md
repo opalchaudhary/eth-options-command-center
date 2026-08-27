@@ -136,3 +136,19 @@ When authenticated REST and public WebSocket are healthy but private WebSocket i
 REST fallback polling reconciles open orders, recent fills, current ETHUSD position, and account/margin state. Fills use Delta exchange fill IDs as an idempotency barrier. Each poll uses an overlapping lookback from the last confirmed fill timestamp plus fill ID deduplication, so repeated fills across polls or restarts are ignored.
 
 Private WebSocket remains the preferred account-event transport. REST fallback is being validated in V0.1 as a resilience/degraded-mode path.
+
+## Exchange Truth Reconciliation
+
+Durable reconciliation uses exchange truth in this order: current open orders,
+bounded/paginated order history, bounded/paginated fills, then current ETHUSD
+position. A GridBot fill is attributed only through a persisted GridBot order by
+`client_order_id` or exchange `order_id`; ETHUSD symbol or nearby timestamps are
+not enough. Missing fills are persisted before terminal order state is assigned,
+so an order absent from open orders is not treated as manually cancelled unless
+order-history evidence supports cancellation.
+
+Fill-derived GridBot inventory is computed from persisted fills with BUY as
+positive and SELL as negative, then compared with the observed Delta ETHUSD
+position. Any unexplained difference is reported as `POSITION_MISMATCH`. The
+query pattern is active-run and relevant-order scoped; reconciliation does not
+download all historical GridBot rows.
