@@ -172,7 +172,40 @@ class SupabaseGridRepository:
         )
         return bool(rows)
 
+    def retire_unlocked_active_run_rows(self, retain_run_id: str | None = None) -> int:
+        locks = self.select(
+            "grid_active_run_locks",
+            {"select": "run_id", "lock_name": "eq.gridbot_v01_active_run", "limit": 1},
+        )
+        locked_run_id = str(locks[0].get("run_id")) if locks and locks[0].get("run_id") else None
+        rows = self.select(
+            "grid_runs",
+            {
+                "select": "run_id,status",
+                "status": f"in.({','.join(sorted(ACTIVE_STATUSES))})",
+                "order": "started_at.desc",
+            },
+        )
+        retired = 0
+        for row in rows:
+            row_run_id = str(row.get("run_id") or "")
+            if not row_run_id or row_run_id in {locked_run_id, retain_run_id}:
+                continue
+            self.patch(
+                "grid_runs",
+                {"run_id": row_run_id},
+                {
+                    "status": "STOPPED",
+                    "stop_reason": "stale_active_lock_recovery",
+                    "stopped_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+            )
+            retired += 1
+        return retired
+
     def acquire_active_run_guard(self, run_id: str) -> None:
+        self.retire_unlocked_active_run_rows(retain_run_id=run_id)
         self.insert_once(
             "grid_active_run_locks",
             {"lock_name": "gridbot_v01_active_run", "run_id": run_id, "created_at": utc_now()},
@@ -185,6 +218,7 @@ class SupabaseGridRepository:
         locked_run_id = rows[0].get("run_id") if rows else None
         if locked_run_id != run_id and not self._locked_run_is_active(locked_run_id):
             self.release_active_run_guard(str(locked_run_id))
+            self.retire_unlocked_active_run_rows(retain_run_id=run_id)
             self.insert_once(
                 "grid_active_run_locks",
                 {"lock_name": "gridbot_v01_active_run", "run_id": run_id, "created_at": utc_now()},

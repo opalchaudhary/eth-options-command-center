@@ -1811,6 +1811,25 @@ def test_supabase_acquire_active_run_retires_stale_lock():
     assert locks[0]["run_id"] == "fresh-run"
 
 
+def test_supabase_acquire_active_run_retires_unlocked_active_status_rows():
+    db = _MemorySupabaseGridRepository()
+    db.tables["grid_runs"] = {
+        ("stale-paused",): {
+            "run_id": "stale-paused",
+            "bot_id": "bot-stale",
+            "status": "PAUSED",
+            "config_version": 1,
+            "started_at": "2026-08-28T00:00:00+00:00",
+        }
+    }
+
+    db.acquire_active_run_guard("fresh-run")
+
+    assert db.tables["grid_runs"][("stale-paused",)]["status"] == "STOPPED"
+    assert db.tables["grid_runs"][("stale-paused",)]["stop_reason"] == "stale_active_lock_recovery"
+    assert db.select("grid_active_run_locks")[0]["run_id"] == "fresh-run"
+
+
 def test_supabase_lifecycle_ignores_stale_json_when_no_active_lock(tmp_path):
     path = tmp_path / "grid_state.json"
     path.write_text(
