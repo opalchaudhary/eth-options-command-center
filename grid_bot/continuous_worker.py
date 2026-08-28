@@ -224,7 +224,12 @@ class ContinuousGridBotWorker:
             with self._lock:
                 self._run = None
             return None
-        if run and active.get("run_id") == run.get("run_id") and active.get("status") in EXECUTABLE_STATUSES:
+        if (
+            run
+            and active.get("run_id") == run.get("run_id")
+            and active.get("status") == run.get("status")
+            and active.get("status") in EXECUTABLE_STATUSES
+        ):
             return run
         return self._recover_active_run()
 
