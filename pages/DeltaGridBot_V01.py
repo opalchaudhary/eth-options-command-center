@@ -188,6 +188,15 @@ def status_class(status: str) -> str:
     return "warn"
 
 
+def lifecycle_label(live: dict) -> str:
+    lifecycle = live.get("lifecycle_state")
+    if lifecycle:
+        return human_lifecycle(lifecycle)
+    if live.get("run_id"):
+        return "Active"
+    return "No active grid"
+
+
 def refresh_history() -> None:
     st.session_state["gridbot_history_runs"] = safe_get("/api/grid/v01/history/grid_runs", {"limit": 25}).get("rows") or []
     st.session_state["gridbot_history_summaries"] = safe_get("/api/grid/v01/history/grid_run_summaries", {"limit": 25}).get("rows") or []
@@ -247,7 +256,7 @@ def render_live_dashboard(live: dict) -> None:
         st.markdown(
             "<div class='operator-top'>"
             "<div class='operator-title'>DELTA GRID BOT</div>"
-            f"<div class='operator-sub'>ETH {fmt_money(telemetry.get('mark_price'))} | {human_lifecycle(lifecycle)} | {grid_name}</div>"
+            f"<div class='operator-sub'>ETH {fmt_money(telemetry.get('mark_price'))} | {lifecycle_label(live)} | {grid_name}</div>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -321,7 +330,8 @@ def render_actions(live: dict) -> None:
     if c2.button("Edit Grid", disabled=lifecycle not in {"RUNNING", "PAUSED"}, use_container_width=True):
         st.session_state["gridbot_edit_open"] = True
         st.rerun()
-    if c3.button("Stop & Close", disabled=lifecycle not in {"RUNNING", "PAUSED", "EDITING", "RESUMING", "PAUSING"}, type="primary", use_container_width=True):
+    can_stop = bool(live.get("run_id")) or lifecycle in {"RUNNING", "PAUSED", "EDITING", "RESUMING", "PAUSING", "STARTING"}
+    if c3.button("Stop & Close", disabled=not can_stop, type="primary", use_container_width=True):
         st.session_state["gridbot_confirm_stop"] = True
         st.rerun()
 
