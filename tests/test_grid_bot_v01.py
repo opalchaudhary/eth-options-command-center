@@ -1624,8 +1624,8 @@ def test_continuous_worker_active_refresh_does_not_reload_same_running_run(tmp_p
     refreshed = worker._refresh_active_run_if_due()
 
     assert refreshed["run_id"] == started["run"]["run_id"]
-    assert db.stats()["select"] == 1
-    assert db.stats()["by_table"] == {"grid_runs": {"select": 1}}
+    assert db.stats()["select"] == 2
+    assert db.stats()["by_table"] == {"grid_active_run_locks": {"select": 1}, "grid_runs": {"select": 1}}
 
 
 def test_supabase_order_source_fill_fallback_preserves_raw_link():
@@ -1762,6 +1762,29 @@ def test_supabase_recovery_without_json_preserves_run_and_orders(tmp_path):
     assert recovered["config"]["config_version"] == config_version
     assert set(recovered["orders"]) == order_ids
     assert len(client.open_orders()["result"]) == len(order_ids)
+
+
+def test_supabase_active_run_uses_lock_not_stale_status_rows():
+    db = _MemorySupabaseGridRepository()
+    db.tables["grid_runs"] = {
+        ("stale-paused",): {
+            "run_id": "stale-paused",
+            "bot_id": "bot-stale",
+            "status": "PAUSED",
+            "config_version": 1,
+            "started_at": "2026-08-28T00:00:00+00:00",
+        }
+    }
+
+    assert db.active_run() is None
+
+    db.tables["grid_active_run_locks"] = {
+        ("gridbot_v01_active_run",): {
+            "lock_name": "gridbot_v01_active_run",
+            "run_id": "stale-paused",
+        }
+    }
+    assert db.active_run()["run_id"] == "stale-paused"
 
 
 def test_supabase_fill_uniqueness_and_restart_does_not_duplicate_orders(tmp_path):

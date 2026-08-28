@@ -139,10 +139,18 @@ class SupabaseGridRepository:
         self._request("PATCH", table, params=params, json=payload, prefer="return=minimal")
 
     def active_run(self) -> dict | None:
+        locks = self.select(
+            "grid_active_run_locks",
+            {"select": "run_id", "lock_name": "eq.gridbot_v01_active_run", "limit": 1},
+        )
+        if not locks:
+            return None
+        run_id = locks[0].get("run_id")
         rows = self.select(
             "grid_runs",
             {
                 "select": "*",
+                "run_id": f"eq.{run_id}",
                 "status": f"in.({','.join(sorted(ACTIVE_STATUSES))})",
                 "order": "started_at.desc",
                 "limit": 1,
