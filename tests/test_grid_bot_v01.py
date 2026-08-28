@@ -1761,6 +1761,10 @@ def test_supabase_recovery_without_json_preserves_run_and_orders(tmp_path):
     assert recovered["run_id"] == run_id
     assert recovered["config"]["config_version"] == config_version
     assert set(recovered["orders"]) == order_ids
+    assert all("opens_inventory" in order for order in recovered["orders"].values())
+    assert all("projected_inventory_if_filled" in order for order in recovered["orders"].values())
+    assert all("reserved_long_after" in order for order in recovered["orders"].values())
+    assert all("reserved_short_after" in order for order in recovered["orders"].values())
     assert len(client.open_orders()["result"]) == len(order_ids)
 
 

@@ -393,6 +393,16 @@ class SupabaseGridRepository:
                 source_fill_id = None
         if source_fill_id:
             raw = {**raw, "gridbot": {**(raw.get("gridbot") or {}), "source_fill_id": source_fill_id}}
+        gridbot_raw = {
+            **(raw.get("gridbot") or {}),
+            "opens_inventory": order.get("opens_inventory"),
+            "projected_inventory_if_filled": order.get("projected_inventory_if_filled"),
+            "reserved_long_after": order.get("reserved_long_after"),
+            "reserved_short_after": order.get("reserved_short_after"),
+        }
+        if source_fill_id:
+            gridbot_raw["source_fill_id"] = source_fill_id
+        raw = {**raw, "gridbot": {key: value for key, value in gridbot_raw.items() if value is not None}}
         self.upsert_with_optional_source_fill_id(
             "grid_orders",
             {
@@ -670,6 +680,10 @@ class SupabaseGridRepository:
                     "order_kind": row.get("order_kind"),
                     "config_version": row.get("config_version"),
                     "source_fill_id": row.get("source_fill_id") or ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"),
+                    "opens_inventory": ((row.get("raw") or {}).get("gridbot") or {}).get("opens_inventory"),
+                    "projected_inventory_if_filled": ((row.get("raw") or {}).get("gridbot") or {}).get("projected_inventory_if_filled"),
+                    "reserved_long_after": ((row.get("raw") or {}).get("gridbot") or {}).get("reserved_long_after"),
+                    "reserved_short_after": ((row.get("raw") or {}).get("gridbot") or {}).get("reserved_short_after"),
                     "raw": row.get("raw") or {},
                     "created_at": row.get("submitted_at"),
                     "cancelled_at": row.get("cancelled_at"),
