@@ -1637,13 +1637,36 @@ class DurableGridBotLifecycle:
         created = deferred = 0
         inventory = _decimal(reconciliation.get("gridbot_inventory"))
         if previous_status == GridStatus.RUNNING.value:
-            for level in run["levels"]:
-                proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory)
-                if order.get("status") == "deferred":
-                    deferred += 1
-                else:
-                    created += 1
+            try:
+                for level in run["levels"]:
+                    proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
+                    order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory)
+                    if order.get("status") == "deferred":
+                        deferred += 1
+                    else:
+                        created += 1
+            except Exception as exc:
+                for order in list((run.get("orders") or {}).values()):
+                    if order.get("order_kind") == "edit_grid" and order.get("status") not in START_TERMINAL_ORDER_STATUSES:
+                        self._cancel_order_safely(product_id, order)
+                now = utc_now()
+                run["status"] = GridStatus.PAUSED.value
+                run["status_updated_at"] = now
+                run["updated_at"] = now
+                run["edit_state"] = {
+                    **(run.get("edit_state") or {}),
+                    "stage": "PLACEMENT_FAILED",
+                    "failed_at": now,
+                    "created_orders": created,
+                    "deferred_orders": deferred,
+                    "cancelled_orders": cancelled,
+                    "deferred_superseded": deferred_superseded,
+                    "error": str(exc)[:500],
+                }
+                run["edit_diagnostics"] = {"reason": "placement_failed", "error": str(exc)[:500], "updated_at": now}
+                self._event(state, run["run_id"], "GRID_RUN_EDIT_PLACEMENT_FAILED", run["edit_diagnostics"])
+                self._save(state)
+                return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run["edit_state"])}
         self._save(state)
 
         verified = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)

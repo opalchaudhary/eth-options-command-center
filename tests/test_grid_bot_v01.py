@@ -746,6 +746,31 @@ def test_restart_during_edit_recovers_without_duplicate_config_or_orders(tmp_pat
     assert len(economic_keys) == len([order for order in edit_orders if order.get("exchange_order_id")])
 
 
+def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
+    class FailEditPlacementClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.fail_placements = False
+
+        def place_order(self, payload):
+            if self.fail_placements:
+                raise RuntimeError("400 Client Error: Bad Request for url: https://testnet/orders")
+            return super().place_order(payload)
+
+    client = FailEditPlacementClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    client.fail_placements = True
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="bad_post_only_move")
+
+    assert edited["ok"] is False
+    assert edited["requires_attention"] is True
+    assert edited["run"]["status"] == GridStatus.PAUSED.value
+    assert edited["edit"]["stage"] == "PLACEMENT_FAILED"
+    assert client.open_orders(1699)["result"] == []
+
+
 def test_stop_preempts_editing_state(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
