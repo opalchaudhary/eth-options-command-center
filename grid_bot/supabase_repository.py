@@ -5,6 +5,7 @@ from typing import Any
 import requests
 
 import storage
+from .accounting import FEE_CONFIRMED, build_run_accounting, cycle_to_row, decimal_value, extract_fee, fill_notional, normalize_maker_taker_role
 from .models import new_id, utc_now
 
 
@@ -367,6 +368,10 @@ class SupabaseGridRepository:
         quantity = fill.get("size") or fill.get("quantity")
         exchange_fill_id = str(fill.get("id") or fill_id)
         exchange_timestamp = fill.get("created_at") if isinstance(fill.get("created_at"), str) else None
+        fee = extract_fee(fill)
+        multiplier = decimal_value((run.get("product") or {}).get("contract_multiplier"), "1")
+        notional = str(fill_notional(decimal_value(price), decimal_value(quantity), multiplier))
+        role = normalize_maker_taker_role(fill)
         inserted = self.insert_once_with_optional_config_version(
             "grid_fills",
             {
@@ -380,10 +385,19 @@ class SupabaseGridRepository:
                 "side": str(fill.get("side") or "").lower(),
                 "price": price,
                 "quantity": quantity,
-                "notional": None,
-                "liquidity_role": fill.get("role") or fill.get("liquidity") or fill.get("liquidity_role") or "unknown",
-                "fee": fill.get("commission") or fill.get("fee") or "0",
-                "exchange_fee": fill.get("commission") or fill.get("fee") or "0",
+                "quantity_lots": quantity,
+                "base_quantity": str(decimal_value(quantity) * multiplier),
+                "notional": notional,
+                "notional_value": notional,
+                "liquidity_role": role,
+                "maker_taker_role": role,
+                "fee": str(fee.amount) if fee.amount is not None else None,
+                "exchange_fee": str(fee.amount) if fee.amount is not None else None,
+                "trading_fee": str(fee.amount) if fee.amount is not None else None,
+                "fee_currency": fee.currency,
+                "fee_status": fee.status,
+                "fee_source": fee.source,
+                "exchange_order_id": exchange_order_id,
                 "exchange_timestamp": exchange_timestamp,
                 "detected_at": utc_now(),
                 "rest_detection_latency": None,
@@ -392,19 +406,18 @@ class SupabaseGridRepository:
             on_conflict="exchange_fill_id",
         )
         if inserted:
-            fee = fill.get("commission") or fill.get("fee")
-            if fee not in [None, "", "0", 0]:
+            if fee.status == FEE_CONFIRMED:
                     self.insert_once_with_optional_config_version(
                         "grid_exchange_costs",
                     {
-                        "cost_id": new_id("cost"),
+                        "cost_id": f"fee_{exchange_fill_id}",
                         "run_id": run["run_id"],
                         "order_id": order.get("order_key") or client_order_id,
                         "fill_id": fill_id,
                         "config_version": int(order.get("config_version") or (run.get("config") or {}).get("config_version") or 1),
                         "cost_type": "trading_fee",
-                        "amount": fee,
-                        "currency": fill.get("commission_asset") or "USD",
+                        "amount": str(fee.amount or 0),
+                        "currency": fee.currency or "USD",
                         "direction": "debit",
                         "exchange_transaction_id": exchange_fill_id,
                         "exchange_timestamp": exchange_timestamp,
@@ -412,7 +425,17 @@ class SupabaseGridRepository:
                     },
                     on_conflict="cost_id",
                 )
+            self.persist_cycles(run)
         return inserted
+
+    def persist_cycles(self, run: dict) -> None:
+        accounting = build_run_accounting(run)
+        for cycle in accounting.cycles:
+            self.insert_once_with_optional_config_version(
+                "grid_cycles",
+                cycle_to_row(cycle, run.get("bot_id")),
+                on_conflict="run_id,entry_fill_id,exit_fill_id",
+            )
 
     def persist_snapshot(self, run: dict, risk: dict, summary: dict | None = None) -> None:
         payload = {
@@ -508,6 +531,7 @@ class SupabaseGridRepository:
         )
         orders = self.select("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "submitted_at.asc"})
         fills = self.select("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
+        exchange_costs = self.select("grid_exchange_costs", {"select": "*", "run_id": f"eq.{run_id}", "order": "created_at.asc"})
         snapshots = self.select("grid_risk_snapshots", {"select": "*", "run_id": f"eq.{run_id}", "order": "timestamp.asc", "limit": 50})
         summary_rows = self.select("grid_run_summaries", {"select": "summary", "run_id": f"eq.{run_id}", "limit": 1})
         event_rows = self.select(
@@ -585,6 +609,7 @@ class SupabaseGridRepository:
                 for row in orders
             },
             "fills": {str(row.get("exchange_fill_id") or row.get("fill_id")): row.get("raw") or row for row in fills},
+            "exchange_costs": exchange_costs,
             "replacement_keys": {},
             "risk_snapshots": [row.get("margin_state") or row for row in snapshots],
             "started_at": run_row.get("started_at"),

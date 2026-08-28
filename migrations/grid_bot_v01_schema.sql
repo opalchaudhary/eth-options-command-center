@@ -132,15 +132,24 @@ create table if not exists grid_fills (
     bot_id text,
     order_id text not null,
     level_id text,
+    config_version integer,
+    exchange_order_id text,
     exchange_fill_id text unique,
     side text not null,
     price numeric not null,
     quantity numeric not null,
+    quantity_lots numeric,
+    base_quantity numeric,
     notional numeric,
+    notional_value numeric,
     liquidity_role text not null default 'unknown',
-    fee numeric not null default 0,
-    exchange_fee numeric not null default 0,
+    maker_taker_role text not null default 'unknown',
+    fee numeric,
+    exchange_fee numeric,
+    trading_fee numeric,
     fee_currency text,
+    fee_status text not null default 'UNAVAILABLE',
+    fee_source text,
     exchange_timestamp timestamptz,
     detected_at timestamptz not null default now(),
     rest_detection_latency numeric,
@@ -152,15 +161,38 @@ create table if not exists grid_cycles (
     cycle_id text primary key,
     run_id text not null,
     bot_id text,
+    config_version integer,
+    entry_config_version integer,
+    exit_config_version integer,
     entry_fill_id text not null,
     exit_fill_id text not null,
+    direction text,
+    entry_level text,
+    exit_level text,
     level_id text,
+    quantity_lots numeric,
+    base_quantity numeric,
+    entry_price numeric,
+    exit_price numeric,
+    gross_pnl numeric,
     gross_grid_pnl numeric not null default 0,
+    entry_fee numeric,
+    exit_fee numeric,
+    total_trading_fees numeric,
     exchange_fees numeric not null default 0,
     funding numeric not null default 0,
+    other_costs numeric not null default 0,
+    other_credits numeric not null default 0,
     other_costs_credits numeric not null default 0,
+    net_pnl numeric,
     net_grid_pnl numeric not null default 0,
+    opened_at timestamptz,
+    closed_at timestamptz,
     holding_duration interval,
+    duration_seconds integer,
+    status text not null default 'PARTIAL',
+    fee_to_gross_profit_ratio numeric,
+    accounting_warnings jsonb not null default '[]'::jsonb,
     created_at timestamptz not null default now(),
     unique (run_id, entry_fill_id, exit_fill_id)
 );
@@ -175,6 +207,9 @@ create table if not exists grid_exchange_costs (
     currency text not null,
     direction text not null check (direction in ('debit', 'credit')),
     exchange_transaction_id text,
+    config_version integer,
+    attribution_status text,
+    source text,
     exchange_timestamp timestamptz,
     raw jsonb,
     created_at timestamptz not null default now()
@@ -300,8 +335,15 @@ create index if not exists idx_grid_runs_bot_created on grid_runs (bot_id, creat
 create index if not exists idx_grid_levels_run_config on grid_levels (run_id, config_version, level_index);
 create index if not exists idx_grid_orders_run on grid_orders (run_id, submitted_at desc);
 create index if not exists idx_grid_fills_run on grid_fills (run_id, detected_at desc);
+create index if not exists idx_grid_fills_run_config on grid_fills (run_id, config_version);
+create index if not exists idx_grid_fills_fee_status on grid_fills (run_id, fee_status);
 create index if not exists idx_grid_events_run on grid_events (run_id, created_at desc);
 create index if not exists idx_grid_bot_snapshots_run on grid_bot_snapshots (run_id, timestamp desc);
+create index if not exists idx_grid_cycles_run_config on grid_cycles (run_id, config_version);
+create index if not exists idx_grid_exchange_costs_run_config on grid_exchange_costs (run_id, config_version);
+create unique index if not exists idx_grid_exchange_costs_exchange_tx
+    on grid_exchange_costs (exchange_transaction_id, cost_type)
+    where exchange_transaction_id is not null and exchange_transaction_id <> '';
 
 create or replace function reject_grid_run_summary_mutation()
 returns trigger

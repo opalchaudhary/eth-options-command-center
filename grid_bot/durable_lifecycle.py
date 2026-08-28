@@ -9,6 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from .accounting import build_run_accounting
 from .config import DEFAULT_RISK_THRESHOLDS, GRIDBOT_VERSION
 from .account_telemetry import AccountTelemetryCache
 from .delta_testnet_client import DeltaTestnetClient
@@ -1057,9 +1058,8 @@ class DurableGridBotLifecycle:
         position = _position_size(self.client, product_id)
         open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
         fills = list(run.get("fills", {}).values())
-        spec_multiplier = _decimal(run["product"].get("contract_multiplier"), "1")
-        gross = _gross_pnl(fills, spec_multiplier)
-        fees = _fee_total(fills)
+        telemetry = self.account_telemetry.get(run.get("product", {}).get("symbol") or "ETHUSD")
+        accounting = build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=position)
         summary = {
             "summary_id": new_id("summary"),
             "run_id": run["run_id"],
@@ -1072,11 +1072,31 @@ class DurableGridBotLifecycle:
             "stop_reason": reason,
             "orders_total": len(run.get("orders", {})),
             "fills_total": len(fills),
-            "gross_pnl": str(gross),
-            "delta_fees": str(fees),
-            "funding": "0",
-            "other_delta_costs_credits": "0",
-            "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(gross - fees),
+            "cycles_total": accounting.cycles_completed,
+            "gross_pnl": str(accounting.gross_realized_pnl),
+            "gross_realized_pnl": str(accounting.gross_realized_pnl),
+            "gross_grid_profit": str(accounting.gross_realized_pnl),
+            "delta_fees": str(accounting.trading_fees),
+            "trading_fees": str(accounting.trading_fees),
+            "maker_fees": str(accounting.maker_fees),
+            "taker_fees": str(accounting.taker_fees),
+            "unknown_role_fees": str(accounting.unknown_role_fees),
+            "funding": str(accounting.funding_net),
+            "funding_paid": str(accounting.funding_paid),
+            "funding_received": str(accounting.funding_received),
+            "funding_net": str(accounting.funding_net),
+            "other_delta_costs_credits": str(accounting.other_credits - accounting.other_costs),
+            "other_costs": str(accounting.other_costs),
+            "other_credits": str(accounting.other_credits),
+            "net_realized_pnl": str(accounting.net_realized_pnl),
+            "unrealized_pnl": str(accounting.unrealized_pnl) if accounting.unrealized_pnl is not None else None,
+            "live_net_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else None,
+            "net_run_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else str(accounting.net_realized_pnl),
+            "fee_to_gross_profit_ratio": str(accounting.fee_to_gross_ratio) if accounting.fee_to_gross_ratio is not None else None,
+            "accounting_status": accounting.accounting_status,
+            "accounting_warnings": accounting.warnings,
+            "funding_attribution_status": accounting.funding_attribution_status,
+            "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(accounting.net_realized_pnl),
             "final_position": str(position),
             "stray_gridbot_orders": len(open_orders),
             "immutable": True,

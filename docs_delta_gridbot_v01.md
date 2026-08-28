@@ -153,13 +153,102 @@ Both numerator and denominator are USD notional/account values. If account equit
 
 ## Accounting
 
-No GST, personal income tax, or inferred tax model is included.
+Accounting V0.1 is execution-led and prospective. Historical rows created before
+the Prompt 5 accounting schema may have null fee/config/cycle fields and are not
+rewritten as if the data had always existed.
+
+No GST component is added. No personal income tax or inferred tax model is
+included. Only Delta-reported fees, funding, costs, and credits are eligible for
+the ledger.
+
+Fill fee source order:
+
+1. Delta fill/trade field such as `fee`, `commission`, `trading_fee`,
+   `paid_commission`, or `execution_fee`.
+2. Persisted fill accounting fields if the fill has already been reconciled.
+3. Future documented and role-certain rate derivation, only if actual exchange
+   fee data is unavailable.
+4. `PENDING` or `UNAVAILABLE`, never a fake zero.
+
+Fee status semantics:
+
+- `CONFIRMED`: Delta or a persisted exchange-truth row explicitly supplied the
+  fee amount. Confirmed zero is a real zero.
+- `PENDING`: the fill exists but no reliable fee field was present in the
+  current exchange response.
+- `UNAVAILABLE`: there is no usable fill payload or Delta Testnet genuinely
+  cannot provide the fee information for the row.
+
+Maker/taker source:
+
+Delta-reported fields are normalized from `maker`, `m`, `taker`, or `t`.
+Unknown or missing values remain `unknown`; post-only intent alone is not used
+as proof.
+
+Contract normalization:
+
+`base_quantity = quantity_lots * contract_multiplier`
+
+`notional_value = fill_price * quantity_lots * contract_multiplier`
+
+Cycle matching:
+
+The ledger uses deterministic FIFO inventory matching over GridBot-attributed
+fills. BUY then SELL creates a `LONG_CYCLE`; SELL then BUY creates a
+`SHORT_CYCLE`. Partial fills create partial cycles only for the closed
+quantity, and multiple closing fills produce multiple execution-level cycle
+records. Open residual quantity remains in inventory basis and is not counted as
+realized P&L.
+
+Gross cycle P&L:
+
+- LONG cycle: `(exit_price - entry_price) * closed_base_quantity`
+- SHORT cycle: `(entry_price - exit_price) * closed_base_quantity`
+
+Net cycle P&L:
+
+`gross cycle P&L - entry fee allocation - exit fee allocation +/- attributed funding/costs/credits`
 
 Net Trading P&L Before Income Tax:
 
-`gross realised P&L - trading fees + net funding - other exchange costs + other exchange credits`
+`gross realized P&L - trading fees + net funding - other exchange costs + other exchange credits`
 
-Maker/taker roles are recorded only when Delta reports or reconciliation can reliably infer them; otherwise fills remain `unknown`.
+Live Net P&L:
+
+`net realized P&L + GridBot-attributable unrealized P&L`
+
+Unrealized P&L is calculated from remaining GridBot inventory basis and current
+mark price only when account ETHUSD position matches GridBot-attributed
+remaining inventory. If unrelated/manual exposure may coexist, GridBot
+unrealized P&L is left unavailable and the run receives an accounting warning.
+
+Funding:
+
+Funding received is positive and funding paid is negative at net level. Funding
+is attributable only when the GridBot run is the clean owner of the ETHUSD
+position for the funding period. Otherwise attribution status is
+`PARTIALLY_ATTRIBUTED`, `UNATTRIBUTED`, or `UNAVAILABLE`. Current Delta Testnet
+funding proof may be `UNAVAILABLE` when no account funding/settlement row is
+observable in accessible history.
+
+Completeness:
+
+- `COMPLETE`: fills and confirmed fees are sufficient, no ambiguous funding or
+  inventory attribution remains.
+- `PARTIAL`: material values exist but at least one fee, funding, cycle, or
+  unrealized attribution warning remains.
+- `UNAVAILABLE`: critical accounting source data is absent.
+
+Warnings include `FILL_FEE_PENDING`, `FILL_FEE_UNAVAILABLE`,
+`FUNDING_ATTRIBUTION_AMBIGUOUS`, `CYCLE_ACCOUNTING_INCOMPLETE`,
+`RUN_ACCOUNTING_INCOMPLETE`, and `PNL_RECONCILIATION_MISMATCH`.
+
+Fee drag:
+
+`fee_to_gross_profit_ratio = trading_fees / gross_grid_profit`
+
+When gross profit is zero or negative, the ratio is `null` rather than a
+divide-by-zero or misleading value.
 
 ## Immutable Summary
 

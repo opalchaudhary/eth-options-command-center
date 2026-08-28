@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from .account_telemetry import AccountTelemetryCache, account_telemetry_cache
+from .accounting import build_run_accounting
 from .delta_testnet_client import DeltaTestnetClient
 from .durable_lifecycle import DurableGridBotLifecycle
 from .exchange_truth import reconcile_exchange_truth
@@ -97,6 +98,7 @@ class ContinuousGridBotWorker:
             "account_risk_state": None,
             "account_telemetry_refresh_count": 0,
             "delta_account_telemetry_request_counts": {},
+            "accounting": build_run_accounting({}).as_dict(),
         }
 
     def start(self) -> dict:
@@ -150,6 +152,10 @@ class ContinuousGridBotWorker:
             cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
             if cached:
                 state["account_risk_state"] = cached
+            if run:
+                mark_price = _decimal((cached or {}).get("mark_price")) if cached and (cached or {}).get("mark_price") not in [None, ""] else None
+                account_position = _decimal((cached or {}).get("position_lots")) if cached and (cached or {}).get("position_lots") not in [None, ""] else None
+                state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
             return state
 
     def ensure_active_worker(self) -> dict:
@@ -287,6 +293,7 @@ class ContinuousGridBotWorker:
             self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
         self._set_state(
             account_risk_state=telemetry.as_dict(),
+            accounting=build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=telemetry.position_lots).as_dict(),
             account_telemetry_refresh_count=self._state["account_telemetry_refresh_count"] + (1 if telemetry_refreshed else 0),
             delta_account_telemetry_request_counts=dict(self.account_telemetry.request_counts),
         )
