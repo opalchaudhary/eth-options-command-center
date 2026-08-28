@@ -294,12 +294,12 @@ def evaluate_gridbot_health(
     elif telemetry_status == "DEGRADED":
         issues.append(_issue("TELEMETRY_DEGRADED", HealthSeverity.WARNING, "Optional or account telemetry is degraded.", run_for_issue, **telemetry_freshness))
 
-    if str(accounting.get("accounting_status") or "COMPLETE") != "COMPLETE":
+    if run_id and str(accounting.get("accounting_status") or "COMPLETE") != "COMPLETE":
         severity = HealthSeverity.WARNING
         issues.append(_issue("ACCOUNTING_INCOMPLETE", severity, "Run accounting is partial or incomplete.", run_for_issue, warnings=accounting.get("warnings") or accounting.get("accounting_warnings") or []))
-    if accounting.get("pnl_mismatch") or accounting.get("cycle_mismatch"):
+    if run_id and (accounting.get("pnl_mismatch") or accounting.get("cycle_mismatch")):
         issues.append(_issue("ACCOUNTING_MISMATCH", HealthSeverity.CRITICAL, "Accounting reconciliation mismatch detected.", run_for_issue, accounting_status=accounting.get("accounting_status")))
-    if "DUPLICATE_EXCHANGE_COST" in (accounting.get("warnings") or []):
+    if run_id and "DUPLICATE_EXCHANGE_COST" in (accounting.get("warnings") or []):
         issues.append(_issue("DUPLICATE_EXCHANGE_COST_PROTECTION", HealthSeverity.CRITICAL, "Duplicate exchange-cost protection fired.", run_for_issue))
 
     db_counts = state.get("supabase_request_counts") or {}
