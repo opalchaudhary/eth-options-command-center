@@ -308,16 +308,16 @@ if active:
         if bcols[0].button("Pause"):
             safe_post("/api/grid/v01/live/pause", timeout=15)
             st.rerun()
-        if bcols[1].button("Regrid"):
-            st.session_state["show_regrid"] = True
+        if bcols[1].button("Edit Grid"):
+            st.session_state["show_edit_grid"] = True
         if bcols[2].button("Stop"):
             st.session_state["confirm_stop"] = True
     elif active_status == "PAUSED":
         if bcols[0].button("Resume"):
             safe_post("/api/grid/v01/live/resume", timeout=15)
             st.rerun()
-        if bcols[1].button("Regrid"):
-            st.session_state["show_regrid"] = True
+        if bcols[1].button("Edit Grid"):
+            st.session_state["show_edit_grid"] = True
         if bcols[2].button("Stop"):
             st.session_state["confirm_stop"] = True
 
@@ -337,27 +337,72 @@ if active:
                 st.session_state.pop("gridbot_history_summaries", None)
                 st.rerun()
 
-    if st.session_state.get("show_regrid"):
+    if st.session_state.get("show_edit_grid"):
         with st.container(border=True):
-            st.subheader("Regrid")
+            st.subheader("Edit Grid")
+            ecol1, ecol2, ecol3 = st.columns(3)
+            with ecol1:
+                proposed_lower = st.text_input("Lower Range", value=str(cfg.get("lower_price") or ""))
+                proposed_upper = st.text_input("Upper Range", value=str(cfg.get("upper_price") or ""))
+            with ecol2:
+                proposed_count = st.number_input("Grid Count", min_value=2, max_value=200, value=int(cfg.get("grid_count") or 2), step=1)
+                proposed_spacing = st.selectbox(
+                    "Spacing",
+                    ["arithmetic", "geometric"],
+                    index=0 if str(cfg.get("spacing_type") or "arithmetic") == "arithmetic" else 1,
+                )
+            with ecol3:
+                proposed_lot = st.text_input("Lot Size", value=str(cfg.get("lot_size") or ""))
+                proposed_max = st.text_input("Max Inventory", value=str(cfg.get("max_inventory_lots") or ""))
+
+            edit_payload = {
+                "lower_price": proposed_lower,
+                "upper_price": proposed_upper,
+                "grid_count": int(proposed_count),
+                "spacing_type": proposed_spacing,
+                "lot_size": proposed_lot,
+                "max_inventory_lots": proposed_max,
+                "reason": "dashboard_operator",
+            }
             current = pd.DataFrame(
                 [
-                    {"Field": "Lower Range", "Current": cfg.get("lower_price"), "Proposed": cfg.get("lower_price")},
-                    {"Field": "Upper Range", "Current": cfg.get("upper_price"), "Proposed": cfg.get("upper_price")},
-                    {"Field": "Grid Count", "Current": cfg.get("grid_count"), "Proposed": cfg.get("grid_count")},
-                    {"Field": "Spacing", "Current": cfg.get("spacing_type"), "Proposed": cfg.get("spacing_type")},
-                    {"Field": "Lot Size", "Current": cfg.get("lot_size"), "Proposed": cfg.get("lot_size")},
-                    {"Field": "Max Inventory", "Current": cfg.get("max_inventory_lots"), "Proposed": cfg.get("max_inventory_lots")},
+                    {"Field": "Lower Range", "Current": cfg.get("lower_price"), "Proposed": proposed_lower},
+                    {"Field": "Upper Range", "Current": cfg.get("upper_price"), "Proposed": proposed_upper},
+                    {"Field": "Grid Count", "Current": cfg.get("grid_count"), "Proposed": proposed_count},
+                    {"Field": "Spacing", "Current": cfg.get("spacing_type"), "Proposed": proposed_spacing},
+                    {"Field": "Lot Size", "Current": cfg.get("lot_size"), "Proposed": proposed_lot},
+                    {"Field": "Max Inventory", "Current": cfg.get("max_inventory_lots"), "Proposed": proposed_max},
                 ]
             )
             st.dataframe(current, use_container_width=True, hide_index=True)
-            rcol1, rcol2 = st.columns(2)
-            if rcol1.button("Cancel Regrid"):
-                st.session_state["show_regrid"] = False
+            preview = st.session_state.get("gridbot_edit_preview")
+            if preview:
+                vcols = st.columns(4)
+                with vcols[0]:
+                    card("New Version", preview.get("proposed_config_version", "N/A"), "pending")
+                with vcols[1]:
+                    card("Cancel", preview.get("order_plan", {}).get("cancel_count", 0), "orders")
+                with vcols[2]:
+                    card("Create", preview.get("order_plan", {}).get("create_count", 0), "orders")
+                with vcols[3]:
+                    card("Defer", preview.get("order_plan", {}).get("defer_count", 0), "orders")
+                validation = preview.get("validation") or {}
+                for warning in validation.get("warnings") or []:
+                    st.warning(warning)
+                for error in validation.get("errors") or []:
+                    st.error(error)
+            rcol1, rcol2, rcol3 = st.columns(3)
+            if rcol1.button("Cancel Edit"):
+                st.session_state["show_edit_grid"] = False
+                st.session_state.pop("gridbot_edit_preview", None)
                 st.rerun()
-            if rcol2.button("Confirm Regrid", type="primary"):
-                safe_post("/api/grid/v01/live/regrid", {"reason": "dashboard_operator"}, timeout=15)
-                st.session_state["show_regrid"] = False
+            if rcol2.button("Preview Edit"):
+                st.session_state["gridbot_edit_preview"] = safe_post("/api/grid/v01/live/edit/preview", edit_payload, timeout=15)
+                st.rerun()
+            if rcol3.button("Apply Edit", type="primary"):
+                safe_post("/api/grid/v01/live/edit", edit_payload, timeout=20)
+                st.session_state["show_edit_grid"] = False
+                st.session_state.pop("gridbot_edit_preview", None)
                 st.rerun()
 
     tabs = st.tabs(["Orders", "Risk / Account", "Execution Health"])

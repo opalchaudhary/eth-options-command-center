@@ -27,6 +27,7 @@ ACTIVE_STATUSES = {
     GridStatus.PAUSING.value,
     GridStatus.PAUSED.value,
     GridStatus.RESUMING.value,
+    GridStatus.EDITING.value,
     GridStatus.REGRID_PENDING.value,
     GridStatus.STOPPING.value,
     GridStatus.STOP_REQUIRES_ATTENTION.value,
@@ -137,6 +138,18 @@ def _replacement_client_order_id(run_id: str, level_id: str, side: Side, source_
 
 def _flatten_client_order_id(run_id: str, side: Side, sequence: int) -> str:
     return f"DGB01-{run_id[-8:]}-STOP-{side.value[0].upper()}-{sequence}"[:32]
+
+
+def _config_fingerprint(config: dict) -> tuple:
+    return (
+        str(config.get("grid_type")),
+        str(config.get("lower_price")),
+        str(config.get("upper_price")),
+        int(config.get("grid_count") or 0),
+        str(config.get("spacing_type")),
+        str(config.get("lot_size")),
+        str(config.get("max_inventory_lots")),
+    )
 
 
 class DurableGridBotLifecycle:
@@ -1350,7 +1363,323 @@ class DurableGridBotLifecycle:
         self._save(state)
         return {"ok": True, "run": deepcopy(run), "reconciliation": verified["reconciliation"]}
 
+    def _edit_config_from_payload(self, run: dict, payload: dict, spec, reference: Decimal, health: dict) -> GridConfig:
+        current = run.get("config") or {}
+        merged = {
+            **current,
+            **{key: value for key, value in (payload or {}).items() if value not in [None, ""]},
+            "bot_id": run["bot_id"],
+            "bot_name": current.get("bot_name") or "DeltaGridBot V0.1 Operator Grid",
+            "product_symbol": current.get("product_symbol") or (run.get("product") or {}).get("symbol") or spec.symbol,
+            "config_version": int(current.get("config_version") or 1) + 1,
+        }
+        return self._config_from_operator_payload(merged, spec, reference, health)
+
+    def _edit_order_plan(self, run: dict, new_levels: list[dict], inventory: Decimal, spec) -> dict:
+        existing_open = [
+            order
+            for order in (run.get("orders") or {}).values()
+            if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"
+        ]
+        target_keys = {
+            (str(level.get("side")), str(level.get("price")), str(level.get("quantity")))
+            for level in new_levels
+        }
+        preserve_candidates = [
+            order
+            for order in existing_open
+            if (str(order.get("side")), str(order.get("price")), str(order.get("requested_quantity"))) in target_keys
+        ]
+        create = []
+        deferred = []
+        simulated_open: list[dict] = []
+        config = run.get("config") or {}
+        for level in new_levels:
+            side = Side(level["side"])
+            price = _decimal(level["price"])
+            quantity = _decimal(level["quantity"])
+            semantic = evaluate_order_semantics(
+                GridType(config["grid_type"]),
+                inventory,
+                _decimal(config["max_inventory_lots"]),
+                side,
+                quantity,
+                simulated_open,
+            )
+            post_only = validate_post_only_price(side, round_price_for_side(price, spec.tick_size, side), spec.best_bid, spec.best_ask)
+            reasons = [*semantic.reason_codes, *post_only.reason_codes]
+            lower_price = _decimal(config.get("lower_price"))
+            upper_price = _decimal(config.get("upper_price"))
+            market_price = spec.mark_price or spec.last_price
+            if semantic.opens_inventory and market_price and (market_price < lower_price or market_price > upper_price):
+                reasons.append("MARKET_OUTSIDE_CONFIGURED_GRID_RANGE")
+            item = {"level_id": level["level_id"], "side": side.value, "price": str(price), "quantity": str(quantity), "reason_codes": reasons}
+            if reasons:
+                deferred.append(item)
+            else:
+                create.append(item)
+                simulated_open.append(
+                    {
+                        "side": side.value,
+                        "remaining_quantity": str(quantity),
+                        "requested_quantity": str(quantity),
+                        "status": "open",
+                        "opens_inventory": semantic.opens_inventory,
+                    }
+                )
+        return {
+            "remain": [],
+            "preserve_candidates": preserve_candidates,
+            "cancel": existing_open,
+            "create": create,
+            "defer": deferred,
+        }
+
+    def preview_edit_grid(self, run_id: str | None = None, payload: dict | None = None) -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS, GridStatus.STOPPED.value}:
+            raise RuntimeError(f"Cannot edit durable DeltaGridBot run from status {run.get('status')}.")
+        if run.get("status") not in {GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.EDITING.value, GridStatus.REGRID_PENDING.value}:
+            raise RuntimeError(f"Cannot edit durable DeltaGridBot run from status {run.get('status')}.")
+        product_symbol = (run.get("config") or {}).get("product_symbol") or (run.get("product") or {}).get("symbol") or "ETHUSD"
+        health = self.product_account_health(product_symbol)
+        spec = self.client.product_spec(product_symbol)
+        reference = _decimal(health["market"]["reference_price"] or run.get("reference_price"))
+        current_config = deepcopy(run.get("config") or {})
+        proposed = self._edit_config_from_payload(run, payload or {}, spec, reference, health)
+        proposed_dict = to_record_dict(proposed)
+        proposed_levels = to_record_dict(build_grid_levels(proposed, reference, spec.tick_size))
+        try:
+            reconciliation = reconcile_exchange_truth(
+                deepcopy(run),
+                self.client,
+                None,
+                suppress_replacements=True,
+                persist_order_updates=False,
+            )
+        except Exception as exc:
+            reconciliation = {"errors": [str(exc)], "gridbot_inventory": "0", "delta_position": "0", "exchange_open_orders": 0}
+        inventory = _decimal(reconciliation.get("gridbot_inventory"))
+        plan_run = {**run, "config": proposed_dict}
+        plan = self._edit_order_plan(plan_run, proposed_levels, inventory, spec)
+        warnings = []
+        if inventory != 0:
+            warnings.append("CURRENT_INVENTORY_PRESERVED")
+        max_inventory = _decimal(proposed_dict.get("max_inventory_lots"))
+        if abs(inventory) > max_inventory:
+            warnings.append("CURRENT_INVENTORY_ABOVE_PROPOSED_MAX")
+        if reconciliation.get("errors"):
+            warnings.append("EXCHANGE_TRUTH_UNAVAILABLE")
+        return {
+            "ok": not reconciliation.get("errors"),
+            "run_id": run["run_id"],
+            "current_config_version": int(current_config.get("config_version") or 1),
+            "proposed_config_version": int(proposed_dict.get("config_version") or 1),
+            "current_config": current_config,
+            "proposed_config": proposed_dict,
+            "current_inventory": str(inventory),
+            "delta_position": reconciliation.get("delta_position"),
+            "projected_inventory_limits": {
+                "max_inventory_lots": proposed_dict.get("max_inventory_lots"),
+                "current_inventory": str(inventory),
+                "above_new_max": abs(inventory) > max_inventory,
+            },
+            "orders": {
+                "remain": len(plan["remain"]),
+                "preserve_candidates": len(plan["preserve_candidates"]),
+                "cancel": len(plan["cancel"]),
+                "create": len(plan["create"]),
+                "defer": len(plan["defer"]),
+                "create_items": plan["create"],
+                "defer_items": plan["defer"],
+            },
+            "validation": {"warnings": warnings, "errors": reconciliation.get("errors") or []},
+        }
+
+    def _editing_blocked(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
+        run["status"] = GridStatus.EDITING.value
+        run["edit_diagnostics"] = {"reason": reason, "updated_at": utc_now(), **diagnostics}
+        self._event(state, run["run_id"], "GRID_RUN_EDIT_BLOCKED", run["edit_diagnostics"])
+        self._save(state)
+        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"])}
+
+    def edit_grid(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
+        payload = payload or {}
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS, GridStatus.STOPPED.value}:
+            raise RuntimeError(f"Stop state takes precedence; cannot edit run from {run.get('status')}.")
+        if run.get("status") not in {GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.EDITING.value, GridStatus.REGRID_PENDING.value}:
+            raise RuntimeError(f"Cannot edit durable DeltaGridBot run from status {run.get('status')}.")
+
+        product_symbol = (run.get("config") or {}).get("product_symbol") or (run.get("product") or {}).get("symbol") or "ETHUSD"
+        health = self.product_account_health(product_symbol)
+        spec = self.client.product_spec(product_symbol)
+        reference = _decimal(health["market"]["reference_price"] or run.get("reference_price"))
+        previous_status = (run.get("edit_state") or {}).get("previous_status") or run.get("status")
+        old_config = deepcopy(run.get("config") or {})
+        proposed = self._edit_config_from_payload(run, payload, spec, reference, health)
+        new_config = to_record_dict(proposed)
+        if _config_fingerprint(old_config) == _config_fingerprint(new_config) and run.get("status") != GridStatus.EDITING.value:
+            return {"ok": True, "run": deepcopy(run), "idempotent": True, "preview": self.preview_edit_grid(run["run_id"], payload)}
+
+        if run.get("status") != GridStatus.EDITING.value:
+            run["status"] = GridStatus.EDITING.value
+            run["edit_state"] = {
+                "previous_status": previous_status,
+                "from_config_version": int(old_config.get("config_version") or 1),
+                "to_config_version": int(new_config.get("config_version") or 1),
+                "fingerprint": list(_config_fingerprint(new_config)),
+                "stage": "FREEZE_PLACEMENT",
+                "reason": reason,
+                "started_at": utc_now(),
+                "target_config": new_config,
+            }
+            self._event(state, run["run_id"], "GRID_RUN_EDITING", {"previous_status": previous_status, "to_config_version": new_config["config_version"], "reason": reason})
+            self._save(state)
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+        else:
+            new_config = (run.get("edit_state") or {}).get("target_config") or new_config
+
+        reconciliation_result = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=False, log_reconcile_event=False)
+        state = self._load()
+        run = state["runs"][run["run_id"]]
+        if run.get("status") == GridStatus.STOPPING.value:
+            return self.stop(run["run_id"], reason="stop_preempted_edit")
+        reconciliation = reconciliation_result["reconciliation"]
+        if reconciliation.get("errors"):
+            return self._editing_blocked(state, run, "exchange_truth_unavailable", {"errors": reconciliation.get("errors")})
+        if int(reconciliation.get("unresolved_orders") or 0) or int(reconciliation.get("fill_ledger_mismatches") or 0):
+            return self._editing_blocked(state, run, "reconciliation_unresolved", {"reconciliation": reconciliation})
+        telemetry = self.account_telemetry.get(product_symbol, force=True)
+        allowed, telemetry_reasons = risk_increasing_action_allowed(telemetry)
+        if not allowed:
+            return self._editing_blocked(state, run, "critical_telemetry_unavailable", {"reason_codes": telemetry_reasons})
+
+        product_id = int(run["product"]["product_id"])
+        cancelled = 0
+        for order in list((run.get("orders") or {}).values()):
+            if order.get("status") in START_TERMINAL_ORDER_STATUSES or order.get("order_kind") == "safety_flatten":
+                continue
+            self._cancel_order_safely(product_id, order)
+            order["superseded_by_config_version"] = new_config["config_version"]
+            cancelled += 1
+        deferred_superseded = self._terminalize_never_submitted_orders(run, status="superseded", reason="edit_grid_new_config")
+        self._save(state)
+
+        state = self._load()
+        latest = state.get("runs", {}).get(run["run_id"])
+        if latest and latest.get("status") == GridStatus.STOPPING.value:
+            return self.stop(run["run_id"], reason="stop_preempted_edit")
+        run = latest or run
+        old_config = deepcopy(run.get("config") or old_config)
+        new_config["effective_from"] = utc_now()
+        new_config_obj = GridConfig(
+            bot_id=new_config["bot_id"],
+            config_version=int(new_config["config_version"]),
+            bot_name=new_config["bot_name"],
+            product_symbol=new_config["product_symbol"],
+            grid_type=GridType(new_config["grid_type"]),
+            lower_price=_decimal(new_config["lower_price"]),
+            upper_price=_decimal(new_config["upper_price"]),
+            grid_count=int(new_config["grid_count"]),
+            spacing_type=SpacingType(new_config["spacing_type"]),
+            lot_size=_decimal(new_config["lot_size"]),
+            max_inventory_lots=_decimal(new_config["max_inventory_lots"]),
+            allocated_capital=_decimal(new_config["allocated_capital"]),
+            risk_capital=_decimal(new_config["risk_capital"]),
+            risk_thresholds=new_config.get("risk_thresholds") or DEFAULT_RISK_THRESHOLDS,
+        )
+        run["config_history"] = run.get("config_history", []) + [old_config]
+        run["config"] = {**to_record_dict(new_config_obj), "effective_from": new_config["effective_from"]}
+        run["levels"] = to_record_dict(build_grid_levels(new_config_obj, reference, spec.tick_size))
+        run["reference_price"] = str(reference)
+        if self._db_enabled():
+            self.db.retire_config(run["run_id"], int(old_config["config_version"]))
+            self.db.persist_config(run, reason="edit_grid")
+            self.db.persist_levels(run)
+            self.db.insert_once(
+                "grid_parameter_changes",
+                {
+                    "change_id": new_id("chg"),
+                    "run_id": run["run_id"],
+                    "bot_id": run["bot_id"],
+                    "from_config_version": int(old_config["config_version"]),
+                    "to_config_version": int(run["config"]["config_version"]),
+                    "reason": reason,
+                    "payload": {"old_config": old_config, "new_config": run["config"], "cancelled_orders": cancelled, "deferred_superseded": deferred_superseded},
+                    "created_at": utc_now(),
+                },
+                on_conflict="change_id",
+            )
+
+        created = deferred = 0
+        inventory = _decimal(reconciliation.get("gridbot_inventory"))
+        if previous_status == GridStatus.RUNNING.value:
+            for level in run["levels"]:
+                proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
+                order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory)
+                if order.get("status") == "deferred":
+                    deferred += 1
+                else:
+                    created += 1
+        self._save(state)
+
+        verified = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)
+        state = self._load()
+        run = state["runs"][run["run_id"]]
+        if verified["reconciliation"].get("errors"):
+            return self._editing_blocked(state, run, "verification_failed", {"reconciliation": verified["reconciliation"]})
+        run["status"] = GridStatus.RUNNING.value if previous_status == GridStatus.RUNNING.value else GridStatus.PAUSED.value
+        run["edit_state"] = {
+            **(run.get("edit_state") or {}),
+            "stage": "COMPLETE",
+            "completed_at": utc_now(),
+            "created_orders": created,
+            "deferred_orders": deferred,
+            "cancelled_orders": cancelled,
+            "deferred_superseded": deferred_superseded,
+        }
+        self._event(
+            state,
+            run["run_id"],
+            "GRID_RUN_EDIT_APPLIED",
+            {
+                "from_config_version": int(old_config["config_version"]),
+                "to_config_version": int(run["config"]["config_version"]),
+                "previous_status": previous_status,
+                "final_status": run["status"],
+                "created_orders": created,
+                "deferred_orders": deferred,
+                "cancelled_orders": cancelled,
+                "gridbot_inventory": verified["reconciliation"].get("gridbot_inventory"),
+            },
+        )
+        self._save(state)
+        return {"ok": True, "run": deepcopy(run), "reconciliation": verified["reconciliation"], "edit": deepcopy(run["edit_state"])}
+
     def regrid(self, run_id: str | None = None) -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        reference = _decimal(run["reference_price"])
+        old_config = deepcopy(run["config"])
+        spec = self.client.product_spec("ETHUSD")
+        width = max(abs(_decimal(old_config["upper_price"]) - _decimal(old_config["lower_price"])) / Decimal("2"), Decimal("45"))
+        payload = {
+            "lower_price": str(quantize_price(reference - width - Decimal("5"), spec.tick_size)),
+            "upper_price": str(quantize_price(reference + width + Decimal("5"), spec.tick_size)),
+        }
+        return self.edit_grid(run["run_id"], payload, reason="legacy_regrid_compat")
+
+    def _legacy_regrid(self, run_id: str | None = None) -> dict:
         paused = self.pause(run_id)
         state = self._load()
         run = state["runs"][paused["run"]["run_id"]]

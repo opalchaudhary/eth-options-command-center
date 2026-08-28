@@ -9,7 +9,7 @@ from .accounting import FEE_CONFIRMED, build_run_accounting, cycle_to_row, decim
 from .models import new_id, utc_now
 
 
-ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "REGRID_PENDING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
+ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "EDITING", "REGRID_PENDING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
 
 
 class SupabasePersistenceError(RuntimeError):
@@ -297,7 +297,7 @@ class SupabaseGridRepository:
                 "run_id": run["run_id"],
                 "bot_id": run["bot_id"],
                 "config_version": version,
-                "effective_from": run.get("started_at") or utc_now(),
+                "effective_from": config.get("effective_from") or run.get("started_at") or utc_now(),
                 "grid_type": config.get("grid_type"),
                 "lower_price": config.get("lower_price"),
                 "upper_price": config.get("upper_price"),

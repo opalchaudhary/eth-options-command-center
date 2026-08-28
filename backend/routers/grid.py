@@ -48,6 +48,17 @@ class RegridRequest(BaseModel):
     reason: str = "manual"
 
 
+class EditGridRequest(BaseModel):
+    reason: str = "manual_edit"
+    grid_type: GridType | None = None
+    lower_price: Decimal | None = None
+    upper_price: Decimal | None = None
+    grid_count: int | None = None
+    spacing_type: SpacingType | None = None
+    lot_size: Decimal | None = None
+    max_inventory_lots: Decimal | None = None
+
+
 class OperatorGridRequest(BaseModel):
     bot_name: str = "ETH Testnet Grid"
     product_symbol: str = "ETHUSD"
@@ -317,6 +328,29 @@ def durable_resume():
 def durable_regrid(_payload: RegridRequest | None = None):
     try:
         return DurableGridBotLifecycle().regrid()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/v01/live/edit/preview")
+def durable_edit_preview(payload: EditGridRequest):
+    try:
+        data = _model_payload(payload)
+        data.pop("reason", None)
+        return DurableGridBotLifecycle().preview_edit_grid(payload=data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/v01/live/edit")
+def durable_edit(payload: EditGridRequest):
+    try:
+        data = _model_payload(payload)
+        reason = data.pop("reason", "manual_edit")
+        result = DurableGridBotLifecycle().edit_grid(payload=data, reason=reason)
+        if (result.get("run") or {}).get("status") == "RUNNING":
+            start_continuous_gridbot_worker()
+        return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

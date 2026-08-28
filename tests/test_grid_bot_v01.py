@@ -8,7 +8,7 @@ from grid_bot.accounting import ExchangeCost, gross_cycle_pnl, summarize_pnl
 from grid_bot.config import REST_URL, TestnetEndpointConfig, validate_testnet_endpoints
 from grid_bot.continuous_worker import ContinuousGridBotWorker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
-from grid_bot.durable_lifecycle import DurableGridBotLifecycle
+from grid_bot.durable_lifecycle import DurableGridBotLifecycle, START_TERMINAL_ORDER_STATUSES
 from grid_bot.engine import DeltaGridBotEngine
 from grid_bot.execution import make_client_order_id
 from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
@@ -600,6 +600,177 @@ def test_durable_lifecycle_pause_resume_regrid_stop_summary(tmp_path):
     assert summary["immutable"] is True
     assert summary["stray_gridbot_orders"] == 0
     assert DurableGridBotLifecycle(client, lifecycle.state_path).status()["active_run_id"] is None
+
+
+def _edit_payload(**updates):
+    payload = {
+        "grid_type": "neutral",
+        "lower_price": "2425",
+        "upper_price": "2575",
+        "grid_count": 4,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "2",
+    }
+    payload.update(updates)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"lower_price": "2410", "upper_price": "2590"},
+        {"grid_count": 6},
+        {"spacing_type": "geometric"},
+        {"lot_size": "2"},
+        {"max_inventory_lots": "4"},
+        {"max_inventory_lots": "1"},
+        {"grid_type": "long_bias"},
+        {"grid_type": "short_bias"},
+    ],
+)
+def test_edit_grid_parameter_changes_same_run_new_config_version(tmp_path, updates):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    preview = lifecycle.preview_edit_grid(run["run_id"], updates)
+
+    edited = lifecycle.edit_grid(run["run_id"], updates, reason="unit_edit")
+
+    assert preview["run_id"] == run["run_id"]
+    assert preview["current_config_version"] == 1
+    assert preview["proposed_config_version"] == 2
+    assert edited["run"]["run_id"] == run["run_id"]
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    for key, value in updates.items():
+        assert str(edited["run"]["config"][key]) == str(value)
+
+
+def test_edit_preview_is_non_mutating(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    before = lifecycle.status()["active_run"]
+
+    preview = lifecycle.preview_edit_grid(run["run_id"], {"grid_count": 6})
+    after = lifecycle.status()["active_run"]
+
+    assert preview["orders"]["create"] + preview["orders"]["defer"] == 6
+    assert before["config"]["config_version"] == after["config"]["config_version"] == 1
+    assert before["orders"] == after["orders"]
+
+
+def test_edit_grid_preserves_inventory_and_blocks_unsafe_nature_transition(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_type": "short_bias"}, reason="neutral_to_short_with_inventory")
+    deferred = [order for order in edited["run"].get("deferred_orders", {}).values() if order.get("config_version") == 2]
+
+    assert edited["reconciliation"]["gridbot_inventory"] == "1"
+    assert edited["reconciliation"]["delta_position"] == "1"
+    assert edited["run"]["config"]["grid_type"] == "short_bias"
+    assert deferred
+    assert any("SHORT_BIAS_CANNOT_OPEN_NET_LONG" in (order.get("rejection_reason") or "") for order in deferred)
+
+
+def test_edit_grid_inventory_above_new_max_allows_risk_reducing_orders(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload(max_inventory_lots="2"))["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+
+    preview = lifecycle.preview_edit_grid(run["run_id"], {"max_inventory_lots": "0.5"})
+    edited = lifecycle.edit_grid(run["run_id"], {"max_inventory_lots": "0.5"}, reason="lower_max")
+    created = [order for order in edited["run"]["orders"].values() if order.get("order_kind") == "edit_grid" and order.get("exchange_order_id")]
+    deferred = [order for order in edited["run"].get("deferred_orders", {}).values() if order.get("config_version") == 2]
+
+    assert "CURRENT_INVENTORY_ABOVE_PROPOSED_MAX" in preview["validation"]["warnings"]
+    assert edited["reconciliation"]["gridbot_inventory"] == "1"
+    assert any(order["side"] == "sell" for order in created)
+    assert any("LONG_OPENING_RESERVATION_EXCEEDED" in (order.get("rejection_reason") or "") for order in deferred)
+
+
+def test_edit_grid_from_paused_updates_config_without_resuming(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_operator_grid(_edit_payload())["run"]["run_id"]
+    paused = lifecycle.pause(run_id)
+
+    edited = lifecycle.edit_grid(run_id, {"grid_count": 6}, reason="paused_edit")
+
+    assert paused["run"]["status"] == GridStatus.PAUSED.value
+    assert edited["run"]["status"] == GridStatus.PAUSED.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert not [order for order in edited["run"]["orders"].values() if order.get("order_kind") == "edit_grid" and order.get("exchange_order_id")]
+
+
+def test_edit_grid_repeated_apply_is_idempotent(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    first = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="repeat_edit")
+    second = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="repeat_edit")
+
+    assert int(first["run"]["config"]["config_version"]) == 2
+    assert int(second["run"]["config"]["config_version"]) == 2
+    assert second["idempotent"] is True
+
+
+def test_restart_during_edit_recovers_without_duplicate_config_or_orders(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    state = lifecycle._load()
+    state["runs"][run["run_id"]]["status"] = GridStatus.EDITING.value
+    state["runs"][run["run_id"]]["edit_state"] = {
+        "previous_status": GridStatus.RUNNING.value,
+        "from_config_version": 1,
+        "to_config_version": 2,
+        "target_config": {**run["config"], "grid_count": 6, "config_version": 2},
+    }
+    lifecycle._save(state)
+
+    edited = DurableGridBotLifecycle(client, path, use_supabase=False).edit_grid(run["run_id"], {"grid_count": 6}, reason="restart_edit")
+    edit_orders = [order for order in edited["run"]["orders"].values() if order.get("order_kind") == "edit_grid"]
+    economic_keys = {(order["side"], order["price"], order["requested_quantity"]) for order in edit_orders if order.get("exchange_order_id")}
+
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert len(economic_keys) == len([order for order in edit_orders if order.get("exchange_order_id")])
+
+
+def test_stop_preempts_editing_state(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    state = lifecycle._load()
+    state["runs"][run["run_id"]]["status"] = GridStatus.EDITING.value
+    lifecycle._save(state)
+
+    stopped = lifecycle.stop(run["run_id"], "stop_preempts_edit")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
+
+
+def test_config_attribution_across_edit_preserves_historical_orders_and_fills(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1", fill_id="pre-edit-fill")
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="attribution_edit")
+
+    old_orders = [order for order in edited["run"]["orders"].values() if order.get("config_version") == 1]
+    new_orders = [order for order in edited["run"]["orders"].values() if order.get("config_version") == 2]
+    assert old_orders and all(order["status"] in START_TERMINAL_ORDER_STATUSES for order in old_orders)
+    assert new_orders and all(order.get("order_kind") in {"edit_grid", "replacement"} or order["status"] == "deferred" for order in new_orders)
 
 
 def test_pause_enters_pausing_reconciles_and_preserves_nonzero_inventory(tmp_path):
