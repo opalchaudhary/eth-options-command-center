@@ -14,6 +14,7 @@ ACTIVE_STATUSES = {
     GridStatus.RESUMING,
     GridStatus.REGRID_PENDING,
     GridStatus.STOPPING,
+    GridStatus.STOP_REQUIRES_ATTENTION,
 }
 
 

@@ -494,6 +494,40 @@ class _FakeLifecycleClient:
         return {"success": True, "result": {"symbol": symbol, "mark_price": "2500", "spot_price": "2500"}}
 
 
+class _FlattenFillsClient(_FakeLifecycleClient):
+    def __init__(self, flatten_chunks=None):
+        super().__init__()
+        self.flatten_chunks = list(flatten_chunks or [])
+        self.flatten_payloads = []
+
+    def place_order(self, payload):
+        row = super().place_order(payload)
+        if payload.get("reduce_only"):
+            order = row["result"]
+            requested = Decimal(str(payload["size"]))
+            fill_size = self.flatten_chunks.pop(0) if self.flatten_chunks else requested
+            fill_size = min(Decimal(str(fill_size)), requested)
+            order["state"] = "filled" if fill_size == requested else "cancelled"
+            order["unfilled_size"] = str(requested - fill_size)
+            self.fill_rows.append(
+                {
+                    "id": f"flatten-fill-{len(self.fill_rows) + 1}",
+                    "order_id": order["id"],
+                    "client_order_id": order["client_order_id"],
+                    "side": order["side"],
+                    "price": order["limit_price"],
+                    "size": str(fill_size),
+                    "commission": "0.02",
+                    "maker_taker_role": "taker",
+                }
+            )
+            signed = Decimal(self.position_size)
+            signed += fill_size if order["side"] == "buy" else -fill_size
+            self.position_size = str(signed)
+            self.flatten_payloads.append(payload)
+        return row
+
+
 def _wait_for(predicate, timeout=3):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -631,6 +665,227 @@ def test_pause_fill_cancel_race_and_partial_fill_are_persisted_once(tmp_path):
     assert second["reconciliation"]["new_fills"] == 0
     assert len(second["run"]["fills"]) == 1
     assert second["reconciliation"]["exchange_open_orders"] == 0
+
+
+def _seed_gridbot_inventory(client, run, side="buy", size="1", fill_id="seed-fill"):
+    order = next(order for order in run["orders"].values() if order["side"] == side)
+    client.fill_rows.append(
+        {
+            "id": fill_id,
+            "order_id": order["exchange_order_id"],
+            "client_order_id": order["client_order_id"],
+            "side": side,
+            "price": order["price"],
+            "size": size,
+            "commission": "0.01",
+            "maker_taker_role": "maker",
+        }
+    )
+    signed = Decimal(size) if side == "buy" else -Decimal(size)
+    client.position_size = str(signed)
+    return order
+
+
+def test_stop_and_close_flattens_long_inventory_reduce_only_and_accounts(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+
+    stopped = lifecycle.stop(run["run_id"], "unit_stop")
+
+    flatten_payloads = [payload for payload in client.flatten_payloads if payload["client_order_id"].startswith(f"DGB01-{run['run_id'][-8:]}-STOP")]
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert stopped["summary"]["stop_mode"] == "STOP_AND_CLOSE"
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
+    assert stopped["summary"]["final_delta_position"] == "0"
+    assert flatten_payloads == [
+        {
+            "product_id": 1699,
+            "side": "sell",
+            "size": "1",
+            "limit_price": "2499.95",
+            "order_type": "limit_order",
+            "time_in_force": "ioc",
+            "post_only": False,
+            "reduce_only": True,
+            "client_order_id": flatten_payloads[0]["client_order_id"],
+        }
+    ]
+    assert stopped["summary"]["trading_fees"] == "0.03"
+    assert stopped["summary"]["flatten_fills"]
+    assert stopped["summary"]["cycles_total"] == 1
+
+
+def test_stop_and_close_flattens_short_inventory_reduce_only(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="sell", size="1")
+
+    stopped = lifecycle.stop(run["run_id"], "unit_stop")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert client.flatten_payloads[-1]["side"] == "buy"
+    assert client.flatten_payloads[-1]["reduce_only"] is True
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
+
+
+def test_stop_from_paused_with_inventory_flattens_without_resume(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    paused = lifecycle.pause(run["run_id"])
+
+    stopped = lifecycle.stop(run["run_id"], "paused_stop")
+
+    event_types = [event["event_type"] for event in lifecycle.status()["events"]]
+    assert paused["run"]["status"] == GridStatus.PAUSED.value
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert "GRID_RUN_RESUMING" not in event_types
+    assert client.flatten_payloads[-1]["side"] == "sell"
+
+
+def test_stop_partial_flatten_closes_only_remaining_inventory(tmp_path):
+    client = _FlattenFillsClient(flatten_chunks=["3", "2"])
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="5")
+
+    stopped = lifecycle.stop(run["run_id"], "partial_flatten")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert [payload["size"] for payload in client.flatten_payloads] == ["5", "2"]
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
+
+
+def test_repeated_stop_does_not_duplicate_flatten_or_fills(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+
+    first = lifecycle.stop(run["run_id"], "repeat_stop")
+    second = lifecycle.stop(run["run_id"], "repeat_stop")
+
+    assert first["run"]["status"] == GridStatus.STOPPED.value
+    assert second["run"]["status"] == GridStatus.STOPPED.value
+    assert len(client.flatten_payloads) == 1
+    assert len(second["run"]["fills"]) == 2
+
+
+def test_stop_requires_attention_on_attribution_mismatch_and_retains_lock(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "3"
+
+    stopped = lifecycle.stop(run["run_id"], "mismatch_stop")
+    status = lifecycle.status()
+
+    assert stopped["ok"] is False
+    assert stopped["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
+    assert stopped["diagnostics"]["reason"] == "attribution_mismatch"
+    assert status["active_run_id"] == run["run_id"]
+    assert client.flatten_payloads == []
+
+
+def test_stop_requires_attention_on_exchange_truth_failure(tmp_path):
+    class FailingTruthClient(_FlattenFillsClient):
+        def open_orders(self, product_id=None):
+            raise RuntimeError("delta auth unavailable")
+
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    failing = FailingTruthClient()
+    failing.orders = client.orders
+    failing.position_size = client.position_size
+    lifecycle = DurableGridBotLifecycle(failing, lifecycle.state_path, use_supabase=False)
+
+    stopped = lifecycle.stop(run_id, "auth_failure")
+
+    assert stopped["ok"] is False
+    assert stopped["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
+    assert stopped["diagnostics"]["reason"] == "exchange_truth_unavailable"
+    assert lifecycle.status()["active_run_id"] == run_id
+
+
+def test_restart_during_stopping_completes_without_duplicate_flatten(tmp_path):
+    client = _FlattenFillsClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    state = lifecycle._load()
+    state["runs"][run["run_id"]]["status"] = GridStatus.STOPPING.value
+    lifecycle._save(state)
+
+    stopped = DurableGridBotLifecycle(client, path, use_supabase=False).stop(run["run_id"], "restart_stop")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert len(client.flatten_payloads) == 1
+    assert DurableGridBotLifecycle(client, path, use_supabase=False).status()["active_run_id"] is None
+
+
+def test_stop_requires_attention_recovery_retries_and_flattens(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "3"
+    attention = lifecycle.stop(run["run_id"], "mismatch_stop")
+    client.position_size = "1"
+
+    recovered = lifecycle.stop(run["run_id"], "mismatch_recovered")
+
+    assert attention["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
+    assert recovered["run"]["status"] == GridStatus.STOPPED.value
+    assert client.flatten_payloads[-1]["side"] == "sell"
+
+
+def test_ambiguous_flatten_submission_recovery_uses_existing_fill(tmp_path):
+    client = _FlattenFillsClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    state = lifecycle._load()
+    state["runs"][run["run_id"]]["status"] = GridStatus.STOPPING.value
+    lifecycle._save(state)
+    client.orders.append(
+        {
+            "id": "flatten-lost-order",
+            "client_order_id": f"DGB01-{run['run_id'][-8:]}-STOP-S-1",
+            "side": "sell",
+            "size": "1",
+            "unfilled_size": "0",
+            "limit_price": "2499.95",
+            "state": "filled",
+        }
+    )
+    client.fill_rows.append(
+        {
+            "id": "flatten-lost-fill",
+            "order_id": "flatten-lost-order",
+            "client_order_id": f"DGB01-{run['run_id'][-8:]}-STOP-S-1",
+            "side": "sell",
+            "price": "2499.95",
+            "size": "1",
+            "commission": "0.02",
+            "maker_taker_role": "taker",
+        }
+    )
+    client.position_size = "0"
+
+    stopped = DurableGridBotLifecycle(client, path, use_supabase=False).stop(run["run_id"], "recover_lost_flatten")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert client.flatten_payloads == []
+    assert "flatten-lost-fill" in stopped["run"]["fills"]
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
 
 
 def test_pause_terminalizes_deferred_never_submitted_replacements(tmp_path):

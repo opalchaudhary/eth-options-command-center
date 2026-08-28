@@ -29,6 +29,7 @@ ACTIVE_STATUSES = {
     GridStatus.RESUMING.value,
     GridStatus.REGRID_PENDING.value,
     GridStatus.STOPPING.value,
+    GridStatus.STOP_REQUIRES_ATTENTION.value,
 }
 GRIDBOT_ORDER_PREFIX = "DGB01-"
 DEFAULT_STATE_PATH = Path(os.getenv("GRIDBOT_V01_STATE_PATH", "grid_bot_state_v01.json"))
@@ -47,6 +48,7 @@ START_TERMINAL_ORDER_STATUSES = {
 DEFERRED_ORDER_STATUSES = {"deferred", "blocked"}
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
+STOP_ATTENTION_STATUS = GridStatus.STOP_REQUIRES_ATTENTION.value
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -131,6 +133,10 @@ def _fill_identity(fill: dict, fallback: str = "") -> str:
 def _replacement_client_order_id(run_id: str, level_id: str, side: Side, source_fill_id: str) -> str:
     stable = "".join(ch for ch in source_fill_id if ch.isalnum())[-8:] or "fill"
     return f"DGB01-{run_id[-8:]}-{level_id}-{side.value[0].upper()}-R{stable}"[:32]
+
+
+def _flatten_client_order_id(run_id: str, side: Side, sequence: int) -> str:
+    return f"DGB01-{run_id[-8:]}-STOP-{side.value[0].upper()}-{sequence}"[:32]
 
 
 class DurableGridBotLifecycle:
@@ -669,11 +675,208 @@ class DurableGridBotLifecycle:
         for order in run.get("orders", {}).values():
             if order.get("status") in START_TERMINAL_ORDER_STATUSES:
                 continue
+            if order.get("order_kind") == "safety_flatten":
+                continue
             if not order.get("exchange_order_id"):
                 continue
             attempted += 1
             self._cancel_order_safely(product_id, order)
         return attempted
+
+    def _stop_attention(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
+        run["status"] = STOP_ATTENTION_STATUS
+        run["stop_reason"] = reason
+        run["stop_diagnostics"] = {
+            **(run.get("stop_diagnostics") or {}),
+            "updated_at": utc_now(),
+            **diagnostics,
+        }
+        self._event(state, run["run_id"], "GRID_RUN_STOP_REQUIRES_ATTENTION", run["stop_diagnostics"])
+        self._save(state)
+        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["stop_diagnostics"])}
+
+    def _flatten_orders(self, run: dict) -> list[dict]:
+        return [order for order in (run.get("orders") or {}).values() if order.get("order_kind") == "safety_flatten"]
+
+    def _find_fill_by_client_id(self, product_id: int, client_order_id: str) -> dict | None:
+        for row in _result_rows(self.client.fills(product_id, page_size=50)):
+            if str(row.get("client_order_id") or "") == client_order_id:
+                return row
+        return None
+
+    def _flatten_order_record(
+        self,
+        run: dict,
+        side: Side,
+        quantity: Decimal,
+        client_order_id: str,
+        exchange_order: dict | None,
+        fill: dict | None,
+        price: Decimal,
+    ) -> dict:
+        exchange_order = exchange_order or {}
+        return {
+            "order_key": client_order_id,
+            "run_id": run["run_id"],
+            "level_id": "STOP",
+            "side": side.value,
+            "price": str(price),
+            "requested_quantity": str(quantity),
+            "filled_quantity": "0",
+            "remaining_quantity": str(quantity),
+            "client_order_id": client_order_id,
+            "exchange_order_id": _order_id(exchange_order) or str((fill or {}).get("order_id") or ""),
+            "status": (exchange_order.get("state") or exchange_order.get("status") or ("filled" if fill else "open")).lower(),
+            "order_kind": "safety_flatten",
+            "config_version": run["config"]["config_version"],
+            "reduce_only": True,
+            "post_only": False,
+            "time_in_force": "ioc",
+            "raw": exchange_order or {"recovered_from_fill": fill},
+            "created_at": utc_now(),
+            "submitted_at": utc_now(),
+        }
+
+    def _recover_flatten_order(self, run: dict, product_id: int, inventory: Decimal) -> dict | None:
+        side = Side.SELL if inventory > 0 else Side.BUY
+        quantity = abs(inventory)
+        sequence = len(self._flatten_orders(run)) + 1
+        client_order_id = _flatten_client_order_id(run["run_id"], side, sequence)
+        existing = run.get("orders", {}).get(client_order_id)
+        if existing:
+            return existing
+
+        exchange_order = _find_exchange_order_by_client_id(self.client, product_id, client_order_id)
+        fill = None if exchange_order else self._find_fill_by_client_id(product_id, client_order_id)
+        if not exchange_order and not fill:
+            return None
+        spec = self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
+        price = spec.best_bid if side == Side.SELL else spec.best_ask
+        if not price:
+            price = spec.mark_price or spec.last_price
+        if not price:
+            raise RuntimeError("Cannot submit safety flatten without a usable ETHUSD price.")
+
+        record = self._flatten_order_record(run, side, quantity, client_order_id, exchange_order, fill, price)
+        run.setdefault("orders", {})[client_order_id] = record
+        run.setdefault("flatten", {}).setdefault("orders", []).append(
+            {
+                "client_order_id": client_order_id,
+                "side": side.value,
+                "quantity": str(quantity),
+                "reduce_only": True,
+                "created_at": record["created_at"],
+            }
+        )
+        if self._db_enabled():
+            self.db.persist_order(run, record)
+        return record
+
+    def _recover_or_place_flatten_order(self, run: dict, product_id: int, inventory: Decimal) -> dict:
+        recovered = self._recover_flatten_order(run, product_id, inventory)
+        if recovered:
+            return recovered
+
+        side = Side.SELL if inventory > 0 else Side.BUY
+        quantity = abs(inventory)
+        sequence = len(self._flatten_orders(run)) + 1
+        client_order_id = _flatten_client_order_id(run["run_id"], side, sequence)
+        spec = self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
+        price = spec.best_bid if side == Side.SELL else spec.best_ask
+        if not price:
+            price = spec.mark_price or spec.last_price
+        if not price:
+            raise RuntimeError("Cannot submit safety flatten without a usable ETHUSD price.")
+        proposal = OrderProposal(
+            run_id=run["run_id"],
+            level_id="STOP",
+            side=side,
+            price=price,
+            quantity=quantity,
+            client_order_id=client_order_id,
+            post_only=False,
+            time_in_force="ioc",
+            reduce_only=True,
+        )
+        exchange_order = self.client.place_order(order_payload(product_id, proposal)).get("result") or {}
+        record = self._flatten_order_record(run, side, quantity, client_order_id, exchange_order, None, price)
+        run.setdefault("orders", {})[client_order_id] = record
+        run.setdefault("flatten", {}).setdefault("orders", []).append(
+            {
+                "client_order_id": client_order_id,
+                "side": side.value,
+                "quantity": str(quantity),
+                "reduce_only": True,
+                "created_at": record["created_at"],
+            }
+        )
+        if self._db_enabled():
+            self.db.persist_order(run, record)
+        return record
+
+    def _build_stop_summary(self, run: dict, reason: str, reconciliation: dict, position: Decimal, open_orders: list[dict]) -> dict:
+        fills = list(run.get("fills", {}).values())
+        telemetry = self.account_telemetry.get(run.get("product", {}).get("symbol") or "ETHUSD")
+        accounting = build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=position)
+        flatten_orders = self._flatten_orders(run)
+        flatten_order_ids = {order.get("client_order_id") for order in flatten_orders}
+        flatten_fills = []
+        for fill in fills:
+            raw = fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill
+            if isinstance(raw, dict) and str(raw.get("client_order_id") or "") in flatten_order_ids:
+                flatten_fills.append(fill)
+        return {
+            "summary_id": new_id("summary"),
+            "run_id": run["run_id"],
+            "gridbot_version": GRIDBOT_VERSION,
+            "execution_event_mode": run.get("execution_event_mode"),
+            "private_ws_available": False,
+            "private_ws_status": run.get("private_ws_status"),
+            "started_at": run.get("started_at"),
+            "stopped_at": utc_now(),
+            "stop_reason": reason,
+            "stop_mode": "STOP_AND_CLOSE",
+            "orders_total": len(run.get("orders", {})),
+            "fills_total": len(fills),
+            "cycles_total": accounting.cycles_completed,
+            "orders_cancelled": len([order for order in run.get("orders", {}).values() if str(order.get("status") or "").lower() in {"cancelled", "manual_cancelled", "abandoned_by_stop"}]),
+            "late_fills": int(reconciliation.get("new_fills") or 0),
+            "flatten_orders": deepcopy(flatten_orders),
+            "flatten_fills": deepcopy(flatten_fills),
+            "gross_pnl": str(accounting.gross_realized_pnl),
+            "gross_realized_pnl": str(accounting.gross_realized_pnl),
+            "gross_grid_profit": str(accounting.gross_realized_pnl),
+            "delta_fees": str(accounting.trading_fees),
+            "trading_fees": str(accounting.trading_fees),
+            "maker_fees": str(accounting.maker_fees),
+            "taker_fees": str(accounting.taker_fees),
+            "unknown_role_fees": str(accounting.unknown_role_fees),
+            "funding": str(accounting.funding_net),
+            "funding_paid": str(accounting.funding_paid),
+            "funding_received": str(accounting.funding_received),
+            "funding_net": str(accounting.funding_net),
+            "other_delta_costs_credits": str(accounting.other_credits - accounting.other_costs),
+            "other_costs": str(accounting.other_costs),
+            "other_credits": str(accounting.other_credits),
+            "net_realized_pnl": str(accounting.net_realized_pnl),
+            "unrealized_pnl": str(accounting.unrealized_pnl) if accounting.unrealized_pnl is not None else None,
+            "live_net_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else None,
+            "net_run_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else str(accounting.net_realized_pnl),
+            "fee_to_gross_profit_ratio": str(accounting.fee_to_gross_ratio) if accounting.fee_to_gross_ratio is not None else None,
+            "accounting_status": accounting.accounting_status,
+            "accounting_warnings": accounting.warnings,
+            "funding_attribution_status": accounting.funding_attribution_status,
+            "accounting_completeness": accounting.accounting_status,
+            "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(accounting.net_realized_pnl),
+            "final_gridbot_inventory": str(reconciliation.get("gridbot_inventory") or "0"),
+            "final_delta_position": str(position),
+            "final_position": str(position),
+            "stray_gridbot_orders": len(open_orders),
+            "stop_warnings": accounting.warnings,
+            "stop_errors": [],
+            "immutable": True,
+            "created_at": utc_now(),
+        }
 
     def _assert_pause_reconciled(self, reconciliation: dict) -> None:
         errors = reconciliation.get("errors") or []
@@ -904,6 +1107,10 @@ class DurableGridBotLifecycle:
     def process_replacements(self, run: dict, reconciliation: dict | None = None) -> dict:
         product_id = int(run["product"]["product_id"])
         outcome = {"created": 0, "deferred": 0, "skipped": 0, "existing": 0, "items": []}
+        if run.get("status") and run.get("status") != GridStatus.RUNNING.value:
+            outcome["skipped"] = len(run.get("fills") or {})
+            outcome["items"].append({"state": "skipped", "reason": "run_not_running", "status": run.get("status")})
+            return outcome
         fills = run.get("fills") or {}
         inventory = _decimal((reconciliation or {}).get("gridbot_inventory"), str(_position_size(self.client, product_id)))
         for fill_id, fill in list(fills.items()):
@@ -1206,67 +1413,152 @@ class DurableGridBotLifecycle:
             raise RuntimeError("No active durable DeltaGridBot run found.")
         if run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
             return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
-        product_id = int(run["product"]["product_id"])
-        if run.get("status") == GridStatus.STARTING.value:
+        if run.get("status") not in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+            previous_status = run.get("status")
             run["status"] = GridStatus.STOPPING.value
-            run["start_stage"] = "STOPPING"
-            run["startup"] = self._startup_progress(run, "STOPPING")
+            run["stop_reason"] = reason
+            if run.get("start_stage"):
+                run["start_stage"] = "STOPPING"
+                run["startup"] = self._startup_progress(run, "STOPPING")
+            self._event(state, run["run_id"], "GRID_RUN_STOPPING", {"previous_status": previous_status, "reason": reason})
             self._save(state)
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+        elif run.get("status") == STOP_ATTENTION_STATUS:
+            run["status"] = GridStatus.STOPPING.value
+            run["stop_reason"] = reason
+            self._event(state, run["run_id"], "GRID_RUN_STOP_RETRYING", {"reason": reason, "previous_diagnostics": run.get("stop_diagnostics")})
+            self._save(state)
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+
+        product_id = int(run["product"]["product_id"])
+        cancelled_attempts = 0
         for order in run.get("orders", {}).values():
-            if order.get("status") not in START_TERMINAL_ORDER_STATUSES:
-                self._cancel_order_safely(product_id, order)
+            if order.get("status") in START_TERMINAL_ORDER_STATUSES:
+                continue
+            if order.get("order_kind") == "safety_flatten":
+                continue
+            if self._cancel_order_safely(product_id, order):
+                cancelled_attempts += 1
         self._terminalize_never_submitted_orders(run)
         self._save(state)
-        self.reconcile(run["run_id"])
+
+        reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
-        position = _position_size(self.client, product_id)
+        reconciliation = reconciled["reconciliation"]
+        if reconciliation.get("errors"):
+            return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": reconciliation.get("errors"), "cancel_attempts": cancelled_attempts})
+
+        for _ in range(5):
+            gridbot_inventory = _decimal(reconciliation.get("gridbot_inventory"))
+            delta_position = _decimal(reconciliation.get("delta_position"))
+            open_gridbot_orders = int(reconciliation.get("exchange_open_orders") or 0)
+            unresolved = int(reconciliation.get("unresolved_orders") or 0)
+            fill_mismatches = int(reconciliation.get("fill_ledger_mismatches") or 0)
+            if unresolved or fill_mismatches:
+                return self._stop_attention(
+                    state,
+                    run,
+                    reason,
+                    {
+                        "reason": "unresolved_gridbot_order",
+                        "unresolved_orders": unresolved,
+                        "fill_ledger_mismatches": fill_mismatches,
+                        "reconciliation": reconciliation,
+                    },
+                )
+            if open_gridbot_orders:
+                for exchange_order in _gridbot_orders(_result_rows(self.client.open_orders(product_id))):
+                    cid = str(exchange_order.get("client_order_id") or "")
+                    local = run.setdefault("orders", {}).get(cid)
+                    if local and local.get("order_kind") == "safety_flatten":
+                        continue
+                    if local:
+                        self._cancel_order_safely(product_id, local)
+                    else:
+                        self.client.cancel_order(product_id, str(exchange_order.get("id") or exchange_order.get("order_id")))
+                self._save(state)
+                reconciled = self.reconcile(run["run_id"], process_replacements=False)
+                state = self._load()
+                run = state["runs"][run["run_id"]]
+                reconciliation = reconciled["reconciliation"]
+                if reconciliation.get("errors"):
+                    return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": reconciliation.get("errors")})
+                continue
+            if gridbot_inventory != delta_position:
+                if gridbot_inventory != 0:
+                    try:
+                        recovered = self._recover_flatten_order(run, product_id, gridbot_inventory)
+                    except Exception as exc:
+                        return self._stop_attention(
+                            state,
+                            run,
+                            reason,
+                            {"reason": "flatten_state_ambiguous", "error": str(exc)[:500], "reconciliation": reconciliation},
+                        )
+                    if recovered:
+                        self._event(
+                            state,
+                            run["run_id"],
+                            "GRID_RUN_STOP_FLATTEN_RECOVERED",
+                            {"client_order_id": recovered.get("client_order_id"), "inventory_before_recovery": str(gridbot_inventory)},
+                        )
+                        self._save(state)
+                        reconciled = self.reconcile(run["run_id"], process_replacements=False)
+                        state = self._load()
+                        run = state["runs"][run["run_id"]]
+                        reconciliation = reconciled["reconciliation"]
+                        if reconciliation.get("errors"):
+                            return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_flatten_recovery", "errors": reconciliation.get("errors")})
+                        continue
+                return self._stop_attention(
+                    state,
+                    run,
+                    reason,
+                    {
+                        "reason": "attribution_mismatch",
+                        "gridbot_inventory": str(gridbot_inventory),
+                        "delta_position": str(delta_position),
+                        "unexplained_difference": str(delta_position - gridbot_inventory),
+                        "reconciliation": reconciliation,
+                    },
+                )
+            if gridbot_inventory == 0:
+                break
+            try:
+                self._recover_or_place_flatten_order(run, product_id, gridbot_inventory)
+                self._event(
+                    state,
+                    run["run_id"],
+                    "GRID_RUN_STOP_FLATTEN_SUBMITTED",
+                    {"inventory": str(gridbot_inventory), "side": (Side.SELL if gridbot_inventory > 0 else Side.BUY).value},
+                )
+                self._save(state)
+            except Exception as exc:
+                return self._stop_attention(state, run, reason, {"reason": "flatten_submission_failed", "error": str(exc)[:500], "inventory": str(gridbot_inventory)})
+            reconciled = self.reconcile(run["run_id"], process_replacements=False)
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+            reconciliation = reconciled["reconciliation"]
+            if reconciliation.get("errors"):
+                return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_flatten", "errors": reconciliation.get("errors")})
+        else:
+            return self._stop_attention(state, run, reason, {"reason": "flatten_not_resolved", "reconciliation": reconciliation})
+
+        position = _decimal(reconciliation.get("delta_position"))
+        final_inventory = _decimal(reconciliation.get("gridbot_inventory"))
         open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
-        fills = list(run.get("fills", {}).values())
-        telemetry = self.account_telemetry.get(run.get("product", {}).get("symbol") or "ETHUSD")
-        accounting = build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=position)
-        summary = {
-            "summary_id": new_id("summary"),
-            "run_id": run["run_id"],
-            "gridbot_version": GRIDBOT_VERSION,
-            "execution_event_mode": run.get("execution_event_mode"),
-            "private_ws_available": False,
-            "private_ws_status": run.get("private_ws_status"),
-            "started_at": run.get("started_at"),
-            "stopped_at": utc_now(),
-            "stop_reason": reason,
-            "orders_total": len(run.get("orders", {})),
-            "fills_total": len(fills),
-            "cycles_total": accounting.cycles_completed,
-            "gross_pnl": str(accounting.gross_realized_pnl),
-            "gross_realized_pnl": str(accounting.gross_realized_pnl),
-            "gross_grid_profit": str(accounting.gross_realized_pnl),
-            "delta_fees": str(accounting.trading_fees),
-            "trading_fees": str(accounting.trading_fees),
-            "maker_fees": str(accounting.maker_fees),
-            "taker_fees": str(accounting.taker_fees),
-            "unknown_role_fees": str(accounting.unknown_role_fees),
-            "funding": str(accounting.funding_net),
-            "funding_paid": str(accounting.funding_paid),
-            "funding_received": str(accounting.funding_received),
-            "funding_net": str(accounting.funding_net),
-            "other_delta_costs_credits": str(accounting.other_credits - accounting.other_costs),
-            "other_costs": str(accounting.other_costs),
-            "other_credits": str(accounting.other_credits),
-            "net_realized_pnl": str(accounting.net_realized_pnl),
-            "unrealized_pnl": str(accounting.unrealized_pnl) if accounting.unrealized_pnl is not None else None,
-            "live_net_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else None,
-            "net_run_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else str(accounting.net_realized_pnl),
-            "fee_to_gross_profit_ratio": str(accounting.fee_to_gross_ratio) if accounting.fee_to_gross_ratio is not None else None,
-            "accounting_status": accounting.accounting_status,
-            "accounting_warnings": accounting.warnings,
-            "funding_attribution_status": accounting.funding_attribution_status,
-            "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(accounting.net_realized_pnl),
-            "final_position": str(position),
-            "stray_gridbot_orders": len(open_orders),
-            "immutable": True,
-            "created_at": utc_now(),
-        }
+        if final_inventory != 0 or open_orders:
+            return self._stop_attention(
+                state,
+                run,
+                reason,
+                {"reason": "final_stop_gate_failed", "gridbot_inventory": str(final_inventory), "open_gridbot_orders": len(open_orders)},
+            )
+
+        summary = self._build_stop_summary(run, reason, reconciliation, position, open_orders)
         if run.get("summary"):
             summary = run["summary"]
         run["summary"] = summary
