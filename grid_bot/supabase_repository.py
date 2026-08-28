@@ -158,6 +158,20 @@ class SupabaseGridRepository:
         )
         return rows[0] if rows else None
 
+    def _locked_run_is_active(self, run_id: str | None) -> bool:
+        if not run_id:
+            return False
+        rows = self.select(
+            "grid_runs",
+            {
+                "select": "run_id",
+                "run_id": f"eq.{run_id}",
+                "status": f"in.({','.join(sorted(ACTIVE_STATUSES))})",
+                "limit": 1,
+            },
+        )
+        return bool(rows)
+
     def acquire_active_run_guard(self, run_id: str) -> None:
         self.insert_once(
             "grid_active_run_locks",
@@ -168,6 +182,18 @@ class SupabaseGridRepository:
             "grid_active_run_locks",
             {"select": "run_id", "lock_name": "eq.gridbot_v01_active_run", "limit": 1},
         )
+        locked_run_id = rows[0].get("run_id") if rows else None
+        if locked_run_id != run_id and not self._locked_run_is_active(locked_run_id):
+            self.release_active_run_guard(str(locked_run_id))
+            self.insert_once(
+                "grid_active_run_locks",
+                {"lock_name": "gridbot_v01_active_run", "run_id": run_id, "created_at": utc_now()},
+                on_conflict="lock_name",
+            )
+            rows = self.select(
+                "grid_active_run_locks",
+                {"select": "run_id", "lock_name": "eq.gridbot_v01_active_run", "limit": 1},
+            )
         if not rows or rows[0].get("run_id") != run_id:
             raise SupabasePersistenceError("Another DeltaGridBot V0.1 run is already active.")
 
