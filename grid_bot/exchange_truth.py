@@ -219,10 +219,10 @@ def reconcile_exchange_truth(
     try:
         open_rows = result_rows(client.open_orders(product_id))
         result.request_count += 1
-        order_history = fetch_paginated(lambda after=None, page_size=50: client.order_history(product_id, after=after, page_size=page_size), result)
-        fill_history = fetch_paginated(lambda after=None, page_size=50: client.fills(product_id, after=after, page_size=page_size), result)
         positions = client.positions("ETH")
         result.request_count += 1
+        order_history = fetch_paginated(lambda after=None, page_size=50: client.order_history(product_id, after=after, page_size=page_size), result)
+        fill_history = fetch_paginated(lambda after=None, page_size=50: client.fills(product_id, after=after, page_size=page_size), result)
     except Exception as exc:
         result.errors.append(str(exc))
         return result.as_dict()

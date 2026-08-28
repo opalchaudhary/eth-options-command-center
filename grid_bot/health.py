@@ -201,8 +201,6 @@ def evaluate_gridbot_health(
 
     if int(reconciliation.get("unresolved_orders") or state.get("unresolved_orders") or 0) > 0:
         issues.append(_issue("GRID_ORDER_UNRESOLVED", HealthSeverity.CRITICAL, "One or more submitted GridBot orders cannot be resolved on exchange truth.", run_for_issue, count=reconciliation.get("unresolved_orders")))
-    if int(reconciliation.get("duplicate_fills_ignored") or 0) > 0:
-        issues.append(_issue("DUPLICATE_FILL_IGNORED", HealthSeverity.INFO, "Duplicate exchange fill was ignored by the fill ledger.", run_for_issue, count=reconciliation.get("duplicate_fills_ignored")))
     new_fills = int(reconciliation.get("new_fills") or 0)
     inventory = _decimal(reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"))
     position = _decimal(reconciliation.get("delta_position") or state.get("delta_position"))

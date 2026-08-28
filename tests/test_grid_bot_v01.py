@@ -1482,6 +1482,24 @@ class _TruthClient:
         return {"success": True, "result": [{"product_id": 1699, "symbol": "ETHUSD", "size": self._position}]}
 
 
+class _TruthCallOrderClient(_TruthClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = []
+
+    def order_history(self, *args, **kwargs):
+        self.calls.append("order_history")
+        return super().order_history(*args, **kwargs)
+
+    def fills(self, *args, **kwargs):
+        self.calls.append("fills")
+        return super().fills(*args, **kwargs)
+
+    def positions(self, *args, **kwargs):
+        self.calls.append("positions")
+        return super().positions(*args, **kwargs)
+
+
 def _open_exchange_order(unfilled="5", state="open"):
     return {
         "id": "ex-1",
@@ -1588,6 +1606,19 @@ def test_exchange_truth_full_fill_is_persisted_once_with_config_attribution():
     assert run["orders"]["DGB01-truth-L001-B-1"]["remaining_quantity"] == "0"
     assert first["gridbot_inventory"] == "5"
     assert first["position_mismatches"] == 0
+
+
+def test_exchange_truth_samples_position_before_fill_history_to_avoid_newer_position_race():
+    run = _truth_run()
+    client = _TruthCallOrderClient(
+        order_pages=[[{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "filled"}]],
+        fill_pages=[[_fill()]],
+        position="0",
+    )
+
+    reconcile_exchange_truth(run, client)
+
+    assert client.calls.index("positions") < client.calls.index("fills")
 
 
 def test_exchange_truth_partial_and_multiple_partial_fills():
@@ -2548,7 +2579,8 @@ def test_gridbot_health_detects_orphan_missing_duplicate_and_unresolved_orders()
     orphan = evaluate_gridbot_health({"running": True, "thread_alive": True}, {**run, "orders": {}}, {"gridbot_inventory": "0", "delta_position": "0", "exchange_open_orders": 2})
     codes = {issue["code"] for issue in missing["active_issues"]} | {issue["code"] for issue in orphan["active_issues"]}
 
-    assert {"GRID_ORDER_MISSING_UNEXPECTEDLY", "DUPLICATE_ORDER", "SUBMITTED_ORDER_UNRESOLVED", "DUPLICATE_FILL_IGNORED", "GRID_ORDER_ORPHAN"} <= codes
+    assert {"GRID_ORDER_MISSING_UNEXPECTEDLY", "DUPLICATE_ORDER", "SUBMITTED_ORDER_UNRESOLVED", "GRID_ORDER_ORPHAN"} <= codes
+    assert "DUPLICATE_FILL_IGNORED" not in codes
 
 
 @pytest.mark.parametrize(
