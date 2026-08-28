@@ -672,7 +672,10 @@ class DurableGridBotLifecycle:
         ]
 
     def _set_run_status(self, state: dict, run: dict, status: GridStatus, event_type: str, payload: dict | None = None) -> None:
+        now = utc_now()
         run["status"] = status.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         self._event(state, run["run_id"], event_type, payload or {})
         self._save(state)
 
@@ -697,11 +700,14 @@ class DurableGridBotLifecycle:
         return attempted
 
     def _stop_attention(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
+        now = utc_now()
         run["status"] = STOP_ATTENTION_STATUS
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         run["stop_reason"] = reason
         run["stop_diagnostics"] = {
             **(run.get("stop_diagnostics") or {}),
-            "updated_at": utc_now(),
+            "updated_at": now,
             **diagnostics,
         }
         self._event(state, run["run_id"], "GRID_RUN_STOP_REQUIRES_ATTENTION", run["stop_diagnostics"])
@@ -1280,7 +1286,10 @@ class DurableGridBotLifecycle:
             self._save(state)
             raise
 
+        now = utc_now()
         run["status"] = GridStatus.PAUSED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         self._event(
             state,
             run["run_id"],
@@ -1349,7 +1358,10 @@ class DurableGridBotLifecycle:
                 "Resume placement could not be verified: "
                 f"errors={errors}, unresolved_orders={unresolved}, position_mismatches={mismatches}"
             )
+        now = utc_now()
         run["status"] = GridStatus.RUNNING.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         self._event(
             state,
             run["run_id"],
@@ -1529,7 +1541,10 @@ class DurableGridBotLifecycle:
             return {"ok": True, "run": deepcopy(run), "idempotent": True, "preview": self.preview_edit_grid(run["run_id"], payload)}
 
         if run.get("status") != GridStatus.EDITING.value:
+            now = utc_now()
             run["status"] = GridStatus.EDITING.value
+            run["status_updated_at"] = now
+            run["updated_at"] = now
             run["edit_state"] = {
                 "previous_status": previous_status,
                 "from_config_version": int(old_config.get("config_version") or 1),
@@ -1636,7 +1651,10 @@ class DurableGridBotLifecycle:
         run = state["runs"][run["run_id"]]
         if verified["reconciliation"].get("errors"):
             return self._editing_blocked(state, run, "verification_failed", {"reconciliation": verified["reconciliation"]})
+        now = utc_now()
         run["status"] = GridStatus.RUNNING.value if previous_status == GridStatus.RUNNING.value else GridStatus.PAUSED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         run["edit_state"] = {
             **(run.get("edit_state") or {}),
             "stage": "COMPLETE",
@@ -1709,7 +1727,10 @@ class DurableGridBotLifecycle:
         run["config_history"] = run.get("config_history", []) + [old_config]
         run["config"] = to_record_dict(config_obj)
         run["levels"] = to_record_dict(build_grid_levels(config_obj, reference, spec.tick_size))
+        now = utc_now()
         run["status"] = GridStatus.REGRID_PENDING.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         self._event(state, run["run_id"], "GRID_REGRID_APPLIED", {"config_version": new_config["config_version"]})
         if self._db_enabled():
             self.db.retire_config(run["run_id"], int(old_config["config_version"]))
@@ -1744,7 +1765,10 @@ class DurableGridBotLifecycle:
             return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
         if run.get("status") not in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
             previous_status = run.get("status")
+            now = utc_now()
             run["status"] = GridStatus.STOPPING.value
+            run["status_updated_at"] = now
+            run["updated_at"] = now
             run["stop_reason"] = reason
             if run.get("start_stage"):
                 run["start_stage"] = "STOPPING"
@@ -1754,7 +1778,10 @@ class DurableGridBotLifecycle:
             state = self._load()
             run = state["runs"][run["run_id"]]
         elif run.get("status") == STOP_ATTENTION_STATUS:
+            now = utc_now()
             run["status"] = GridStatus.STOPPING.value
+            run["status_updated_at"] = now
+            run["updated_at"] = now
             run["stop_reason"] = reason
             self._event(state, run["run_id"], "GRID_RUN_STOP_RETRYING", {"reason": reason, "previous_diagnostics": run.get("stop_diagnostics")})
             self._save(state)
@@ -1891,7 +1918,10 @@ class DurableGridBotLifecycle:
         if run.get("summary"):
             summary = run["summary"]
         run["summary"] = summary
+        now = utc_now()
         run["status"] = GridStatus.STOPPED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         run["stopped_at"] = summary["stopped_at"]
         run["stop_reason"] = reason
         if state.get("active_run_id") == run["run_id"]:

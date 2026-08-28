@@ -2476,6 +2476,7 @@ def test_gridbot_health_detects_lifecycle_contradictions(status, orders, invento
         "run_id": "run-life",
         "status": status,
         "started_at": "2026-08-28T00:00:00+00:00",
+        "updated_at": "2026-08-28T00:00:00+00:00" if status == GridStatus.PAUSING.value else None,
         "orders": {str(i): order for i, order in enumerate(orders)},
         "config": {"grid_type": "neutral", "max_inventory_lots": "5"},
     }

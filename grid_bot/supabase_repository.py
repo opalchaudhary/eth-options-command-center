@@ -785,6 +785,8 @@ class SupabaseGridRepository:
             "risk_snapshots": [row.get("margin_state") or row for row in snapshots],
             "started_at": run_row.get("started_at"),
             "stopped_at": run_row.get("stopped_at"),
+            "updated_at": run_row.get("updated_at"),
+            "status_updated_at": run_row.get("updated_at"),
             "stop_reason": run_row.get("stop_reason"),
             "summary": summary_rows[0].get("summary") if summary_rows else None,
             "last_reconciled_at": None,

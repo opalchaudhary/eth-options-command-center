@@ -265,8 +265,8 @@ def evaluate_gridbot_health(
     if status == GridStatus.STOP_REQUIRES_ATTENTION.value:
         issues.append(_issue("STOP_REQUIRES_ATTENTION", HealthSeverity.CRITICAL, "Stop and close requires operator attention.", run_for_issue, diagnostics=run.get("stop_diagnostics")))
     if status in STUCK_STATES:
-        status_age = _age_seconds(run.get("status_updated_at") or run.get("updated_at") or run.get("started_at"), now)
-        if status_age is None or status_age > 120:
+        status_age = _age_seconds(run.get("status_updated_at") or run.get("updated_at"), now)
+        if status_age is not None and status_age > 120:
             issues.append(_issue("LIFECYCLE_STUCK", HealthSeverity.CRITICAL, f"{status} lifecycle state appears stuck.", run_for_issue, lifecycle_state=status, age_seconds=status_age))
 
     missing_replacements = _replacement_missing(run)
