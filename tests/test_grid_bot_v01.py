@@ -1787,6 +1787,23 @@ def test_supabase_active_run_uses_lock_not_stale_status_rows():
     assert db.active_run()["run_id"] == "stale-paused"
 
 
+def test_supabase_lifecycle_ignores_stale_json_when_no_active_lock(tmp_path):
+    path = tmp_path / "grid_state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "active_run_id": "stale-json",
+                "runs": {"stale-json": {"run_id": "stale-json", "bot_id": "bot-json", "status": "PAUSED"}},
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    lifecycle = DurableGridBotLifecycle(_FakeLifecycleClient(), path, db=_MemorySupabaseGridRepository(), use_supabase=True)
+
+    assert lifecycle.status()["active_run_id"] is None
+
+
 def test_supabase_fill_uniqueness_and_restart_does_not_duplicate_orders(tmp_path):
     client = _FakeLifecycleClient()
     db = _MemorySupabaseGridRepository()

@@ -159,6 +159,7 @@ class DurableGridBotLifecycle:
             if active:
                 run = self.db.load_run_state(active["run_id"])
                 return {"runs": {run["run_id"]: run}, "active_run_id": run["run_id"], "events": []}
+            return {"runs": {}, "active_run_id": None, "events": []}
         if not self.state_path.exists():
             return {"runs": {}, "active_run_id": None, "events": []}
         last_error: Exception | None = None
@@ -1198,8 +1199,13 @@ class DurableGridBotLifecycle:
     def stop(self, run_id: str | None = None, reason: str = "manual") -> dict:
         state = self._load()
         run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run and run_id and self._db_enabled():
+            run = self.db.load_run_state(run_id)
+            state.setdefault("runs", {})[run_id] = run
         if not run:
             raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
+            return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
         product_id = int(run["product"]["product_id"])
         if run.get("status") == GridStatus.STARTING.value:
             run["status"] = GridStatus.STOPPING.value
