@@ -174,7 +174,7 @@ def evaluate_gridbot_health(
     run_id = run.get("run_id") or state.get("run_id")
     run_for_issue = {**run, "run_id": run_id} if run_id else run
     poll_interval = float(state.get("poll_interval_seconds") or 2)
-    stale_after = max(15.0, poll_interval * 4)
+    stale_after = max(180.0, poll_interval * 60)
     issues: list[HealthIssue] = []
 
     if status == GridStatus.RUNNING.value:
