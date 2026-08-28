@@ -242,10 +242,11 @@ def evaluate_gridbot_health(
     open_orders = _open_orders(run)
     known_gridbot_orders = state.get("known_gridbot_orders") or list(((run or {}).get("orders") or {}).values())
     known_open_count = len(open_orders) if run else len([order for order in known_gridbot_orders if str(order.get("status") or "").lower() in OPEN_ORDER_STATUSES])
-    exchange_open_count = int(reconciliation.get("exchange_open_orders") or state.get("open_gridbot_orders") or 0)
-    if exchange_open_count > known_open_count:
+    exchange_open_count = int(reconciliation.get("exchange_open_orders") or 0)
+    has_fresh_exchange_order_truth = "exchange_open_orders" in reconciliation
+    if has_fresh_exchange_order_truth and exchange_open_count > known_open_count:
         issues.append(_issue("GRID_ORDER_ORPHAN", HealthSeverity.CRITICAL, "Exchange has GridBot-owned open orders not matched to local run orders.", run_for_issue, exchange_open_orders=exchange_open_count, known_open_orders=known_open_count))
-    if status == GridStatus.RUNNING.value and known_open_count > exchange_open_count and reconciliation:
+    if has_fresh_exchange_order_truth and status == GridStatus.RUNNING.value and known_open_count > exchange_open_count:
         issues.append(_issue("GRID_ORDER_MISSING_UNEXPECTEDLY", HealthSeverity.CRITICAL, "Local GridBot open orders are missing from exchange open-order truth.", run_for_issue, exchange_open_orders=exchange_open_count, known_open_orders=known_open_count))
     client_ids = [str(order.get("client_order_id") or "") for order in known_gridbot_orders if order.get("client_order_id")]
     exchange_ids = [str(order.get("exchange_order_id") or "") for order in known_gridbot_orders if order.get("exchange_order_id")]
@@ -294,7 +295,8 @@ def evaluate_gridbot_health(
     elif telemetry_status == "DEGRADED":
         issues.append(_issue("TELEMETRY_DEGRADED", HealthSeverity.WARNING, "Optional or account telemetry is degraded.", run_for_issue, **telemetry_freshness))
 
-    if run_id and str(accounting.get("accounting_status") or "COMPLETE") != "COMPLETE":
+    has_accounting_activity = bool((run or {}).get("fills") or (run or {}).get("exchange_costs") or accounting.get("warnings") or accounting.get("accounting_warnings"))
+    if run_id and has_accounting_activity and str(accounting.get("accounting_status") or "COMPLETE") != "COMPLETE":
         severity = HealthSeverity.WARNING
         issues.append(_issue("ACCOUNTING_INCOMPLETE", severity, "Run accounting is partial or incomplete.", run_for_issue, warnings=accounting.get("warnings") or accounting.get("accounting_warnings") or []))
     if run_id and (accounting.get("pnl_mismatch") or accounting.get("cycle_mismatch")):
