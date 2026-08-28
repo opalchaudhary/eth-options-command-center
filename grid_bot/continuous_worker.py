@@ -13,6 +13,7 @@ from .accounting import build_run_accounting
 from .delta_testnet_client import DeltaTestnetClient
 from .durable_lifecycle import DurableGridBotLifecycle
 from .exchange_truth import reconcile_exchange_truth
+from .health import HealthIssueTracker, evaluate_gridbot_health
 from .models import GridStatus, utc_now
 from .supabase_repository import SupabaseGridRepository
 
@@ -53,6 +54,7 @@ class ContinuousGridBotWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._run: dict | None = None
+        self._health_tracker = HealthIssueTracker()
         self._last_snapshot_monotonic = 0.0
         self._last_active_refresh_monotonic = 0.0
         self._state = {
@@ -99,6 +101,8 @@ class ContinuousGridBotWorker:
             "account_telemetry_refresh_count": 0,
             "delta_account_telemetry_request_counts": {},
             "accounting": build_run_accounting({}).as_dict(),
+            "health": evaluate_gridbot_health({}),
+            "recent_resolved_health_issues": [],
         }
 
     def start(self) -> dict:
@@ -156,6 +160,8 @@ class ContinuousGridBotWorker:
                 mark_price = _decimal((cached or {}).get("mark_price")) if cached and (cached or {}).get("mark_price") not in [None, ""] else None
                 account_position = _decimal((cached or {}).get("position_lots")) if cached and (cached or {}).get("position_lots") not in [None, ""] else None
                 state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
+            state["recent_resolved_health_issues"] = self._health_tracker.recent_resolved
+            state["health"] = evaluate_gridbot_health(state, run)
             return state
 
     def ensure_active_worker(self) -> dict:
@@ -256,6 +262,7 @@ class ContinuousGridBotWorker:
                         self.db.log_event(self._run, "GRID_WORKER_ERROR", {"error": str(exc)[:500], "status": status})
                 except Exception:
                     logger.exception("Failed to persist GridBot worker error event.")
+                self._update_health(self._run, {})
             elapsed = time.monotonic() - started
             self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
         self._set_state(running=False, thread_alive=False, status="stopped")
@@ -299,7 +306,30 @@ class ContinuousGridBotWorker:
         )
         with self._lock:
             self._run = run
+        self._update_health(run, result)
         return result
+
+    def _update_health(self, run: dict | None, reconciliation: dict | None) -> None:
+        with self._lock:
+            state = deepcopy(self._state)
+        if run and run.get("status") == GridStatus.RUNNING.value:
+            state["running"] = True
+            state["thread_alive"] = True
+            state["status"] = "running"
+        cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
+        if cached:
+            state["account_risk_state"] = cached
+        if run:
+            mark_price = _decimal((cached or {}).get("mark_price")) if cached and (cached or {}).get("mark_price") not in [None, ""] else None
+            account_position = _decimal((cached or {}).get("position_lots")) if cached and (cached or {}).get("position_lots") not in [None, ""] else None
+            state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
+        health = evaluate_gridbot_health(state, run, reconciliation, state.get("accounting"))
+        try:
+            health = self._health_tracker.update(health, self.db if self.db.enabled else None)
+        except Exception:
+            logger.exception("Failed to persist GridBot health state.")
+            health = self._health_tracker.update(health)
+        self._set_state(health=health, recent_resolved_health_issues=health.get("recent_resolved_issues") or [])
 
 
 worker = ContinuousGridBotWorker()
@@ -323,4 +353,5 @@ def gridbot_live_state() -> dict:
         state["account_risk_state"] = telemetry.as_dict()
     except Exception as exc:
         state["account_risk_state_error"] = str(exc)[:300]
+    state["health"] = evaluate_gridbot_health(state)
     return state

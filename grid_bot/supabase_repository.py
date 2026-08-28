@@ -6,6 +6,7 @@ import requests
 
 import storage
 from .accounting import FEE_CONFIRMED, build_run_accounting, cycle_to_row, decimal_value, extract_fee, fill_notional, normalize_maker_taker_role
+from .health import HealthIssue
 from .models import new_id, utc_now
 
 
@@ -577,6 +578,80 @@ class SupabaseGridRepository:
             },
             on_conflict="event_id",
         )
+
+    def sync_health_issues(self, active_issues: list[HealthIssue], resolved_issues: list[HealthIssue] | None = None) -> None:
+        now = utc_now()
+        try:
+            for issue in active_issues:
+                payload = {
+                    "issue_key": issue.key,
+                    "run_id": issue.run_id,
+                    "bot_id": issue.context.get("bot_id"),
+                    "code": issue.code,
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "first_seen": issue.first_seen,
+                    "last_seen": issue.last_seen or now,
+                    "occurrence_count": issue.occurrence_count,
+                    "active": True,
+                    "resolved_at": None,
+                    "operator_attention_required": issue.code in {
+                        "ACTIVE_LOCK_CONTRADICTION",
+                        "ACCOUNTING_MISMATCH",
+                        "FILL_LEDGER_MISMATCH",
+                        "GRID_NATURE_INVENTORY_VIOLATION",
+                        "GRID_ORDER_ORPHAN",
+                        "GRID_ORDER_UNRESOLVED",
+                        "LIFECYCLE_STUCK",
+                        "MISSING_REPLACEMENT",
+                        "POSITION_MISMATCH",
+                        "RESERVATION_MISMATCH",
+                        "STOP_REQUIRES_ATTENTION",
+                        "SUBMITTED_ORDER_UNRESOLVED",
+                        "SUPABASE_FAILURE",
+                    },
+                    "context": issue.context,
+                    "updated_at": now,
+                }
+                self.upsert("grid_health_events", payload, on_conflict="issue_key")
+            for issue in resolved_issues or []:
+                self.patch(
+                    "grid_health_events",
+                    {"issue_key": issue.key},
+                    {
+                        "last_seen": issue.last_seen or now,
+                        "occurrence_count": issue.occurrence_count,
+                        "active": False,
+                        "resolved_at": issue.resolved_at or now,
+                        "updated_at": now,
+                    },
+                )
+        except SupabasePersistenceError as exc:
+            missing_table = "grid_health_events" in str(exc) and any(token in str(exc) for token in ["42P01", "PGRST205", "PGRST204"])
+            if not missing_table:
+                raise
+            for issue in active_issues:
+                self.log_event(
+                    {"run_id": issue.run_id, "bot_id": issue.context.get("bot_id")},
+                    "GRID_HEALTH_ISSUE_ACTIVE",
+                    issue.as_dict(),
+                )
+            for issue in resolved_issues or []:
+                self.log_event(
+                    {"run_id": issue.run_id, "bot_id": issue.context.get("bot_id")},
+                    "GRID_HEALTH_ISSUE_RESOLVED",
+                    issue.as_dict(),
+                )
+
+    def recent_health_issues(self, run_id: str | None = None, limit: int = 50) -> dict:
+        params = {"select": "*", "order": "last_seen.desc", "limit": max(1, min(int(limit), 200))}
+        if run_id:
+            params["run_id"] = f"eq.{run_id}"
+        rows = self.select("grid_health_events", params)
+        return {
+            "active": [row for row in rows if row.get("active") is True],
+            "resolved": [row for row in rows if row.get("active") is False],
+        }
 
     def persist_summary(self, run: dict, summary: dict) -> None:
         self.insert_once(

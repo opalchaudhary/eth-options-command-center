@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from grid_bot.accounting import ExchangeCost, gross_cycle_pnl, summarize_pnl
+from grid_bot.accounting import ExchangeCost, build_run_accounting, gross_cycle_pnl, summarize_pnl
 from grid_bot.config import REST_URL, TestnetEndpointConfig, validate_testnet_endpoints
 from grid_bot.continuous_worker import ContinuousGridBotWorker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
@@ -12,6 +12,7 @@ from grid_bot.durable_lifecycle import DurableGridBotLifecycle, START_TERMINAL_O
 from grid_bot.engine import DeltaGridBotEngine
 from grid_bot.execution import make_client_order_id
 from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
+from grid_bot.health import HealthIssueTracker, evaluate_gridbot_health
 from grid_bot.grid_builder import build_grid_levels, generate_prices
 from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType
 from grid_bot.reconciliation import reconcile_orders
@@ -2343,3 +2344,201 @@ def test_supabase_idempotent_stop_summary_and_active_guard_release(tmp_path):
     assert first["summary"]["summary_id"] == second["summary"]["summary_id"]
     assert len(summaries) == 1
     assert db.select("grid_active_run_locks") == []
+
+
+def test_gridbot_health_reports_healthy_running_state(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    reconciliation = reconcile_exchange_truth(run, client)
+    state = {
+        "running": True,
+        "thread_alive": True,
+        "status": "running",
+        "run_id": run["run_id"],
+        "lifecycle_state": GridStatus.RUNNING.value,
+        "poll_interval_seconds": 2,
+        "successful_polls": 1,
+        "last_successful_poll_at": run["last_reconciled_at"],
+        "last_successful_reconcile": run["last_reconciled_at"],
+        "account_risk_state": client_health_state(),
+        "accounting": build_run_accounting(run, mark_price=Decimal("2500"), account_position_lots=Decimal("0")).as_dict(),
+    }
+
+    health = evaluate_gridbot_health(state, run, reconciliation)
+
+    assert health["overall_status"] == "HEALTHY"
+    assert health["safe_for_risk_increase"] is True
+    assert health["safe_for_risk_reduce"] is True
+    assert health["operator_attention_required"] is False
+    assert health["position_inventory_agreement"]["matches"] is True
+    assert health["active_issues"] == []
+
+
+def client_health_state(**updates):
+    now = "2026-08-28T00:00:00+00:00"
+    payload = {
+        "telemetry_status": "HEALTHY",
+        "last_account_sync": now,
+        "last_position_sync": now,
+        "last_order_sync": now,
+        "last_market_sync": now,
+        "account_age_seconds": 0,
+        "position_age_seconds": 0,
+        "order_age_seconds": 0,
+        "market_age_seconds": 0,
+        "position_lots": "0",
+        "open_order_count": 4,
+        "mark_price": "2500",
+        "errors": [],
+        "unavailable_fields": [],
+    }
+    payload.update(updates)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "error,expected_code",
+    [
+        ("401 unauthorized", "DELTA_AUTH_FAILURE"),
+        ("429 rate limit", "DELTA_RATE_LIMIT"),
+        ("request timeout", "DELTA_TIMEOUT"),
+        ("503 server error", "DELTA_5XX"),
+        ("malformed json response", "DELTA_MALFORMED_RESPONSE"),
+    ],
+)
+def test_gridbot_health_classifies_delta_failures(error, expected_code):
+    run = {"run_id": "run-health", "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "2"}}
+    state = {
+        "running": True,
+        "thread_alive": True,
+        "status": "error",
+        "run_id": run["run_id"],
+        "lifecycle_state": GridStatus.RUNNING.value,
+        "last_error": error,
+        "account_risk_state": client_health_state(),
+    }
+
+    health = evaluate_gridbot_health(state, run, {"errors": [error], "gridbot_inventory": "0", "delta_position": "0"})
+
+    assert expected_code in {issue["code"] for issue in health["active_issues"]}
+    assert health["safe_for_risk_increase"] is False
+
+
+def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_gate():
+    run = {
+        "run_id": "run-risk",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "long_bias", "max_inventory_lots": "2"},
+    }
+    state = {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": GridStatus.RUNNING.value}
+
+    health = evaluate_gridbot_health(state, run, {"gridbot_inventory": "-3", "delta_position": "1", "position_mismatches": 1})
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert {"POSITION_MISMATCH", "MAX_INVENTORY_VIOLATION", "GRID_NATURE_INVENTORY_VIOLATION", "POSITION_ATTRIBUTION_UNSAFE"} <= codes
+    assert health["overall_status"] == "CRITICAL"
+    assert health["safe_for_risk_increase"] is False
+    assert health["safe_for_risk_reduce"] is False
+    assert health["operator_attention_required"] is True
+
+
+def test_gridbot_health_detects_orphan_missing_duplicate_and_unresolved_orders():
+    run = {
+        "run_id": "run-orders",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "5"},
+        "orders": {
+            "a": {"client_order_id": "DGB01-a", "exchange_order_id": "1", "status": "open", "remaining_quantity": "1"},
+            "b": {"client_order_id": "DGB01-b", "exchange_order_id": "1", "status": "open", "remaining_quantity": "1"},
+            "c": {"client_order_id": "DGB01-c", "status": "submitted", "remaining_quantity": "1"},
+        },
+    }
+
+    missing = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "0", "delta_position": "0", "exchange_open_orders": 1, "duplicate_fills_ignored": 1})
+    orphan = evaluate_gridbot_health({"running": True, "thread_alive": True}, {**run, "orders": {}}, {"gridbot_inventory": "0", "delta_position": "0", "exchange_open_orders": 2})
+    codes = {issue["code"] for issue in missing["active_issues"]} | {issue["code"] for issue in orphan["active_issues"]}
+
+    assert {"GRID_ORDER_MISSING_UNEXPECTEDLY", "DUPLICATE_ORDER", "SUBMITTED_ORDER_UNRESOLVED", "DUPLICATE_FILL_IGNORED", "GRID_ORDER_ORPHAN"} <= codes
+
+
+@pytest.mark.parametrize(
+    "status,orders,inventory,expected_code",
+    [
+        (GridStatus.PAUSED.value, [{"status": "open", "remaining_quantity": "1", "client_order_id": "DGB01-pause"}], "0", "PAUSED_WITH_RESTING_ORDERS"),
+        (GridStatus.STOPPED.value, [], "1", "STOPPED_WITH_EXPOSURE"),
+        (GridStatus.STOP_REQUIRES_ATTENTION.value, [], "0", "STOP_REQUIRES_ATTENTION"),
+        (GridStatus.PAUSING.value, [], "0", "LIFECYCLE_STUCK"),
+    ],
+)
+def test_gridbot_health_detects_lifecycle_contradictions(status, orders, inventory, expected_code):
+    run = {
+        "run_id": "run-life",
+        "status": status,
+        "started_at": "2026-08-28T00:00:00+00:00",
+        "orders": {str(i): order for i, order in enumerate(orders)},
+        "config": {"grid_type": "neutral", "max_inventory_lots": "5"},
+    }
+    health = evaluate_gridbot_health({}, run, {"gridbot_inventory": inventory, "delta_position": inventory})
+
+    assert expected_code in {issue["code"] for issue in health["active_issues"]}
+    assert health["operator_attention_required"] is True
+
+
+def test_gridbot_health_detects_telemetry_and_accounting_degradation():
+    run = {"run_id": "run-telemetry", "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "5"}}
+    state = {
+        "running": True,
+        "thread_alive": True,
+        "run_id": run["run_id"],
+        "lifecycle_state": GridStatus.RUNNING.value,
+        "account_risk_state": client_health_state(telemetry_status="STALE", market_age_seconds=120),
+        "accounting": {"accounting_status": "PARTIAL", "warnings": ["FILL_FEE_PENDING"]},
+    }
+
+    health = evaluate_gridbot_health(state, run, {"gridbot_inventory": "0", "delta_position": "0"})
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert {"TELEMETRY_STALE", "ACCOUNTING_INCOMPLETE"} <= codes
+    assert health["overall_status"] == "DEGRADED"
+    assert health["safe_for_risk_reduce"] is True
+
+
+def test_gridbot_health_event_dedupe_and_resolution_tracking(tmp_path):
+    db = _CountingSupabaseGridRepository()
+    run = {"run_id": "run-dedupe", "bot_id": "bot-dedupe", "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "5"}, "orders": {}}
+    tracker = HealthIssueTracker()
+    degraded = evaluate_gridbot_health(
+        {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": "RUNNING"},
+        run,
+        {"gridbot_inventory": "0", "delta_position": "1", "position_mismatches": 1},
+    )
+    before = dict(db.write_counts)
+
+    tracker.update(degraded, db)
+    tracker.update(degraded, db)
+    recovered = tracker.update(evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "0", "delta_position": "0"}), db)
+
+    assert db.write_counts["upsert"] == before["upsert"] + 2
+    assert db.write_counts["patch"] == before["patch"] + 2
+    assert recovered["active_issues"] == []
+    assert {issue["code"] for issue in recovered["recent_resolved_issues"]} == {"POSITION_MISMATCH", "POSITION_ATTRIBUTION_UNSAFE"}
+
+
+def test_continuous_worker_live_state_includes_health_without_no_change_health_writes(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+    before = dict(db.write_counts)
+
+    for _ in range(5):
+        worker._poll_once(worker._run)
+
+    state = worker.state()
+    assert state["health"]["overall_status"] in {"HEALTHY", "CRITICAL"}
+    assert "worker_health" in state["health"]
+    assert db.write_counts["upsert"] == before["upsert"]
+    assert db.write_counts["patch"] == before["patch"]

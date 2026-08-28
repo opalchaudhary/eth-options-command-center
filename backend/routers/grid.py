@@ -386,6 +386,7 @@ def durable_history(table_name: str, run_id: str | None = None, limit: int = 100
         "grid_risk_snapshots",
         "grid_parameter_changes",
         "grid_events",
+        "grid_health_events",
         "grid_run_summaries",
     }
     if table_name not in allowed:
@@ -395,8 +396,12 @@ def durable_history(table_name: str, run_id: str | None = None, limit: int = 100
         params = {"select": "*", "limit": max(1, min(int(limit), 500))}
         if run_id:
             params["run_id"] = f"eq.{run_id}"
-        if table_name in {"grid_events", "grid_bot_snapshots", "grid_risk_snapshots"}:
-            params["order"] = "created_at.desc" if table_name == "grid_events" else "timestamp.desc"
+        if table_name == "grid_events":
+            params["order"] = "created_at.desc"
+        elif table_name == "grid_health_events":
+            params["order"] = "last_seen.desc"
+        elif table_name in {"grid_bot_snapshots", "grid_risk_snapshots"}:
+            params["order"] = "timestamp.desc"
         rows = repo.select(table_name, params)
         return {"ok": True, "table": table_name, "rows": rows}
     except Exception as exc:
