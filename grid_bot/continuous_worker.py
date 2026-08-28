@@ -173,11 +173,29 @@ class ContinuousGridBotWorker:
         with self._lock:
             self._state.update(updates)
 
+    def _set_idle_state(self) -> None:
+        self._set_state(
+            status="idle",
+            run_id=None,
+            open_gridbot_orders=0,
+            known_order_count=0,
+            known_fill_count=0,
+            replacement_count=0,
+            deferred_replacement_count=0,
+            position_mismatches=0,
+            fill_ledger_mismatches=0,
+            fill_derived_inventory="0",
+            delta_position="0",
+            last_fill=None,
+            last_replacement=None,
+        )
+
     def _recover_active_run(self) -> dict | None:
         active = self.db.active_run() if self.db.enabled else None
         if not active:
             with self._lock:
                 self._run = None
+            self._set_idle_state()
             return None
         run = self.db.load_run_state(active["run_id"])
         with self._lock:
@@ -218,7 +236,7 @@ class ContinuousGridBotWorker:
             try:
                 run = self._refresh_active_run_if_due()
                 if not run or run.get("status") not in EXECUTABLE_STATUSES:
-                    self._set_state(status="idle", run_id=None)
+                    self._set_idle_state()
                     self._stop.wait(self.poll_interval_seconds)
                     continue
 

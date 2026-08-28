@@ -2039,6 +2039,43 @@ def test_continuous_worker_exposes_supabase_request_counts():
     assert counts["by_table"]["grid_runs"]["select"] == 1
 
 
+def test_continuous_worker_clears_run_counters_when_idle():
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
+    worker._run = {"run_id": "run-stale", "status": "RUNNING", "orders": {"a": {}}, "fills": {"f": {}}}
+    worker._set_state(
+        run_id="run-stale",
+        status="running",
+        open_gridbot_orders=4,
+        known_order_count=12,
+        known_fill_count=3,
+        replacement_count=2,
+        deferred_replacement_count=1,
+        position_mismatches=1,
+        fill_ledger_mismatches=1,
+        fill_derived_inventory="2",
+        delta_position="2",
+        last_fill={"fill_id": "f"},
+        last_replacement={"state": "created"},
+    )
+
+    worker._recover_active_run()
+    state = worker.state()
+
+    assert state["run_id"] is None
+    assert state["status"] == "idle"
+    assert state["open_gridbot_orders"] == 0
+    assert state["known_order_count"] == 0
+    assert state["known_fill_count"] == 0
+    assert state["replacement_count"] == 0
+    assert state["deferred_replacement_count"] == 0
+    assert state["position_mismatches"] == 0
+    assert state["fill_ledger_mismatches"] == 0
+    assert state["fill_derived_inventory"] == "0"
+    assert state["delta_position"] == "0"
+    assert state["last_fill"] is None
+    assert state["last_replacement"] is None
+
+
 def test_continuous_worker_active_refresh_does_not_reload_same_running_run(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
