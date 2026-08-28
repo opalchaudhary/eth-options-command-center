@@ -203,15 +203,19 @@ def evaluate_gridbot_health(
         issues.append(_issue("GRID_ORDER_UNRESOLVED", HealthSeverity.CRITICAL, "One or more submitted GridBot orders cannot be resolved on exchange truth.", run_for_issue, count=reconciliation.get("unresolved_orders")))
     if int(reconciliation.get("duplicate_fills_ignored") or 0) > 0:
         issues.append(_issue("DUPLICATE_FILL_IGNORED", HealthSeverity.INFO, "Duplicate exchange fill was ignored by the fill ledger.", run_for_issue, count=reconciliation.get("duplicate_fills_ignored")))
-    if int(reconciliation.get("position_mismatches") or state.get("position_mismatches") or 0) > 0:
+    new_fills = int(reconciliation.get("new_fills") or 0)
+    inventory = _decimal(reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"))
+    position = _decimal(reconciliation.get("delta_position") or state.get("delta_position"))
+    transient_fill_position_catchup = bool(new_fills and abs(position - inventory) <= new_fills)
+    if int(reconciliation.get("position_mismatches") or state.get("position_mismatches") or 0) > 0 and not transient_fill_position_catchup:
         issues.append(
             _issue(
                 "POSITION_MISMATCH",
                 HealthSeverity.CRITICAL,
                 "Delta position and GridBot fill-derived inventory disagree.",
                 run_for_issue,
-                gridbot_inventory=reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"),
-                delta_position=reconciliation.get("delta_position") or state.get("delta_position"),
+                gridbot_inventory=str(inventory),
+                delta_position=str(position),
             )
         )
     if int(reconciliation.get("fill_ledger_mismatches") or state.get("fill_ledger_mismatches") or 0) > 0:
@@ -226,8 +230,6 @@ def evaluate_gridbot_health(
         elif event_type == "FILL_LEDGER_MISMATCH":
             issues.append(_issue("FILL_LEDGER_MISMATCH", HealthSeverity.CRITICAL, "Fill ledger exceeds requested order quantity.", run_for_issue, **payload))
 
-    inventory = _decimal(reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"))
-    position = _decimal(reconciliation.get("delta_position") or state.get("delta_position"))
     max_inventory = abs(_decimal((run.get("config") or {}).get("max_inventory_lots")))
     if max_inventory and abs(inventory) > max_inventory:
         issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(inventory), max_inventory=str(max_inventory)))
@@ -236,7 +238,7 @@ def evaluate_gridbot_health(
         issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Long grid is unexpectedly net short.", run_for_issue, inventory=str(inventory)))
     if grid_type == GridType.SHORT_BIAS.value and inventory > 0:
         issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Short grid is unexpectedly net long.", run_for_issue, inventory=str(inventory)))
-    if abs(position - inventory) > 0:
+    if abs(position - inventory) > 0 and not transient_fill_position_catchup:
         issues.append(_issue("POSITION_ATTRIBUTION_UNSAFE", HealthSeverity.CRITICAL, "Account exposure cannot be safely attributed to this GridBot.", run_for_issue, delta_position=str(position), gridbot_inventory=str(inventory)))
 
     open_orders = _open_orders(run)
@@ -246,7 +248,8 @@ def evaluate_gridbot_health(
     has_fresh_exchange_order_truth = "exchange_open_orders" in reconciliation
     if has_fresh_exchange_order_truth and exchange_open_count > known_open_count:
         issues.append(_issue("GRID_ORDER_ORPHAN", HealthSeverity.CRITICAL, "Exchange has GridBot-owned open orders not matched to local run orders.", run_for_issue, exchange_open_orders=exchange_open_count, known_open_orders=known_open_count))
-    if has_fresh_exchange_order_truth and status == GridStatus.RUNNING.value and known_open_count > exchange_open_count:
+    transient_fill_order_catchup = bool(new_fills and known_open_count > exchange_open_count and (known_open_count - exchange_open_count) <= new_fills)
+    if has_fresh_exchange_order_truth and status == GridStatus.RUNNING.value and known_open_count > exchange_open_count and not transient_fill_order_catchup:
         issues.append(_issue("GRID_ORDER_MISSING_UNEXPECTEDLY", HealthSeverity.CRITICAL, "Local GridBot open orders are missing from exchange open-order truth.", run_for_issue, exchange_open_orders=exchange_open_count, known_open_orders=known_open_count))
     client_ids = [str(order.get("client_order_id") or "") for order in known_gridbot_orders if order.get("client_order_id")]
     exchange_ids = [str(order.get("exchange_order_id") or "") for order in known_gridbot_orders if order.get("exchange_order_id")]

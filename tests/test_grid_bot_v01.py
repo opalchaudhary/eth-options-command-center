@@ -2500,6 +2500,38 @@ def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_
     assert health["operator_attention_required"] is True
 
 
+def test_gridbot_health_allows_one_poll_fill_catchup_without_false_critical():
+    run = {
+        "run_id": "run-fill-catchup",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "2"},
+        "orders": {
+            "open-a": {"client_order_id": "DGB01-open-a", "exchange_order_id": "1", "status": "open", "remaining_quantity": "1"},
+            "open-b": {"client_order_id": "DGB01-open-b", "exchange_order_id": "2", "status": "open", "remaining_quantity": "1"},
+            "open-c": {"client_order_id": "DGB01-open-c", "exchange_order_id": "3", "status": "open", "remaining_quantity": "1"},
+            "open-d": {"client_order_id": "DGB01-open-d", "exchange_order_id": "4", "status": "open", "remaining_quantity": "1"},
+        },
+    }
+
+    health = evaluate_gridbot_health(
+        {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": GridStatus.RUNNING.value},
+        run,
+        {
+            "new_fills": 1,
+            "position_mismatches": 1,
+            "gridbot_inventory": "-1",
+            "delta_position": "-2",
+            "exchange_open_orders": 3,
+        },
+    )
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert "POSITION_MISMATCH" not in codes
+    assert "POSITION_ATTRIBUTION_UNSAFE" not in codes
+    assert "GRID_ORDER_MISSING_UNEXPECTEDLY" not in codes
+    assert health["overall_status"] == "HEALTHY"
+
+
 def test_gridbot_health_detects_orphan_missing_duplicate_and_unresolved_orders():
     run = {
         "run_id": "run-orders",
