@@ -378,6 +378,17 @@ class SupabaseGridRepository:
         submitted_at = order.get("submitted_at") or order.get("created_at") or utc_now()
         raw = order.get("raw") or {}
         source_fill_id = order.get("source_fill_id") or (raw.get("gridbot") or {}).get("source_fill_id")
+        reduce_only = order.get("reduce_only")
+        if reduce_only is None:
+            reduce_only = raw.get("reduce_only")
+        post_only = order.get("post_only")
+        if post_only is None:
+            post_only = raw.get("post_only")
+        if post_only is None and isinstance(raw.get("meta_data"), dict):
+            post_only = raw["meta_data"].get("post_only")
+        if post_only is None:
+            post_only = order.get("order_kind") != "safety_flatten"
+        time_in_force = order.get("time_in_force") or raw.get("time_in_force") or ("ioc" if order.get("order_kind") == "safety_flatten" else "gtc")
         if not source_fill_id and order.get("client_order_id"):
             try:
                 existing = self.select(
@@ -419,9 +430,9 @@ class SupabaseGridRepository:
                 "filled_quantity": order.get("filled_quantity") or "0",
                 "remaining_quantity": order.get("remaining_quantity"),
                 "order_type": "limit_order",
-                "time_in_force": "gtc",
-                "post_only": True,
-                "reduce_only": bool(order.get("reduce_only", False)),
+                "time_in_force": time_in_force,
+                "post_only": bool(post_only),
+                "reduce_only": bool(reduce_only),
                 "status": order.get("status"),
                 "source_fill_id": source_fill_id,
                 "submitted_at": submitted_at,
@@ -680,6 +691,9 @@ class SupabaseGridRepository:
                     "order_kind": row.get("order_kind"),
                     "config_version": row.get("config_version"),
                     "source_fill_id": row.get("source_fill_id") or ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"),
+                    "reduce_only": row.get("reduce_only"),
+                    "post_only": row.get("post_only"),
+                    "time_in_force": row.get("time_in_force"),
                     "opens_inventory": ((row.get("raw") or {}).get("gridbot") or {}).get("opens_inventory"),
                     "projected_inventory_if_filled": ((row.get("raw") or {}).get("gridbot") or {}).get("projected_inventory_if_filled"),
                     "reserved_long_after": ((row.get("raw") or {}).get("gridbot") or {}).get("reserved_long_after"),

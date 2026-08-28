@@ -1919,6 +1919,34 @@ def test_supabase_order_source_fill_fallback_preserves_raw_link():
     assert "source_fill_id" not in row
 
 
+def test_supabase_persist_order_preserves_safety_flatten_execution_flags():
+    db = _MemorySupabaseGridRepository()
+    run = {"run_id": "run-flatten-flags", "bot_id": "bot-flatten", "config": {"config_version": 1}}
+
+    db.persist_order(
+        run,
+        {
+            "order_key": "DGB01-flatten-STOP-S-1",
+            "client_order_id": "DGB01-flatten-STOP-S-1",
+            "exchange_order_id": "exchange-flatten",
+            "level_id": "STOP",
+            "side": "sell",
+            "price": "2499.95",
+            "requested_quantity": "1",
+            "filled_quantity": "1",
+            "remaining_quantity": "0",
+            "status": "filled",
+            "order_kind": "safety_flatten",
+            "raw": {"id": "exchange-flatten", "reduce_only": True, "time_in_force": "ioc"},
+        },
+    )
+
+    row = next(iter(db.tables["grid_orders"].values()))
+    assert row["reduce_only"] is True
+    assert row["post_only"] is False
+    assert row["time_in_force"] == "ioc"
+
+
 class _MemorySupabaseGridRepository(SupabaseGridRepository):
     def __init__(self):
         self.enabled = True
