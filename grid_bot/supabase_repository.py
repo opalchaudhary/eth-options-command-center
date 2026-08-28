@@ -9,7 +9,7 @@ from .accounting import FEE_CONFIRMED, build_run_accounting, cycle_to_row, decim
 from .models import new_id, utc_now
 
 
-ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSED", "REGRID_PENDING", "STOPPING"}
+ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "REGRID_PENDING", "STOPPING"}
 
 
 class SupabasePersistenceError(RuntimeError):

@@ -1,4 +1,5 @@
 from decimal import Decimal
+import json
 import time
 
 import pytest
@@ -425,6 +426,7 @@ class _FakeLifecycleClient:
         self.orders = []
         self.fill_rows = []
         self.cancelled = []
+        self.position_size = "0"
 
     def product_spec(self, symbol):
         assert symbol == "ETHUSD"
@@ -476,10 +478,20 @@ class _FakeLifecycleClient:
         return {"success": True, "result": self.fill_rows}
 
     def positions(self, underlying_asset_symbol="ETH"):
-        return {"success": True, "result": [{"product_id": 1699, "size": "0"}]}
+        return {"success": True, "result": [{"product_id": 1699, "size": self.position_size}]}
 
     def account_margin(self):
         return {"success": True, "result": {"portfolio_margin": True}}
+
+    def wallet(self):
+        return {
+            "success": True,
+            "meta": {"net_equity": "1000"},
+            "result": [{"asset_symbol": "USD", "balance": "1000", "available_balance": "990", "blocked_margin": "10"}],
+        }
+
+    def ticker(self, symbol):
+        return {"success": True, "result": {"symbol": symbol, "mark_price": "2500", "spot_price": "2500"}}
 
 
 def _wait_for(predicate, timeout=3):
@@ -554,6 +566,196 @@ def test_durable_lifecycle_pause_resume_regrid_stop_summary(tmp_path):
     assert summary["immutable"] is True
     assert summary["stray_gridbot_orders"] == 0
     assert DurableGridBotLifecycle(client, lifecycle.state_path).status()["active_run_id"] is None
+
+
+def test_pause_enters_pausing_reconciles_and_preserves_nonzero_inventory(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    first_order = next(iter(started["run"]["orders"].values()))
+    signed_position = "1" if first_order["side"] == "buy" else "-1"
+    client.fill_rows = [
+        {
+            "id": "pause-fill-1",
+            "order_id": first_order["exchange_order_id"],
+            "client_order_id": first_order["client_order_id"],
+            "side": first_order["side"],
+            "price": first_order["price"],
+            "size": "1",
+            "commission": "0.01",
+        }
+    ]
+    client.position_size = signed_position
+
+    paused = lifecycle.pause(run_id)
+    events = [event["event_type"] for event in lifecycle.status()["events"]]
+
+    assert events.index("GRID_RUN_PAUSING") < events.index("GRID_RUN_PAUSED")
+    assert paused["run"]["status"] == GridStatus.PAUSED.value
+    assert paused["reconciliation"]["new_fills"] == 1
+    assert paused["reconciliation"]["gridbot_inventory"] == signed_position
+    assert paused["reconciliation"]["exchange_open_orders"] == 0
+    assert client.open_orders(1699)["result"] == []
+    assert client.position_size == signed_position
+
+
+def test_pause_fill_cancel_race_and_partial_fill_are_persisted_once(tmp_path):
+    class FillDuringCancelClient(_FakeLifecycleClient):
+        def cancel_order(self, product_id, order_id):
+            order = next(row for row in self.orders if str(row["id"]) == str(order_id))
+            if not self.fill_rows:
+                self.fill_rows.append(
+                    {
+                        "id": "race-partial-fill",
+                        "order_id": order["id"],
+                        "client_order_id": order["client_order_id"],
+                        "side": order["side"],
+                        "price": order["limit_price"],
+                        "size": "0.5",
+                        "commission": "0.01",
+                    }
+                )
+                self.position_size = "0.5" if order["side"] == "buy" else "-0.5"
+            return super().cancel_order(product_id, order_id)
+
+    client = FillDuringCancelClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+
+    first = lifecycle.pause(run_id)
+    second = lifecycle.pause(run_id)
+
+    assert first["run"]["status"] == GridStatus.PAUSED.value
+    assert first["reconciliation"]["new_fills"] == 1
+    assert second["reconciliation"]["new_fills"] == 0
+    assert len(second["run"]["fills"]) == 1
+    assert second["reconciliation"]["exchange_open_orders"] == 0
+
+
+def test_pause_terminalizes_deferred_never_submitted_replacements(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    state = lifecycle._load()
+    run = state["runs"][run_id]
+    run["deferred_orders"]["deferred-replacement"] = {
+        "order_key": "deferred-replacement",
+        "run_id": run_id,
+        "level_id": run["levels"][0]["level_id"],
+        "side": "sell",
+        "price": run["levels"][0]["price"],
+        "requested_quantity": "1",
+        "filled_quantity": "0",
+        "remaining_quantity": "0",
+        "client_order_id": "deferred-replacement",
+        "exchange_order_id": "",
+        "status": "deferred",
+        "order_kind": "replacement",
+    }
+    lifecycle._save(state)
+
+    paused = lifecycle.pause(run_id)
+
+    deferred = paused["run"]["deferred_orders"]["deferred-replacement"]
+    assert deferred["status"] == "cancelled_before_submission"
+    assert deferred["terminal_reason"] == "pause_before_submission"
+    assert paused["reconciliation"]["exchange_open_orders"] == 0
+
+
+def test_pause_exchange_failure_stays_pausing(tmp_path):
+    class FailingTruthClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.fail_truth = False
+
+        def open_orders(self, product_id=None):
+            if not self.fail_truth:
+                return super().open_orders(product_id)
+            raise RuntimeError("delta unavailable")
+
+    client = FailingTruthClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    client.fail_truth = True
+
+    with pytest.raises(RuntimeError, match="Pause could not establish exchange truth"):
+        lifecycle.pause(run_id)
+
+    status = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()["active_run"]
+    assert status["status"] == GridStatus.PAUSING.value
+    assert any(event["event_type"] == "GRID_RUN_PAUSE_BLOCKED" for event in lifecycle.status()["events"])
+
+
+def test_resume_reconciles_before_placement_rebuilds_reservations_and_is_idempotent(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    first_order = next(iter(started["run"]["orders"].values()))
+    signed_position = "1" if first_order["side"] == "buy" else "-1"
+    client.fill_rows = [
+        {
+            "id": "resume-fill-1",
+            "order_id": first_order["exchange_order_id"],
+            "client_order_id": first_order["client_order_id"],
+            "side": first_order["side"],
+            "price": first_order["price"],
+            "size": "1",
+            "commission": "0.01",
+        }
+    ]
+    client.position_size = signed_position
+    lifecycle.pause(run_id)
+
+    resumed = lifecycle.resume(run_id)
+    order_count_after_first_resume = len(client.open_orders(1699)["result"])
+    resumed_again = lifecycle.resume(run_id)
+    events = [event["event_type"] for event in lifecycle.status()["events"]]
+    resumed_orders = [order for order in resumed["run"]["orders"].values() if order.get("order_kind") == "resume_grid"]
+
+    assert events.index("GRID_RUN_RESUMING") < events.index("GRID_RUN_RESUMED")
+    assert resumed["run"]["status"] == GridStatus.RUNNING.value
+    assert resumed_again["attached"] is True
+    assert len(client.open_orders(1699)["result"]) == order_count_after_first_resume
+    assert all("projected_inventory_if_filled" in order for order in resumed_orders)
+    assert resumed["reconciliation"]["gridbot_inventory"] == signed_position
+
+
+def test_restart_while_pausing_or_resuming_can_complete_requested_lifecycle(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    state = lifecycle._load()
+    state["runs"][run_id]["status"] = GridStatus.PAUSING.value
+    lifecycle._save(state)
+
+    paused = DurableGridBotLifecycle(client, path, use_supabase=False).pause(run_id)
+    assert paused["run"]["status"] == GridStatus.PAUSED.value
+
+    state = DurableGridBotLifecycle(client, path, use_supabase=False)._load()
+    state["runs"][run_id]["status"] = GridStatus.RESUMING.value
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = DurableGridBotLifecycle(client, path, use_supabase=False).resume(run_id)
+    assert resumed["run"]["status"] == GridStatus.RUNNING.value
+
+
+def test_paused_survives_restart_without_auto_resume(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    paused = lifecycle.pause(run_id)
+
+    restarted = DurableGridBotLifecycle(client, path, use_supabase=False).status()
+
+    assert paused["run"]["status"] == GridStatus.PAUSED.value
+    assert restarted["active_run_id"] == run_id
+    assert restarted["active_run"]["status"] == GridStatus.PAUSED.value
+    assert client.open_orders(1699)["result"] == []
 
 
 def test_operator_preview_derives_reference_tick_and_account_risk(tmp_path):
@@ -1377,6 +1579,22 @@ def test_continuous_worker_no_change_polls_do_not_write_per_loop(tmp_path):
     assert after["insert_once"] == before["insert_once"] + 2
     assert after["upsert"] == before["upsert"]
     assert after["patch"] == before["patch"]
+
+
+def test_paused_run_worker_refresh_does_not_write_per_loop(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    paused = lifecycle.pause(started["run"]["run_id"])
+    db.write_counts = {"upsert": 0, "insert_once": 0, "patch": 0}
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = paused["run"]
+
+    for _ in range(5):
+        worker._refresh_active_run_if_due()
+
+    assert db.write_counts == {"upsert": 0, "insert_once": 0, "patch": 0}
 
 
 def test_continuous_worker_default_snapshot_cadence_is_five_minutes():

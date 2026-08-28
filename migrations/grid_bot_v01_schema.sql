@@ -306,7 +306,7 @@ create table if not exists grid_run_summaries (
 
 create unique index if not exists idx_grid_runs_single_active_v01
     on grid_runs ((true))
-    where status in ('STARTING', 'RUNNING', 'PAUSED', 'REGRID_PENDING');
+    where status in ('STARTING', 'RUNNING', 'PAUSING', 'PAUSED', 'RESUMING', 'REGRID_PENDING');
 
 create unique index if not exists idx_grid_order_proposals_client_order_id
     on grid_order_proposals (client_order_id);

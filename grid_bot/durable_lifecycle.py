@@ -11,7 +11,7 @@ from typing import Any
 
 from .accounting import build_run_accounting
 from .config import DEFAULT_RISK_THRESHOLDS, GRIDBOT_VERSION
-from .account_telemetry import AccountTelemetryCache
+from .account_telemetry import AccountTelemetryCache, risk_increasing_action_allowed
 from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .exchange_truth import reconcile_exchange_truth
@@ -21,7 +21,15 @@ from .semantics import evaluate_order_semantics, round_price_for_side, validate_
 from .supabase_repository import SupabaseGridRepository, SupabasePersistenceError
 
 
-ACTIVE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value, GridStatus.STOPPING.value}
+ACTIVE_STATUSES = {
+    GridStatus.STARTING.value,
+    GridStatus.RUNNING.value,
+    GridStatus.PAUSING.value,
+    GridStatus.PAUSED.value,
+    GridStatus.RESUMING.value,
+    GridStatus.REGRID_PENDING.value,
+    GridStatus.STOPPING.value,
+}
 GRIDBOT_ORDER_PREFIX = "DGB01-"
 DEFAULT_STATE_PATH = Path(os.getenv("GRIDBOT_V01_STATE_PATH", "grid_bot_state_v01.json"))
 START_TERMINAL_ORDER_STATUSES = {
@@ -153,7 +161,16 @@ class DurableGridBotLifecycle:
                 return {"runs": {run["run_id"]: run}, "active_run_id": run["run_id"], "events": []}
         if not self.state_path.exists():
             return {"runs": {}, "active_run_id": None, "events": []}
-        return json.loads(self.state_path.read_text(encoding="utf-8"))
+        last_error: Exception | None = None
+        for attempt in range(5):
+            try:
+                return json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (PermissionError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+        raise last_error or RuntimeError("Unable to load durable DeltaGridBot state.")
 
     def _save(self, state: dict) -> None:
         with self._save_lock:
@@ -634,6 +651,57 @@ class DurableGridBotLifecycle:
             if order.get("status") not in START_TERMINAL_ORDER_STATUSES
         ]
 
+    def _set_run_status(self, state: dict, run: dict, status: GridStatus, event_type: str, payload: dict | None = None) -> None:
+        run["status"] = status.value
+        self._event(state, run["run_id"], event_type, payload or {})
+        self._save(state)
+
+    def _terminalize_deferred_for_pause(self, run: dict) -> int:
+        return self._terminalize_never_submitted_orders(
+            run,
+            status="cancelled_before_submission",
+            reason="pause_before_submission",
+        )
+
+    def _cancel_known_gridbot_resting_orders(self, run: dict, product_id: int) -> int:
+        attempted = 0
+        for order in run.get("orders", {}).values():
+            if order.get("status") in START_TERMINAL_ORDER_STATUSES:
+                continue
+            if not order.get("exchange_order_id"):
+                continue
+            attempted += 1
+            self._cancel_order_safely(product_id, order)
+        return attempted
+
+    def _assert_pause_reconciled(self, reconciliation: dict) -> None:
+        errors = reconciliation.get("errors") or []
+        open_orders = int(reconciliation.get("exchange_open_orders") or 0)
+        unresolved = int(reconciliation.get("unresolved_orders") or 0)
+        mismatches = int(reconciliation.get("position_mismatches") or 0)
+        if errors or open_orders or unresolved or mismatches:
+            raise RuntimeError(
+                "Pause could not establish exchange truth: "
+                f"errors={errors}, open_gridbot_orders={open_orders}, "
+                f"unresolved_orders={unresolved}, position_mismatches={mismatches}"
+            )
+
+    def _assert_resume_ready(self, run: dict, reconciliation: dict) -> Decimal:
+        errors = reconciliation.get("errors") or []
+        unresolved = int(reconciliation.get("unresolved_orders") or 0)
+        mismatches = int(reconciliation.get("position_mismatches") or 0)
+        if errors or unresolved or mismatches:
+            raise RuntimeError(
+                "Resume could not establish exchange truth: "
+                f"errors={errors}, unresolved_orders={unresolved}, position_mismatches={mismatches}"
+            )
+        product_symbol = run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD"
+        telemetry = self.account_telemetry.get(product_symbol, force=True)
+        allowed, reasons = risk_increasing_action_allowed(telemetry)
+        if not allowed:
+            raise RuntimeError(f"Resume requires fresh critical telemetry before placement: {','.join(reasons)}")
+        return _decimal(reconciliation.get("gridbot_inventory"), str(telemetry.position_lots or "0"))
+
     def _place_proposal(
         self,
         run: dict,
@@ -955,20 +1023,82 @@ class DurableGridBotLifecycle:
         if not run:
             raise RuntimeError("No active durable DeltaGridBot run found.")
         product_id = int(run["product"]["product_id"])
-        for order in run.get("orders", {}).values():
-            if order.get("status") not in START_TERMINAL_ORDER_STATUSES:
-                self._cancel_order_safely(product_id, order)
-        run["status"] = GridStatus.PAUSED.value
-        self._event(state, run["run_id"], "GRID_RUN_PAUSED", {})
+        if run.get("status") == GridStatus.PAUSED.value:
+            reconciled = self.reconcile(run["run_id"], process_replacements=False)
+            self._assert_pause_reconciled(reconciled["reconciliation"])
+            return {"ok": True, "run": deepcopy(reconciled["run"]), "reconciliation": reconciled["reconciliation"]}
+
+        if run.get("status") != GridStatus.PAUSING.value:
+            self._set_run_status(state, run, GridStatus.PAUSING, "GRID_RUN_PAUSING", {"previous_status": run.get("status")})
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+
+        cancelled_attempts = self._cancel_known_gridbot_resting_orders(run, product_id)
+        deferred_terminalized = self._terminalize_deferred_for_pause(run)
         self._save(state)
-        return {"ok": True, "run": deepcopy(run)}
+
+        reconciled = self.reconcile(run["run_id"], process_replacements=False)
+        if reconciled["reconciliation"].get("exchange_open_orders"):
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+            cancelled_attempts += self._cancel_known_gridbot_resting_orders(run, product_id)
+            self._save(state)
+            reconciled = self.reconcile(run["run_id"], process_replacements=False)
+
+        state = self._load()
+        run = state["runs"][run["run_id"]]
+        try:
+            self._assert_pause_reconciled(reconciled["reconciliation"])
+        except RuntimeError as exc:
+            self._event(
+                state,
+                run["run_id"],
+                "GRID_RUN_PAUSE_BLOCKED",
+                {"reason": str(exc), "cancel_attempts": cancelled_attempts, "deferred_terminalized": deferred_terminalized},
+            )
+            self._save(state)
+            raise
+
+        run["status"] = GridStatus.PAUSED.value
+        self._event(
+            state,
+            run["run_id"],
+            "GRID_RUN_PAUSED",
+            {
+                "open_gridbot_orders": reconciled["open_gridbot_orders"],
+                "gridbot_inventory": reconciled["reconciliation"].get("gridbot_inventory"),
+                "delta_position": reconciled["position"],
+                "cancel_attempts": cancelled_attempts,
+                "deferred_terminalized": deferred_terminalized,
+            },
+        )
+        self._save(state)
+        return {"ok": True, "run": deepcopy(run), "reconciliation": reconciled["reconciliation"]}
 
     def resume(self, run_id: str | None = None) -> dict:
         state = self._load()
         run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
         if not run:
             raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") == GridStatus.RUNNING.value:
+            return {"ok": True, "run": deepcopy(run), "attached": True}
+        if run.get("status") == GridStatus.PAUSING.value:
+            paused = self.pause(run["run_id"])
+            state = self._load()
+            run = state["runs"][paused["run"]["run_id"]]
+        if run.get("status") != GridStatus.RESUMING.value:
+            if run.get("status") not in {GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value}:
+                raise RuntimeError(f"Cannot resume durable DeltaGridBot run from status {run.get('status')}.")
+            self._set_run_status(state, run, GridStatus.RESUMING, "GRID_RUN_RESUMING", {"previous_status": run.get("status")})
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+
         product_id = int(run["product"]["product_id"])
+        reconciled = self.reconcile(run["run_id"], process_replacements=False)
+        state = self._load()
+        run = state["runs"][run["run_id"]]
+        inventory = self._assert_resume_ready(run, reconciled["reconciliation"])
+
         for level in run["levels"]:
             existing_open = [
                 order
@@ -977,11 +1107,40 @@ class DurableGridBotLifecycle:
             ]
             if not existing_open:
                 proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                self._place_proposal(run, product_id, proposal, "resume_grid")
-        run["status"] = GridStatus.RUNNING.value
-        self._event(state, run["run_id"], "GRID_RUN_RESUMED", {})
+                self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory)
         self._save(state)
-        return {"ok": True, "run": deepcopy(run)}
+
+        verified = self.reconcile(run["run_id"], process_replacements=False)
+        state = self._load()
+        run = state["runs"][run["run_id"]]
+        errors = verified["reconciliation"].get("errors") or []
+        unresolved = int(verified["reconciliation"].get("unresolved_orders") or 0)
+        mismatches = int(verified["reconciliation"].get("position_mismatches") or 0)
+        if errors or unresolved or mismatches:
+            self._event(
+                state,
+                run["run_id"],
+                "GRID_RUN_RESUME_BLOCKED",
+                {"errors": errors, "unresolved_orders": unresolved, "position_mismatches": mismatches},
+            )
+            self._save(state)
+            raise RuntimeError(
+                "Resume placement could not be verified: "
+                f"errors={errors}, unresolved_orders={unresolved}, position_mismatches={mismatches}"
+            )
+        run["status"] = GridStatus.RUNNING.value
+        self._event(
+            state,
+            run["run_id"],
+            "GRID_RUN_RESUMED",
+            {
+                "open_gridbot_orders": verified["open_gridbot_orders"],
+                "gridbot_inventory": verified["reconciliation"].get("gridbot_inventory"),
+                "delta_position": verified["position"],
+            },
+        )
+        self._save(state)
+        return {"ok": True, "run": deepcopy(run), "reconciliation": verified["reconciliation"]}
 
     def regrid(self, run_id: str | None = None) -> dict:
         paused = self.pause(run_id)

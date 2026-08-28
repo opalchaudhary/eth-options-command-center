@@ -6,7 +6,15 @@ from typing import Any
 from .models import GridConfig, GridRun, GridStatus, new_id, to_record_dict, utc_now
 
 
-ACTIVE_STATUSES = {GridStatus.STARTING, GridStatus.RUNNING, GridStatus.PAUSED, GridStatus.REGRID_PENDING, GridStatus.STOPPING}
+ACTIVE_STATUSES = {
+    GridStatus.STARTING,
+    GridStatus.RUNNING,
+    GridStatus.PAUSING,
+    GridStatus.PAUSED,
+    GridStatus.RESUMING,
+    GridStatus.REGRID_PENDING,
+    GridStatus.STOPPING,
+}
 
 
 class InMemoryGridRepository:
