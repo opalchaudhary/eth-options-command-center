@@ -136,6 +136,11 @@ def _replacement_client_order_id(run_id: str, level_id: str, side: Side, source_
     return f"DGB01-{run_id[-8:]}-{level_id}-{side.value[0].upper()}-R{stable}"[:32]
 
 
+def _replacement_group_client_order_id(run_id: str, level_id: str, side: Side, source_order_key: str, sequence: int) -> str:
+    stable = "".join(ch for ch in source_order_key if ch.isalnum())[-6:] or "order"
+    return f"DGB01-{run_id[-8:]}-{level_id}-{side.value[0].upper()}-G{stable}{sequence}"[:32]
+
+
 def _flatten_client_order_id(run_id: str, side: Side, sequence: int) -> str:
     return f"DGB01-{run_id[-8:]}-STOP-{side.value[0].upper()}-{sequence}"[:32]
 
@@ -1149,20 +1154,253 @@ class DurableGridBotLifecycle:
 
     def process_replacements(self, run: dict, reconciliation: dict | None = None) -> dict:
         product_id = int(run["product"]["product_id"])
-        outcome = {"created": 0, "deferred": 0, "skipped": 0, "existing": 0, "items": []}
+        outcome = {
+            "created": 0,
+            "deferred": 0,
+            "skipped": 0,
+            "existing": 0,
+            "cancel_replaced": 0,
+            "items": [],
+            "metrics": {},
+        }
+        self._refresh_replacement_entitlements(run)
         if run.get("status") and run.get("status") != GridStatus.RUNNING.value:
             outcome["skipped"] = len(run.get("fills") or {})
             outcome["items"].append({"state": "skipped", "reason": "run_not_running", "status": run.get("status")})
+            outcome["metrics"] = self._replacement_metrics(run)
             return outcome
-        fills = run.get("fills") or {}
         inventory = _decimal((reconciliation or {}).get("gridbot_inventory"), str(_position_size(self.client, product_id)))
-        for fill_id, fill in list(fills.items()):
-            raw = fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill
-            result = self._place_replacement_for_fill(run, raw, product_id, str(fill_id), inventory)
+        outcome["skipped"] = int(run.pop("_replacement_refresh_skipped", 0) or 0)
+        for group_key, group in sorted((run.get("replacement_entitlements") or {}).items()):
+            result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory)
             if result:
                 outcome[result["state"]] = outcome.get(result["state"], 0) + 1
+                if result.get("cancel_replaced"):
+                    outcome["cancel_replaced"] += 1
                 outcome["items"].append(result)
+        outcome["metrics"] = self._replacement_metrics(run)
         return outcome
+
+    def _find_order_for_fill(self, run: dict, fill: dict) -> dict | None:
+        order = (run.get("orders") or {}).get(str(fill.get("client_order_id")))
+        if order:
+            return order
+        return next(
+            (
+                row
+                for row in (run.get("orders") or {}).values()
+                if str(row.get("exchange_order_id") or "") == str(fill.get("order_id") or "")
+            ),
+            None,
+        )
+
+    def _replacement_target_for_order(self, run: dict, order: dict, fill_side: Side) -> dict | None:
+        levels = run.get("levels") or []
+        current_index = next((index for index, level in enumerate(levels) if level.get("level_id") == order.get("level_id")), None)
+        if current_index is None:
+            return None
+        target_index = current_index + 1 if fill_side == Side.BUY else current_index - 1
+        if target_index < 0 or target_index >= len(levels):
+            return None
+        target = deepcopy(levels[target_index])
+        target["side"] = Side.SELL.value if fill_side == Side.BUY else Side.BUY.value
+        return target
+
+    def _refresh_replacement_entitlements(self, run: dict) -> None:
+        entitlements: dict[str, dict] = {}
+        fill_links: dict[str, dict] = {}
+        skipped = 0
+        for fill_id, fill_record in sorted((run.get("fills") or {}).items()):
+            fill = fill_record.get("raw") if isinstance(fill_record, dict) and isinstance(fill_record.get("raw"), dict) else fill_record
+            source_order = self._find_order_for_fill(run, fill)
+            if not source_order or source_order.get("order_kind") == "safety_flatten":
+                run.setdefault("replacement_keys", {})[f"{fill_id}:replacement"] = {"skipped": True, "reason": "source_order_not_found"}
+                skipped += 1
+                continue
+            try:
+                fill_side = Side(str(fill.get("side")).lower())
+            except Exception:
+                run.setdefault("replacement_keys", {})[f"{fill_id}:replacement"] = {"skipped": True, "reason": "invalid_fill_side"}
+                skipped += 1
+                continue
+            target = self._replacement_target_for_order(run, source_order, fill_side)
+            if not target:
+                reason = "source_level_not_found" if not any(level.get("level_id") == source_order.get("level_id") for level in (run.get("levels") or [])) else "edge_level"
+                run.setdefault("replacement_keys", {})[f"{fill_id}:replacement"] = {"skipped": True, "reason": reason}
+                skipped += 1
+                continue
+            source_order_key = source_order.get("client_order_id") or source_order.get("order_key") or str(fill.get("client_order_id") or fill.get("order_id"))
+            group_key = f"{source_order_key}:{target['level_id']}:{target['side']}"
+            group = entitlements.setdefault(
+                group_key,
+                {
+                    "replacement_group_key": group_key,
+                    "source_order_key": source_order_key,
+                    "source_level_id": source_order.get("level_id"),
+                    "target_level_id": target["level_id"],
+                    "target_side": target["side"],
+                    "target_price": str(target["price"]),
+                    "configured_target_qty": str(source_order.get("requested_quantity") or target.get("quantity") or "0"),
+                    "source_fill_ids": [],
+                    "submitted_order_ids": [],
+                    "created_at": utc_now(),
+                },
+            )
+            group["source_fill_ids"].append(_fill_identity(fill, str(fill_id)))
+            group["replacement_entitlement_qty"] = str(_decimal(group.get("replacement_entitlement_qty")) + _decimal(fill.get("size")))
+            fill_links[f"{fill_id}:replacement"] = {"replacement_group_key": group_key, "state": "aggregated"}
+
+        replacement_records = {
+            str(order.get("client_order_id") or order.get("order_key") or index): order
+            for index, order in enumerate(list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values()))
+        }
+        for order in replacement_records.values():
+            if order.get("order_kind") != "replacement":
+                continue
+            group_key = order.get("replacement_group_key")
+            if not group_key:
+                source_order_key = order.get("source_order_key") or order.get("source_fill_id") or "legacy"
+                group_key = f"{source_order_key}:{order.get('level_id')}:{order.get('side')}"
+                order["replacement_group_key"] = group_key
+            if group_key in entitlements:
+                entitlements[group_key].setdefault("submitted_order_ids", []).append(order.get("client_order_id"))
+
+        for group_key, group in entitlements.items():
+            related = [order for order in replacement_records.values() if order.get("replacement_group_key") == group_key]
+            filled = sum((_decimal(order.get("filled_quantity")) for order in related), Decimal("0"))
+            open_qty = sum(
+                (
+                    _decimal(order.get("remaining_quantity"))
+                    for order in related
+                    if str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+                ),
+                Decimal("0"),
+            )
+            submitted = sum((_decimal(order.get("requested_quantity")) for order in related), Decimal("0"))
+            entitlement = _decimal(group.get("replacement_entitlement_qty"))
+            group["replacement_qty_already_submitted"] = str(submitted)
+            group["replacement_qty_already_filled"] = str(filled)
+            group["replacement_qty_currently_open"] = str(open_qty)
+            group["replacement_deficit_qty"] = str(max(Decimal("0"), entitlement - filled - open_qty))
+            group["unrepresented_replacement_entitlement"] = group["replacement_deficit_qty"]
+            group["updated_at"] = utc_now()
+
+        run["replacement_entitlements"] = entitlements
+        run.setdefault("replacement_keys", {}).update(fill_links)
+        run["_replacement_refresh_skipped"] = skipped
+
+    def _replacement_metrics(self, run: dict) -> dict:
+        fills = run.get("fills") or {}
+        replacement_orders = [order for order in (run.get("orders") or {}).values() if order.get("order_kind") == "replacement"]
+        quantities = [_decimal(order.get("requested_quantity")) for order in replacement_orders]
+        total_replacement_qty = sum(quantities, Decimal("0"))
+        entitlements = run.get("replacement_entitlements") or {}
+        logical_count = len(entitlements)
+        return {
+            "total_exchange_fills": len(fills),
+            "partial_fill_fragments": len(fills),
+            "logical_source_orders": logical_count,
+            "replacement_entitlement_generated": str(sum((_decimal(item.get("replacement_entitlement_qty")) for item in entitlements.values()), Decimal("0"))),
+            "replacement_orders_submitted": len(replacement_orders),
+            "average_replacement_quantity": str(total_replacement_qty / Decimal(len(quantities))) if quantities else "0",
+            "replacement_orders_per_logical_source_order": str(Decimal(len(replacement_orders)) / Decimal(logical_count)) if logical_count else "0",
+            "unrepresented_replacement_entitlement": str(sum((_decimal(item.get("replacement_deficit_qty")) for item in entitlements.values()), Decimal("0"))),
+            "duplicate_replacement_attempts": 0,
+        }
+
+    def _place_replacement_for_entitlement(
+        self,
+        run: dict,
+        product_id: int,
+        group_key: str,
+        group: dict,
+        current_inventory: Decimal | None = None,
+    ) -> dict | None:
+        entitlement = _decimal(group.get("replacement_entitlement_qty"))
+        filled = _decimal(group.get("replacement_qty_already_filled"))
+        open_qty = _decimal(group.get("replacement_qty_currently_open"))
+        deficit = max(Decimal("0"), entitlement - filled - open_qty)
+        related_deferred = [
+            order
+            for order in (run.get("deferred_orders") or {}).values()
+            if order.get("replacement_group_key") == group_key and not order.get("exchange_order_id")
+        ]
+        for order in related_deferred:
+            run.setdefault("orders", {}).pop(order.get("client_order_id"), None)
+            run.setdefault("deferred_orders", {}).pop(order.get("client_order_id"), None)
+            order["status"] = "superseded"
+            order["terminal_reason"] = "replacement_entitlement_retry"
+        related_open = [
+            order
+            for order in (run.get("orders") or {}).values()
+            if order.get("replacement_group_key") == group_key and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+        ]
+        if deficit <= 0:
+            return {"state": "existing", "replacement_group_key": group_key, "entitlement": str(entitlement), "open": str(open_qty), "filled": str(filled)}
+        if related_open:
+            for order in related_open:
+                self._cancel_order_safely(product_id, order)
+                order["remaining_quantity"] = "0"
+                order["cancel_replace_reason"] = "replacement_entitlement_increased"
+            open_qty = Decimal("0")
+            deficit = max(Decimal("0"), entitlement - filled)
+
+        target = {
+            "level_id": group["target_level_id"],
+            "side": group["target_side"],
+            "price": group["target_price"],
+            "quantity": str(deficit),
+        }
+        source_fill_ids = list(group.get("source_fill_ids") or [])
+        if len(source_fill_ids) == 1 and not group.get("submitted_order_ids"):
+            client_order_id = _replacement_client_order_id(run["run_id"], group["target_level_id"], Side(group["target_side"]), source_fill_ids[0])
+        else:
+            client_order_id = _replacement_group_client_order_id(
+                run["run_id"],
+                group["target_level_id"],
+                Side(group["target_side"]),
+                group["source_order_key"],
+                int(run.get("sequence", 1)),
+            )
+        proposal = self._proposal_for_level(
+            run["run_id"],
+            target,
+            int(run["sequence"]),
+            quantity=deficit,
+            client_order_id=client_order_id,
+        )
+        created = self._place_proposal(
+            run,
+            product_id,
+            proposal,
+            "replacement",
+            current_inventory=current_inventory,
+            source_fill_id=source_fill_ids[0] if len(source_fill_ids) == 1 else group_key,
+        )
+        created["replacement_group_key"] = group_key
+        created["source_order_key"] = group["source_order_key"]
+        created["source_fill_ids"] = list(group.get("source_fill_ids") or [])
+        if self._db_enabled():
+            self.db.persist_order(run, created)
+        if created.get("status") == "deferred":
+            run.setdefault("deferred_orders", {})[created["client_order_id"]]["replacement_group_key"] = group_key
+            state = "deferred"
+        else:
+            state = "created"
+        group.setdefault("submitted_order_ids", []).append(created["client_order_id"])
+        group["replacement_qty_currently_open"] = str(deficit if state == "created" else Decimal("0"))
+        group["replacement_deficit_qty"] = "0" if state == "created" else str(deficit)
+        group["last_replacement_client_order_id"] = created["client_order_id"]
+        group["last_submitted_at"] = utc_now()
+        return {
+            "state": state,
+            "replacement_group_key": group_key,
+            "client_order_id": created["client_order_id"],
+            "level_id": group["target_level_id"],
+            "quantity": str(deficit),
+            "entitlement": str(entitlement),
+            "cancel_replaced": bool(related_open),
+        }
 
     def _place_replacement_for_fill(
         self,

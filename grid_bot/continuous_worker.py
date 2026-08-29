@@ -327,6 +327,7 @@ class ContinuousGridBotWorker:
             accounting=build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=telemetry.position_lots).as_dict(),
             account_telemetry_refresh_count=self._state["account_telemetry_refresh_count"] + (1 if telemetry_refreshed else 0),
             delta_account_telemetry_request_counts=dict(self.account_telemetry.request_counts),
+            replacement_aggregation_metrics=replacement_result.get("metrics") or {},
         )
         with self._lock:
             self._run = run
