@@ -240,6 +240,7 @@ def reconcile_exchange_truth(
         known_fill_ids.add(fill_identity(fill.get("raw") or fill))
 
     matched_fills = [fill for fill in fill_history if any(fill_matches_order(fill, order) for order in orders.values())]
+    cycles_need_persist = False
     for fill in matched_fills:
         fid = fill_identity(fill)
         if fid in known_fill_ids:
@@ -249,7 +250,10 @@ def reconcile_exchange_truth(
         known_fill_ids.add(fid)
         result.new_fills += 1
         if db and getattr(db, "enabled", False):
-            db.persist_fill(run, fid, fill)
+            inserted = db.persist_fill(run, fid, fill, persist_cycles=False)
+            cycles_need_persist = cycles_need_persist or bool(inserted)
+    if cycles_need_persist and db and getattr(db, "enabled", False):
+        db.persist_cycles(run)
 
     all_fills = list(persisted_fills.values())
     result.gridbot_inventory = inventory_from_fills([fill.get("raw") or fill for fill in all_fills])

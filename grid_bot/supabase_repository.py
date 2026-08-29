@@ -448,7 +448,7 @@ class SupabaseGridRepository:
             on_conflict="client_order_id",
         )
 
-    def persist_fill(self, run: dict, fill_id: str, fill: dict) -> bool:
+    def persist_fill(self, run: dict, fill_id: str, fill: dict, persist_cycles: bool = True) -> bool:
         client_order_id = str(fill.get("client_order_id") or "")
         orders = run.get("orders") or {}
         exchange_order_id = str(fill.get("order_id") or fill.get("exchange_order_id") or "")
@@ -517,7 +517,8 @@ class SupabaseGridRepository:
                     },
                     on_conflict="cost_id",
                 )
-            self.persist_cycles(run)
+            if persist_cycles:
+                self.persist_cycles(run)
         return inserted
 
     def persist_cycles(self, run: dict) -> None:
