@@ -2021,6 +2021,38 @@ def test_replacement_semantics_neutral_buy_to_adjacent_sell_and_idempotent(tmp_p
     assert replacements[0]["source_fill_id"] == "fill-buy"
 
 
+def test_existing_target_level_order_satisfies_replacement_entitlement(tmp_path):
+    client = _FakeLifecycleClient()
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-buy")
+    run["orders"]["target-open"] = {
+        "order_key": "target-open",
+        "run_id": run["run_id"],
+        "level_id": "L003",
+        "side": "sell",
+        "price": "2505",
+        "requested_quantity": "1",
+        "filled_quantity": "0",
+        "remaining_quantity": "1",
+        "client_order_id": "target-open",
+        "exchange_order_id": "target-open-exchange",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 3,
+    }
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"]
+    entitlement = next(iter(run["replacement_entitlements"].values()))
+
+    assert result["existing"] == 1
+    assert result["created"] == 0
+    assert replacements == []
+    assert entitlement["replacement_qty_currently_open"] == "1"
+    assert run["orders"]["target-open"]["replacement_group_key"] == entitlement["replacement_group_key"]
+    assert len(client.orders) == 0
+
+
 def test_partial_fill_fragments_aggregate_to_one_logical_replacement(tmp_path):
     client = _FakeLifecycleClient()
     run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-1", fill_size="1")

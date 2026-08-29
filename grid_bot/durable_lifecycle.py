@@ -1266,7 +1266,14 @@ class DurableGridBotLifecycle:
                 entitlements[group_key].setdefault("submitted_order_ids", []).append(order.get("client_order_id"))
 
         for group_key, group in entitlements.items():
-            related = [order for order in replacement_records.values() if order.get("replacement_group_key") == group_key]
+            for order in replacement_records.values():
+                if not order.get("replacement_group_key") and self._order_represents_replacement_entitlement(order, group_key, group):
+                    order["replacement_group_key"] = group_key
+                    order["source_order_key"] = group.get("source_order_key")
+                    order["source_fill_ids"] = list(group.get("source_fill_ids") or [])
+                    if self._db_enabled():
+                        self.db.persist_order(run, order)
+            related = [order for order in replacement_records.values() if self._order_represents_replacement_entitlement(order, group_key, group)]
             filled = sum((_decimal(order.get("filled_quantity")) for order in related), Decimal("0"))
             open_qty = sum(
                 (
@@ -1288,6 +1295,21 @@ class DurableGridBotLifecycle:
         run["replacement_entitlements"] = entitlements
         run.setdefault("replacement_keys", {}).update(fill_links)
         run["_replacement_refresh_skipped"] = skipped
+
+    def _order_represents_replacement_entitlement(self, order: dict, group_key: str, group: dict) -> bool:
+        if order.get("replacement_group_key") == group_key:
+            return True
+        if order.get("client_order_id") == group.get("source_order_key"):
+            return False
+        if order.get("order_kind") == "safety_flatten":
+            return False
+        if str(order.get("status") or "").lower() in START_TERMINAL_ORDER_STATUSES:
+            return False
+        return (
+            order.get("level_id") == group.get("target_level_id")
+            and order.get("side") == group.get("target_side")
+            and _decimal(order.get("price")) == _decimal(group.get("target_price"))
+        )
 
     def _replacement_metrics(self, run: dict) -> dict:
         fills = run.get("fills") or {}
@@ -1333,7 +1355,8 @@ class DurableGridBotLifecycle:
         related_open = [
             order
             for order in (run.get("orders") or {}).values()
-            if order.get("replacement_group_key") == group_key and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+            if self._order_represents_replacement_entitlement(order, group_key, group)
+            and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
         ]
         if deficit <= 0:
             return {"state": "existing", "replacement_group_key": group_key, "entitlement": str(entitlement), "open": str(open_qty), "filled": str(filled)}
