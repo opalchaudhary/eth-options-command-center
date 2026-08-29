@@ -15,6 +15,7 @@ from probability_engine.jobs.evaluation_job import run_probability_performance_j
 from probability_engine.jobs.outcome_job import run_probability_outcome_job
 from probability_engine.jobs.prediction_job import run_probability_prediction_job
 from probability_engine.jobs.strike_job import run_probability_strike_scan_job
+from probability_engine.jobs.v2_outcome_job import run_probability_v2_shadow_outcome_job
 from probability_engine.jobs.v2_shadow_job import run_probability_v2_shadow_job
 from backend.services.rich_orderflow_ws_service import orderflow_ws_status
 from grid_bot.jobs import run_gridbot_heartbeat_job
@@ -44,6 +45,7 @@ _job_locks = {
     "probability_outcome_evaluator_v1": threading.Lock(),
     "probability_performance_daily_v1": threading.Lock(),
     "probability_v2_shadow_prediction_v1": threading.Lock(),
+    "probability_v2_shadow_outcome_evaluator_v1": threading.Lock(),
     "rich_derivatives_v1": threading.Lock(),
     "rich_orderflow_v1": threading.Lock(),
     "rich_orderbook_v1": threading.Lock(),
@@ -304,7 +306,12 @@ def start_scheduler():
             run_probability_v2_shadow_job,
             probability_config.v2_shadow_interval_seconds,
         )
-        logger.info("Probability V2 shadow scheduler job registered.")
+        _add_interval_job(
+            "probability_v2_shadow_outcome_evaluator_v1",
+            run_probability_v2_shadow_outcome_job,
+            probability_config.outcome_interval_seconds,
+        )
+        logger.info("Probability V2 shadow scheduler jobs registered.")
     else:
         logger.info("Probability V2 shadow scheduler job is disabled by config.")
     if config.RICH_DATA_COLLECTION_ENABLED:
@@ -411,6 +418,7 @@ def data_refresh_jobs_running():
                 "probability_outcome_evaluator_v1",
                 "probability_performance_daily_v1",
                 "probability_v2_shadow_prediction_v1",
+                "probability_v2_shadow_outcome_evaluator_v1",
                 "rich_derivatives_v1",
                 "rich_orderflow_v1",
                 "rich_orderbook_v1",

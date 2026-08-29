@@ -6,11 +6,14 @@ import pandas as pd
 
 from probability_engine.services.v2_shadow_outcome import is_mature
 from probability_engine.services.v2_shadow_service import (
+    FROZEN_MANIFEST_HASH,
     clamp_probability,
     compute_v2_features_for_timestamps,
     load_ohlcv_from_supabase,
     load_manifest,
+    manifest_identity_hash,
     requires_range_reference,
+    semantic_manifest_hash,
 )
 
 
@@ -34,6 +37,16 @@ def test_packaged_manifest_loads_and_has_frozen_counts():
     assert manifest["spec_version"] == "probability_v2_candidate_v1"
     assert len(manifest["models"]) == 26
     assert len(manifest["derived_outputs"]) == 4
+    assert manifest_identity_hash() == FROZEN_MANIFEST_HASH
+
+
+def test_manifest_semantic_hash_is_line_ending_independent(tmp_path):
+    source = load_manifest()
+    lf_path = tmp_path / "manifest.json"
+    lf_path.write_text(__import__("json").dumps(source, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    assert semantic_manifest_hash(source) == semantic_manifest_hash(load_manifest(lf_path))
+    assert manifest_identity_hash(lf_path) == FROZEN_MANIFEST_HASH
 
 
 def test_historical_feature_mode_is_deterministic_for_supplied_timestamp_grid():
@@ -104,3 +117,128 @@ def test_v2_shadow_outcome_maturity_respects_horizon():
 
     assert is_mature(prediction, now=datetime(2026, 1, 1, 1, 59, tzinfo=timezone.utc)) is False
     assert is_mature(prediction, now=datetime(2026, 1, 1, 2, 0, tzinfo=timezone.utc)) is True
+
+
+def _v2_prediction(prediction_id="v2-1", target="path_inside_70", horizon="1H", prediction_timestamp=None):
+    prediction_timestamp = prediction_timestamp or datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    return {
+        "id": prediction_id,
+        "feature_snapshot_id": "snap-1",
+        "prediction_timestamp": prediction_timestamp.isoformat(),
+        "symbol": "ETHUSD",
+        "record_type": "LIVE",
+        "model_version": "probability_v2_candidate_v1",
+        "model_id": f"probability_v2_candidate_v1__{target}__{horizon.lower()}",
+        "target": target,
+        "horizon": horizon,
+        "feature_version": "probability_v2_features_v1",
+        "label_version": "label_v2",
+        "calibration_version": "calibration_v2_candidate_v1",
+        "manifest_hash": FROZEN_MANIFEST_HASH,
+        "metadata_json": {
+            "range_70_lower": 95,
+            "range_70_upper": 105,
+            "range_reference_status": "OK",
+        },
+    }
+
+
+def _v2_candles(start, count=12, high=104, low=96, close=101):
+    return pd.DataFrame(
+        [
+            {
+                "candle_time": start + timedelta(minutes=5 * index),
+                "open": 100,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 1,
+            }
+            for index in range(count)
+        ]
+    )
+
+
+class FakeV2PredictionRepository:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def mature_candidates(self, before_iso, limit=100, offset=0):
+        before = pd.Timestamp(before_iso)
+        pending = [row for row in self.rows if pd.Timestamp(row["prediction_timestamp"]) <= before]
+        return pending[offset : offset + limit]
+
+
+class FakeV2OutcomeRepository:
+    def __init__(self, existing=None):
+        self.existing = set(existing or [])
+        self.inserted = []
+
+    def existing_prediction_ids(self, prediction_ids, label_version="label_v2"):
+        return self.existing.intersection(prediction_ids)
+
+    def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
+        if prediction_id in self.existing:
+            return False
+        self.existing.add(prediction_id)
+        self.inserted.append({"prediction_id": prediction_id, "label_version": label_version, **outcome})
+        return True
+
+
+class FakeV2SnapshotRepository:
+    def by_ids(self, snapshot_ids):
+        return {
+            "snap-1": {
+                "id": "snap-1",
+                "feature_vector_json": {"atr_pct_12b": 0.02},
+                "metadata_json": {},
+            }
+        }
+
+
+def test_v2_shadow_outcome_evaluator_persists_mature_prediction():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository([_v2_prediction(prediction_timestamp=start)]),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["created_count"] == 1
+    inserted = outcomes.inserted[0]
+    assert inserted["prediction_id"] == "v2-1"
+    assert inserted["outcome"] is True
+    assert inserted["metadata_json"]["target"] == "path_inside_70"
+    assert inserted["metadata_json"]["horizon"] == "1H"
+    assert inserted["metadata_json"]["manifest_hash"] == FROZEN_MANIFEST_HASH
+
+
+def test_v2_shadow_outcome_evaluator_skips_immature_and_existing_rows():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction("existing", prediction_timestamp=start),
+        _v2_prediction("immature", prediction_timestamp=start + timedelta(minutes=30)),
+    ]
+    outcomes = FakeV2OutcomeRepository(existing={"existing"})
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=1))
+
+    assert result["created_count"] == 0
+    assert result["skipped_existing_count"] == 1
+    assert outcomes.inserted == []

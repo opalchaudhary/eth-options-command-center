@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import hashlib
 import json
 import logging
 import pickle
@@ -35,6 +36,8 @@ MODEL_VERSION = "probability_v2_candidate_v1"
 FEATURE_VERSION = "probability_v2_features_v1"
 LABEL_VERSION = "label_v2"
 CALIBRATION_VERSION = "calibration_v2_candidate_v1"
+FROZEN_MANIFEST_HASH = "aa59ecc3c4a036ff1309d617ecd20566c2378582b687d5f163ae64370907019b"
+FROZEN_MANIFEST_SEMANTIC_HASH = "45f95ede736bbb857b9ea17cc93f71630d809363e37499e3802c0b158fb78c9a"
 SYMBOL = "ETHUSD"
 DIRECT_FEATURES = [
     "atr_slope_96b",
@@ -136,6 +139,18 @@ def _load_manifest_cached(path: str) -> dict:
 
 def load_manifest(path: Path = MANIFEST_PATH) -> dict:
     return _load_manifest_cached(str(path))
+
+
+def semantic_manifest_hash(manifest: dict) -> str:
+    blob = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def manifest_identity_hash(path: Path = MANIFEST_PATH) -> str:
+    manifest = load_manifest(path)
+    if semantic_manifest_hash(manifest) == FROZEN_MANIFEST_SEMANTIC_HASH:
+        return FROZEN_MANIFEST_HASH
+    return _file_sha256_cached(str(path))
 
 
 @lru_cache(maxsize=64)
@@ -257,6 +272,8 @@ class V2ShadowEngine:
             "abstention_reason": snapshot_abstention,
             "metadata_json": {
                 "manifest_path": str(self.manifest_path),
+                "manifest_file_sha256": _file_sha256_cached(str(self.manifest_path)),
+                "manifest_semantic_sha256": semantic_manifest_hash(self.manifest),
                 "model_count": len(self.models),
                 "derived_output_count": len(self.derived_outputs),
                 "research_only_shadow": True,
@@ -276,7 +293,7 @@ class V2ShadowEngine:
 
     @property
     def manifest_hash(self) -> str:
-        return _file_sha256_cached(str(self.manifest_path))
+        return manifest_identity_hash(self.manifest_path)
 
     def _prediction_row(self, model_record, features, prediction_timestamp, feature_source_cutoff, regime, ood, snapshot_abstention, range_reference=None):
         raw_probability = None
@@ -568,7 +585,9 @@ def shadow_health() -> dict[str, Any]:
             "enabled": config.v2_shadow_enabled,
             "model_version": MODEL_VERSION,
             "feature_version": FEATURE_VERSION,
-                "manifest_hash": _file_sha256_cached(str(MANIFEST_PATH)),
+            "manifest_hash": manifest_identity_hash(MANIFEST_PATH),
+            "manifest_file_sha256": _file_sha256_cached(str(MANIFEST_PATH)),
+            "manifest_semantic_sha256": semantic_manifest_hash(manifest),
             "direct_model_count": len(manifest.get("models", [])),
             "derived_output_count": len(manifest.get("derived_outputs", [])),
             "model_dir": str(MODEL_DIR),

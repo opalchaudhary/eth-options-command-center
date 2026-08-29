@@ -92,6 +92,37 @@ def test_scheduler_registers_canonical_probability_jobs_when_enabled(monkeypatch
     assert "retention_cleanup" in added
 
 
+def test_scheduler_registers_v2_shadow_outcome_job_when_v2_enabled(monkeypatch):
+    import backend.services.scheduler_service as scheduler_service
+
+    added = []
+    monkeypatch.setattr(scheduler_service.config, "BACKEND_SCHEDULER_ENABLED", True)
+    monkeypatch.setattr(
+        scheduler_service,
+        "get_probability_config",
+        lambda: ProbabilityEngineConfig(enabled=True, v2_shadow_enabled=True),
+    )
+
+    class FakeScheduler:
+        running = False
+
+        def add_job(self, *args, **kwargs):
+            added.append(kwargs["id"])
+
+        def start(self):
+            self.running = True
+
+        def get_jobs(self):
+            return []
+
+    monkeypatch.setattr(scheduler_service, "BackgroundScheduler", lambda timezone: FakeScheduler())
+    scheduler_service._scheduler = None
+    scheduler_service.start_scheduler()
+
+    assert added.count("probability_v2_shadow_prediction_v1") == 1
+    assert added.count("probability_v2_shadow_outcome_evaluator_v1") == 1
+
+
 def test_repository_safe_insert_uses_model_record(monkeypatch):
     from probability_engine.repositories.snapshot_repository import SnapshotRepository
 
