@@ -1117,7 +1117,7 @@ class DurableGridBotLifecycle:
             self._event(state, run["run_id"], "REST_RECONCILED", {**result, "replacements": replacement_result})
         if self._db_enabled() and persist_snapshot:
             self.db.persist_snapshot(run, risk, run.get("summary"))
-        self._save(state)
+        self._save(state, include_children=False)
         return {
             "ok": not result.get("errors"),
             "run": deepcopy(run),
