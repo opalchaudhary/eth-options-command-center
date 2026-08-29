@@ -2545,6 +2545,41 @@ def test_paused_run_worker_refresh_does_not_write_per_loop(tmp_path):
     assert db.write_counts == {"upsert": 0, "insert_once": 0, "patch": 0}
 
 
+def test_worker_state_derives_paused_inventory_from_fill_ledger():
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
+    run = _replacement_run(fill_id="paused-fill", fill_size="5")
+    run["status"] = GridStatus.PAUSED.value
+    worker._run = run
+    worker._set_idle_state()
+
+    state = worker.state()
+
+    assert state["lifecycle_state"] == GridStatus.PAUSED.value
+    assert state["fill_derived_inventory"] == "5"
+    assert state["known_fill_count"] == 1
+    assert state["known_order_count"] == 1
+
+
+def test_supabase_reload_preserves_replacement_group_idempotency(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    run = _replacement_run(fill_id="fill-db-reload")
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+
+    first = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    db.persist_run_state(run)
+    replacement_count = len([row for row in db.tables["grid_orders"].values() if row.get("order_kind") == "replacement"])
+    loaded = db.load_run_state(run["run_id"])
+    second = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True).process_replacements(
+        loaded,
+        {"gridbot_inventory": "1"},
+    )
+
+    assert first["created"] == 1
+    assert second["existing"] == 1
+    assert len([row for row in db.tables["grid_orders"].values() if row.get("order_kind") == "replacement"]) == replacement_count
+
+
 def test_continuous_worker_default_snapshot_cadence_is_five_minutes():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     assert worker.state()["snapshot_interval_seconds"] == 300.0

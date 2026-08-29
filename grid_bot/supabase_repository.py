@@ -409,6 +409,9 @@ class SupabaseGridRepository:
             raw = {**raw, "gridbot": {**(raw.get("gridbot") or {}), "source_fill_id": source_fill_id}}
         gridbot_raw = {
             **(raw.get("gridbot") or {}),
+            "replacement_group_key": order.get("replacement_group_key"),
+            "source_order_key": order.get("source_order_key"),
+            "source_fill_ids": order.get("source_fill_ids"),
             "opens_inventory": order.get("opens_inventory"),
             "projected_inventory_if_filled": order.get("projected_inventory_if_filled"),
             "reserved_long_after": order.get("reserved_long_after"),
@@ -801,6 +804,9 @@ class SupabaseGridRepository:
                     "order_kind": row.get("order_kind"),
                     "config_version": row.get("config_version"),
                     "source_fill_id": row.get("source_fill_id") or ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"),
+                    "replacement_group_key": ((row.get("raw") or {}).get("gridbot") or {}).get("replacement_group_key"),
+                    "source_order_key": ((row.get("raw") or {}).get("gridbot") or {}).get("source_order_key"),
+                    "source_fill_ids": ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_ids"),
                     "reduce_only": row.get("reduce_only"),
                     "post_only": row.get("post_only"),
                     "time_in_force": row.get("time_in_force"),

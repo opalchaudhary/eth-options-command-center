@@ -12,7 +12,7 @@ from .account_telemetry import AccountTelemetryCache, account_telemetry_cache
 from .accounting import build_run_accounting
 from .delta_testnet_client import DeltaTestnetClient
 from .durable_lifecycle import DurableGridBotLifecycle
-from .exchange_truth import reconcile_exchange_truth
+from .exchange_truth import inventory_from_fills, reconcile_exchange_truth
 from .health import HealthIssueTracker, evaluate_gridbot_health
 from .models import GridStatus, utc_now
 from .supabase_repository import SupabaseGridRepository
@@ -158,6 +158,12 @@ class ContinuousGridBotWorker:
             if cached:
                 state["account_risk_state"] = cached
             if run:
+                fill_inventory = inventory_from_fills([fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill for fill in (run.get("fills") or {}).values()])
+                state["fill_derived_inventory"] = str(fill_inventory)
+                state["known_fill_count"] = len(run.get("fills") or {})
+                state["known_order_count"] = len(run.get("orders") or {})
+                if cached and (cached or {}).get("position_lots") not in [None, ""]:
+                    state["delta_position"] = str(_decimal((cached or {}).get("position_lots")))
                 mark_price = _decimal((cached or {}).get("mark_price")) if cached and (cached or {}).get("mark_price") not in [None, ""] else None
                 account_position = _decimal((cached or {}).get("position_lots")) if cached and (cached or {}).get("position_lots") not in [None, ""] else None
                 state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
