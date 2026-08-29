@@ -1269,7 +1269,7 @@ class DurableGridBotLifecycle:
         deferred_terminalized = self._terminalize_deferred_for_pause(run)
         self._save(state)
 
-        reconciled = self.reconcile(run["run_id"], process_replacements=False)
+        reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
         if reconciled["reconciliation"].get("exchange_open_orders"):
             state = self._load()
             run = state["runs"][run["run_id"]]
@@ -1875,7 +1875,7 @@ class DurableGridBotLifecycle:
                     else:
                         self.client.cancel_order(product_id, str(exchange_order.get("id") or exchange_order.get("order_id")))
                 self._save(state)
-                reconciled = self.reconcile(run["run_id"], process_replacements=False)
+                reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
                 state = self._load()
                 run = state["runs"][run["run_id"]]
                 reconciliation = reconciled["reconciliation"]
@@ -1901,7 +1901,7 @@ class DurableGridBotLifecycle:
                             {"client_order_id": recovered.get("client_order_id"), "inventory_before_recovery": str(gridbot_inventory)},
                         )
                         self._save(state)
-                        reconciled = self.reconcile(run["run_id"], process_replacements=False)
+                        reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
                         state = self._load()
                         run = state["runs"][run["run_id"]]
                         reconciliation = reconciled["reconciliation"]
@@ -1952,7 +1952,7 @@ class DurableGridBotLifecycle:
                 self._save(state)
             except Exception as exc:
                 return self._stop_attention(state, run, reason, {"reason": "flatten_submission_failed", "error": str(exc)[:500], "inventory": str(gridbot_inventory)})
-            reconciled = self.reconcile(run["run_id"], process_replacements=False)
+            reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
             state = self._load()
             run = state["runs"][run["run_id"]]
             reconciliation = reconciled["reconciliation"]
