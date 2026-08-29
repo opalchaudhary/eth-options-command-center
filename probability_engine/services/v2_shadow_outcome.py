@@ -44,6 +44,19 @@ def _records(rows):
 
 class V2ShadowOutcomeRepository(SupabaseRepository):
     table_name = "probability_v2_shadow_outcomes"
+    outcome_columns = {
+        "evaluated_at",
+        "outcome",
+        "actual_open",
+        "actual_high",
+        "actual_low",
+        "actual_close",
+        "maximum_up_excursion",
+        "maximum_down_excursion",
+        "realized_path_range",
+        "realized_over_range_width",
+        "metadata_json",
+    }
 
     def existing_prediction_ids(self, prediction_ids, label_version="label_v2"):
         clean_ids = [str(item) for item in prediction_ids if item]
@@ -60,12 +73,13 @@ class V2ShadowOutcomeRepository(SupabaseRepository):
         return {row.get("prediction_id") for row in _records(rows) if row.get("prediction_id")}
 
     def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
+        outcome_payload = {key: value for key, value in outcome.items() if key in self.outcome_columns}
         payload = {
             "prediction_id": prediction_id,
             "label_version": label_version,
             "target": outcome.get("metadata_json", {}).get("target"),
             "horizon": outcome.get("metadata_json", {}).get("horizon"),
-            **outcome,
+            **outcome_payload,
         }
         return self.safe_insert(payload)
 

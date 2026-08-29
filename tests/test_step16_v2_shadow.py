@@ -220,6 +220,43 @@ def test_v2_shadow_outcome_evaluator_persists_mature_prediction():
     assert inserted["metadata_json"]["manifest_hash"] == FROZEN_MANIFEST_HASH
 
 
+def test_v2_shadow_outcome_repository_strips_non_schema_fields():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeRepository
+
+    class CapturingRepository(V2ShadowOutcomeRepository):
+        def __init__(self):
+            self.payload = None
+
+        def safe_insert(self, payload):
+            self.payload = payload
+            return True
+
+    repository = CapturingRepository()
+
+    ok = repository.safe_insert_outcome(
+        "v2-1",
+        {
+            "ok": True,
+            "outcome": False,
+            "actual_open": 100,
+            "evaluated_at": "2026-01-01T01:00:00+00:00",
+            "metadata_json": {
+                "target": "path_inside_70",
+                "horizon": "1H",
+                "manifest_hash": FROZEN_MANIFEST_HASH,
+            },
+        },
+    )
+
+    assert ok is True
+    assert repository.payload["prediction_id"] == "v2-1"
+    assert repository.payload["target"] == "path_inside_70"
+    assert repository.payload["horizon"] == "1H"
+    assert repository.payload["outcome"] is False
+    assert repository.payload["metadata_json"]["manifest_hash"] == FROZEN_MANIFEST_HASH
+    assert "ok" not in repository.payload
+
+
 def test_v2_shadow_outcome_evaluator_skips_immature_and_existing_rows():
     from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
 
