@@ -989,6 +989,57 @@ def test_stop_requires_attention_on_attribution_mismatch_and_retains_lock(tmp_pa
     assert client.flatten_payloads == []
 
 
+def test_stop_recovers_when_manual_external_close_leaves_delta_flat(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "0"
+
+    stopped = lifecycle.stop(run["run_id"], "manual_external_close_recovery")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert client.flatten_payloads == []
+    assert len(stopped["run"]["fills"]) == 1
+    assert stopped["summary"]["final_gridbot_inventory"] == "0"
+    assert stopped["summary"]["ledger_gridbot_inventory"] == "1"
+    assert stopped["summary"]["final_delta_position"] == "0"
+    assert stopped["summary"]["accounting_status"] == "PARTIAL"
+    assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" in stopped["summary"]["accounting_warnings"]
+    assert stopped["summary"]["external_position_resolution"]["status"] == "EXTERNALLY_RESOLVED"
+
+
+def test_stop_does_not_external_resolve_nonzero_delta_exposure(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "2"
+
+    stopped = lifecycle.stop(run["run_id"], "unsafe_external_close")
+
+    assert stopped["ok"] is False
+    assert stopped["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
+    assert stopped["diagnostics"]["reason"] == "attribution_mismatch"
+    assert "external_position_resolution" not in stopped["run"]
+
+
+def test_stop_external_close_recovery_is_idempotent(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "0"
+
+    first = lifecycle.stop(run["run_id"], "manual_external_close_recovery")
+    second = lifecycle.stop(run["run_id"], "manual_external_close_recovery")
+
+    events = [event["event_type"] for event in lifecycle.status()["events"]]
+    assert first["summary"]["summary_id"] == second["summary"]["summary_id"]
+    assert events.count("GRID_RUN_STOP_EXTERNAL_POSITION_RESOLVED") == 1
+    assert len(client.flatten_payloads) == 0
+
+
 def test_stop_requires_attention_on_exchange_truth_failure(tmp_path):
     class FailingTruthClient(_FlattenFillsClient):
         def open_orders(self, product_id=None):
@@ -1041,6 +1092,33 @@ def test_stop_requires_attention_recovery_retries_and_flattens(tmp_path):
     assert attention["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
     assert recovered["run"]["status"] == GridStatus.STOPPED.value
     assert client.flatten_payloads[-1]["side"] == "sell"
+
+
+def test_later_recovery_after_exchange_truth_returns_and_delta_is_flat(tmp_path):
+    class FlakyTruthClient(_FlattenFillsClient):
+        def __init__(self):
+            super().__init__()
+            self.fail_truth = False
+
+        def open_orders(self, product_id=None):
+            if self.fail_truth:
+                raise RuntimeError("delta unavailable")
+            return super().open_orders(product_id)
+
+    client = FlakyTruthClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.fail_truth = True
+    attention = lifecycle.stop(run["run_id"], "truth_down")
+    client.fail_truth = False
+    client.position_size = "0"
+
+    recovered = lifecycle.stop(run["run_id"], "truth_back_flat")
+
+    assert attention["run"]["status"] == GridStatus.STOP_REQUIRES_ATTENTION.value
+    assert recovered["run"]["status"] == GridStatus.STOPPED.value
+    assert recovered["summary"]["external_position_resolution"]["status"] == "EXTERNALLY_RESOLVED"
 
 
 def test_ambiguous_flatten_submission_recovery_uses_existing_fill(tmp_path):
@@ -2457,6 +2535,43 @@ def test_supabase_idempotent_stop_summary_and_active_guard_release(tmp_path):
     assert first["summary"]["summary_id"] == second["summary"]["summary_id"]
     assert len(summaries) == 1
     assert db.select("grid_active_run_locks") == []
+
+
+def test_supabase_stop_external_close_generates_summary_and_releases_lock(tmp_path):
+    client = _FlattenFillsClient()
+    db = _MemorySupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", db=db, use_supabase=True)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    client.position_size = "0"
+
+    stopped = lifecycle.stop(run["run_id"], "manual_external_close_recovery")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert db.select("grid_active_run_locks") == []
+    assert len(db.tables["grid_run_summaries"]) == 1
+    assert stopped["summary"]["accounting_status"] == "PARTIAL"
+    assert stopped["summary"]["external_position_resolution"]["status"] == "EXTERNALLY_RESOLVED"
+
+
+def test_stale_unresolved_order_is_reconciled_from_delta_cancel_history(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    order = next(iter(run["orders"].values()))
+    client.cancel_order(1699, order["exchange_order_id"])
+    state = lifecycle._load()
+    stale = state["runs"][run["run_id"]]["orders"][order["client_order_id"]]
+    stale["status"] = "unresolved"
+    stale["remaining_quantity"] = stale["requested_quantity"]
+    lifecycle._save(state)
+
+    reconciled = lifecycle.reconcile(run["run_id"], process_replacements=False)
+    updated = reconciled["run"]["orders"][order["client_order_id"]]
+
+    assert updated["status"] == "manual_cancelled"
+    assert updated["remaining_quantity"] == "0"
+    assert reconciled["reconciliation"]["unresolved_orders"] == 0
 
 
 def test_gridbot_health_reports_healthy_running_state(tmp_path):

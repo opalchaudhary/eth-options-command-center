@@ -257,9 +257,10 @@ def reconcile_exchange_truth(
 
     result.orders_checked = len(orders)
     for cid, order in orders.items():
-        if not order.get("exchange_order_id") and str(order.get("status") or "").upper() in TERMINAL_STATES:
+        local_status = str(order.get("status") or "").upper()
+        if not order.get("exchange_order_id") and local_status in TERMINAL_STATES:
             continue
-        if str(order.get("status") or "").upper() in TERMINAL_STATES and order.get("status") != "open":
+        if local_status in TERMINAL_STATES and local_status not in {"UNRESOLVED", "ABANDONED_BY_STOP"} and order.get("status") != "open":
             continue
         exchange = open_by_client.get(cid)
         history = history_by_client.get(cid) or history_by_exchange.get(str(order.get("exchange_order_id") or ""))
@@ -273,6 +274,8 @@ def reconcile_exchange_truth(
         if not exchange and not history and executed == 0:
             state = "UNRESOLVED"
             _event(result, "ORDER_UNRESOLVED", {"client_order_id": cid, "exchange_order_id": order.get("exchange_order_id")})
+        elif state in {"FILLED", "REJECTED"} or (state in {"CANCELLED", "MANUAL_CANCELLED"} and executed == 0):
+            remaining = Decimal("0")
 
         if executed > requested:
             result.fill_ledger_mismatches += 1

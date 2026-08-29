@@ -837,6 +837,9 @@ class DurableGridBotLifecycle:
         fills = list(run.get("fills", {}).values())
         telemetry = self.account_telemetry.get(run.get("product", {}).get("symbol") or "ETHUSD")
         accounting = build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=position)
+        external_resolution = run.get("external_position_resolution") or {}
+        operational_gridbot_inventory = "0" if external_resolution.get("status") == "EXTERNALLY_RESOLVED" else str(reconciliation.get("gridbot_inventory") or "0")
+        accounting_warnings = sorted(set(accounting.warnings + (["EXTERNAL_POSITION_CLOSE_UNATTRIBUTED"] if external_resolution else [])))
         flatten_orders = self._flatten_orders(run)
         flatten_order_ids = {order.get("client_order_id") for order in flatten_orders}
         flatten_fills = []
@@ -882,16 +885,18 @@ class DurableGridBotLifecycle:
             "live_net_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else None,
             "net_run_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else str(accounting.net_realized_pnl),
             "fee_to_gross_profit_ratio": str(accounting.fee_to_gross_ratio) if accounting.fee_to_gross_ratio is not None else None,
-            "accounting_status": accounting.accounting_status,
-            "accounting_warnings": accounting.warnings,
+            "accounting_status": "PARTIAL" if external_resolution else accounting.accounting_status,
+            "accounting_warnings": accounting_warnings,
             "funding_attribution_status": accounting.funding_attribution_status,
-            "accounting_completeness": accounting.accounting_status,
+            "accounting_completeness": "PARTIAL" if external_resolution else accounting.accounting_status,
             "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(accounting.net_realized_pnl),
-            "final_gridbot_inventory": str(reconciliation.get("gridbot_inventory") or "0"),
+            "final_gridbot_inventory": operational_gridbot_inventory,
+            "ledger_gridbot_inventory": str(reconciliation.get("gridbot_inventory") or "0"),
             "final_delta_position": str(position),
             "final_position": str(position),
+            "external_position_resolution": deepcopy(external_resolution) if external_resolution else None,
             "stray_gridbot_orders": len(open_orders),
-            "stop_warnings": accounting.warnings,
+            "stop_warnings": accounting_warnings,
             "stop_errors": [],
             "immutable": True,
             "created_at": utc_now(),
@@ -1892,6 +1897,25 @@ class DurableGridBotLifecycle:
                         if reconciliation.get("errors"):
                             return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_flatten_recovery", "errors": reconciliation.get("errors")})
                         continue
+                    if delta_position == 0 and open_gridbot_orders == 0:
+                        now = utc_now()
+                        run["external_position_resolution"] = {
+                            "status": "EXTERNALLY_RESOLVED",
+                            "reason": "delta_flat_gridbot_ledger_stale",
+                            "gridbot_inventory_before_resolution": str(gridbot_inventory),
+                            "delta_position": str(delta_position),
+                            "resolved_at": now,
+                            "accounting_status": "PARTIAL",
+                            "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
+                        }
+                        run["stop_diagnostics"] = {
+                            **(run.get("stop_diagnostics") or {}),
+                            "external_position_resolution": deepcopy(run["external_position_resolution"]),
+                            "updated_at": now,
+                        }
+                        self._event(state, run["run_id"], "GRID_RUN_STOP_EXTERNAL_POSITION_RESOLVED", run["external_position_resolution"])
+                        self._save(state)
+                        break
                 return self._stop_attention(
                     state,
                     run,
@@ -1929,12 +1953,19 @@ class DurableGridBotLifecycle:
         position = _decimal(reconciliation.get("delta_position"))
         final_inventory = _decimal(reconciliation.get("gridbot_inventory"))
         open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
-        if final_inventory != 0 or open_orders:
+        external_resolution = (run.get("external_position_resolution") or {}).get("status") == "EXTERNALLY_RESOLVED"
+        if (final_inventory != 0 and not external_resolution) or open_orders or position != 0:
             return self._stop_attention(
                 state,
                 run,
                 reason,
-                {"reason": "final_stop_gate_failed", "gridbot_inventory": str(final_inventory), "open_gridbot_orders": len(open_orders)},
+                {
+                    "reason": "final_stop_gate_failed",
+                    "gridbot_inventory": str(final_inventory),
+                    "delta_position": str(position),
+                    "open_gridbot_orders": len(open_orders),
+                    "external_position_resolution": run.get("external_position_resolution"),
+                },
             )
 
         summary = self._build_stop_summary(run, reason, reconciliation, position, open_orders)
