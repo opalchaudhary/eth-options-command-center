@@ -523,10 +523,17 @@ class SupabaseGridRepository:
 
     def persist_cycles(self, run: dict) -> None:
         accounting = build_run_accounting(run)
-        for cycle in accounting.cycles:
-            self.insert_once_with_optional_config_version(
+        rows = [cycle_to_row(cycle, run.get("bot_id")) for cycle in accounting.cycles]
+        if not rows:
+            return
+        try:
+            self.upsert("grid_cycles", rows, on_conflict="run_id,entry_fill_id,exit_fill_id")
+        except SupabasePersistenceError as exc:
+            if "config_version" not in str(exc) or "42703" not in str(exc):
+                raise
+            self.upsert(
                 "grid_cycles",
-                cycle_to_row(cycle, run.get("bot_id")),
+                [{key: value for key, value in row.items() if key != "config_version"} for row in rows],
                 on_conflict="run_id,entry_fill_id,exit_fill_id",
             )
 
