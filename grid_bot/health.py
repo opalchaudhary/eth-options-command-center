@@ -130,6 +130,11 @@ def _replacement_missing(run: dict | None) -> list[str]:
         for order in ((run or {}).get("orders") or {}).values()
         if order.get("order_kind") == "replacement"
     }
+    for entitlement in ((run or {}).get("replacement_entitlements") or {}).values():
+        replaced.update(str(fill_id) for fill_id in entitlement.get("source_fill_ids") or [])
+    for replacement in ((run or {}).get("replacement_keys") or {}).values():
+        if replacement.get("state") == "aggregated":
+            replaced.add(str(replacement.get("source_fill_id") or ""))
     deferred = set(((run or {}).get("deferred_orders") or {}).keys())
     return sorted(fill_id for fill_id in fills if fill_id and fill_id not in replaced and fill_id not in deferred)
 
@@ -144,6 +149,8 @@ def _reservation_mismatches(run: dict | None) -> list[str]:
 
 def _classify_delta_error(message: str, status: Any = None) -> tuple[str, HealthSeverity, str]:
     raw = f"{status or ''} {message}".lower()
+    if any(token in raw for token in ["supabase", "postgrest", "pgrst", "database", "db ", "dns", "name resolution", "connection to", "rest/v1"]):
+        return "SUPABASE_FAILURE", HealthSeverity.CRITICAL, "Supabase read/write failed."
     if "401" in raw or "unauthorized" in raw or "auth" in raw:
         return "DELTA_AUTH_FAILURE", HealthSeverity.CRITICAL, "Delta authentication failed."
     if "429" in raw or "rate limit" in raw or "too many" in raw:

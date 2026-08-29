@@ -3053,6 +3053,61 @@ def test_gridbot_health_classifies_delta_failures(error, expected_code):
     assert health["safe_for_risk_increase"] is False
 
 
+def test_gridbot_health_classifies_supabase_failure_as_database_not_delta():
+    run = {"run_id": "run-health", "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "2"}}
+    state = {
+        "running": True,
+        "thread_alive": True,
+        "status": "error",
+        "run_id": run["run_id"],
+        "lifecycle_state": GridStatus.RUNNING.value,
+        "last_error": "HTTPSConnectionPool(host='example.supabase.co', port=443): DNS failure for /rest/v1/grid_active_run_locks",
+        "account_risk_state": client_health_state(),
+    }
+
+    health = evaluate_gridbot_health(state, run, {"errors": [], "gridbot_inventory": "0", "delta_position": "0"})
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert "SUPABASE_FAILURE" in codes
+    assert not any(code.startswith("DELTA_") for code in codes)
+
+
+def test_gridbot_health_treats_aggregated_replacement_entitlement_as_protected():
+    run = {
+        "run_id": "run-aggregate-health",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "10"},
+        "orders": {
+            "source": {"client_order_id": "source", "exchange_order_id": "ex-source", "status": "filled", "remaining_quantity": "0", "order_kind": "initial_grid"},
+            "replacement": {
+                "client_order_id": "replacement",
+                "exchange_order_id": "ex-replacement",
+                "status": "open",
+                "remaining_quantity": "10",
+                "requested_quantity": "10",
+                "order_kind": "replacement",
+                "replacement_group_key": "source:L003:sell",
+                "source_fill_id": "source:L003:sell",
+            },
+        },
+        "fills": {
+            "fill-1": {"id": "fill-1", "client_order_id": "source", "size": "1", "side": "buy"},
+            "fill-2": {"id": "fill-2", "client_order_id": "source", "size": "9", "side": "buy"},
+        },
+        "replacement_entitlements": {
+            "source:L003:sell": {
+                "source_fill_ids": ["fill-1", "fill-2"],
+                "replacement_entitlement_qty": "10",
+                "replacement_qty_currently_open": "10",
+            }
+        },
+    }
+
+    health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "10", "delta_position": "10", "exchange_open_orders": 1})
+
+    assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
+
+
 def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_gate():
     run = {
         "run_id": "run-risk",

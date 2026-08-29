@@ -269,11 +269,20 @@ def render_live_dashboard(live: dict) -> None:
 
     summary_cols = st.columns(3)
     with summary_cols[0]:
-        render_card("Position", inv["label"], f"Maximum {inv['max']} lots | {inv['remaining']} lots capacity remaining")
+        render_card("GridBot Inventory", inv["label"], f"Maximum {inv['max']} lots | {inv['remaining']} lots capacity remaining")
     with summary_cols[1]:
         render_card("Net P&L", fmt_money(pnl["net"]), f"Realized {fmt_money(pnl['realized'])} | Unrealized {fmt_money(pnl['unrealized'])}")
     with summary_cols[2]:
         render_card("Account", fmt_money(telemetry.get("account_equity")), f"Available {fmt_money(telemetry.get('available_margin'))} | Margin {fmt_pct(telemetry.get('margin_utilisation_pct'))}")
+    position_cols = st.columns(2)
+    with position_cols[0]:
+        render_card("Delta Position", inv["delta_label"], f"Difference {inv['difference']} lots")
+    with position_cols[1]:
+        render_card("Trading Fees", fmt_money(pnl["fees"]), f"Completed cycles {pnl['cycles']}")
+    if not inv["matches"]:
+        st.warning("Delta position does not match the bot's records.")
+    if pnl.get("incomplete"):
+        st.warning("Profit information is incomplete.")
 
     st.markdown("<div class='section-label'>Current Grid</div>", unsafe_allow_html=True)
     grid_cols = st.columns(6)
@@ -305,7 +314,7 @@ def render_live_dashboard(live: dict) -> None:
     with activity_cols[2]:
         render_card("Open Orders", len(order_rows))
     with activity_cols[3]:
-        render_card("Trading Fees", fmt_money(pnl["fees"]))
+        render_card("Recent Activity Time", "Asia/Kolkata")
     for line in recent_activity(live):
         st.markdown(f"<div class='activity-line'>{line}</div>", unsafe_allow_html=True)
 
