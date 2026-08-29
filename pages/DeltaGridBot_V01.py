@@ -461,22 +461,23 @@ def render_create_grid(live: dict) -> None:
     with st.form("gridbot_create_grid_form", border=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            bot_name = st.text_input("Bot Name", value="ETH Testnet Grid")
-            product_symbol = st.text_input("Product", value="ETHUSD")
+            bot_name = st.text_input("Bot Name", value="ETH Testnet Grid", key="create_bot_name")
+            product_symbol = st.text_input("Product", value="ETHUSD", key="create_product_symbol")
             grid_type = st.radio(
                 "Grid Type",
                 ["neutral", "long_bias", "short_bias"],
                 format_func=lambda value: {"neutral": "Neutral", "long_bias": "Long", "short_bias": "Short"}[value],
                 horizontal=True,
+                key="create_grid_type",
             )
         with c2:
-            lower = st.number_input("Lower Range", min_value=1.0, value=max(1.0, reference - 40), step=5.0)
-            upper = st.number_input("Upper Range", min_value=1.0, value=reference + 40, step=5.0)
-            grid_count = st.number_input("Grid Levels", min_value=2, max_value=100, value=4, step=1)
+            lower = st.number_input("Lower Range", min_value=1.0, value=max(1.0, reference - 40), step=5.0, key="create_lower")
+            upper = st.number_input("Upper Range", min_value=1.0, value=reference + 40, step=5.0, key="create_upper")
+            grid_count = st.number_input("Grid Levels", min_value=2, max_value=100, value=4, step=1, key="create_grid_count")
         with c3:
-            spacing = st.radio("Spacing", ["arithmetic", "geometric"], format_func=str.title, horizontal=True)
-            lot_size = st.number_input("Order Size", min_value=1.0, value=1.0, step=1.0)
-            max_inventory = st.number_input("Maximum Inventory", min_value=1.0, value=2.0, step=1.0)
+            spacing = st.radio("Spacing", ["arithmetic", "geometric"], format_func=str.title, horizontal=True, key="create_spacing")
+            lot_size = st.number_input("Order Size", min_value=1.0, value=1.0, step=1.0, key="create_lot_size")
+            max_inventory = st.number_input("Maximum Inventory", min_value=1.0, value=2.0, step=1.0, key="create_max_inventory")
 
         payload = {
             "bot_name": bot_name,
@@ -523,6 +524,20 @@ def render_create_preview(preview: dict) -> None:
         render_card("Levels", len(levels))
     with c4:
         render_card("Projected Exposure", fmt_money(risk.get("projected_grid_exposure")))
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        render_card("Spacing", str(data.get("spacing_type") or "").title() or "-")
+    with d2:
+        render_card("Order Size", fmt_lots(data.get("lot_size")))
+    with d3:
+        render_card("Maximum Inventory", fmt_lots(data.get("max_inventory")))
+    with d4:
+        render_card("Waiting", len(data.get("deferred_levels") or []))
+    e1, e2 = st.columns(2)
+    with e1:
+        render_card("Initial Buy Orders", data.get("opening_buy_orders_eligible", 0))
+    with e2:
+        render_card("Initial Sell Orders", data.get("opening_sell_orders_eligible", 0))
     buys = [{"Price": fmt_money(row.get("price")), "Lots": row.get("quantity"), "Status": "Will Open"} for row in levels if row.get("side") == "buy"]
     sells = [{"Price": fmt_money(row.get("price")), "Lots": row.get("quantity"), "Status": "Will Open"} for row in levels if row.get("side") == "sell"]
     left, right = st.columns(2)

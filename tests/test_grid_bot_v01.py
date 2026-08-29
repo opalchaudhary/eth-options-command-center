@@ -1296,20 +1296,203 @@ def test_operator_preview_derives_reference_tick_and_account_risk(tmp_path):
             "bot_name": "Operator Grid",
             "product_symbol": "ETHUSD",
             "grid_type": "neutral",
-            "lower_price": "2400.01",
-            "upper_price": "2500.01",
-            "grid_count": 4,
+            "lower_price": "2410.05",
+            "upper_price": "2590.05",
+            "grid_count": 6,
             "spacing_type": "arithmetic",
             "lot_size": "1",
-            "max_inventory_lots": "2",
+            "max_inventory_lots": "3",
         }
     )
     assert preview["preview"]["reference_price"] == "2500.00"
     assert preview["product"]["tick_size"] == "0.05"
-    assert preview["config"]["lower_price"] == "2400.00"
+    assert preview["config"]["grid_type"] == "neutral"
+    assert preview["config"]["lower_price"] == "2410.05"
+    assert preview["config"]["upper_price"] == "2590.05"
+    assert preview["config"]["grid_count"] == 6
+    assert preview["config"]["spacing_type"] == "arithmetic"
+    assert preview["config"]["lot_size"] == "1"
+    assert preview["config"]["max_inventory_lots"] == "3"
+    assert preview["preview"]["lower_price"] == "2410.05"
+    assert preview["preview"]["upper_price"] == "2590.05"
+    assert preview["preview"]["opening_buy_orders_eligible"] == 3
+    assert preview["preview"]["opening_sell_orders_eligible"] == 3
     assert preview["risk"]["version"] == "gridbot_v01_account_health_grr_v1"
     assert preview["risk"]["formula"] == "projected_grid_exposure / account_equity"
     assert "allocated_capital" in preview["config"]
+
+
+def test_operator_preview_rejects_tick_misalignment_without_mutating_payload(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Operator Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2400.01",
+        "upper_price": "2600.01",
+        "grid_count": 4,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "2",
+    }
+    before = dict(payload)
+
+    with pytest.raises(ValueError, match="tick size"):
+        lifecycle.preview_operator_grid(payload)
+
+    assert payload == before
+
+
+def test_operator_start_persists_exact_create_values_and_order_ladder(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Distinct Operator Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2410.05",
+        "upper_price": "2590.05",
+        "grid_count": 6,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "3",
+    }
+
+    started = lifecycle.start_operator_grid(payload)
+    config = started["run"]["config"]
+    levels = started["run"]["levels"]
+
+    assert started["preview"]["config"]["lower_price"] == payload["lower_price"]
+    assert config["bot_name"] == payload["bot_name"]
+    assert config["product_symbol"] == payload["product_symbol"]
+    assert config["grid_type"] == payload["grid_type"]
+    assert config["lower_price"] == payload["lower_price"]
+    assert config["upper_price"] == payload["upper_price"]
+    assert config["grid_count"] == payload["grid_count"]
+    assert config["spacing_type"] == payload["spacing_type"]
+    assert config["lot_size"] == payload["lot_size"]
+    assert config["max_inventory_lots"] == payload["max_inventory_lots"]
+    assert len(levels) == payload["grid_count"]
+    assert levels[0]["price"] == payload["lower_price"]
+    assert levels[-1]["price"] == payload["upper_price"]
+    assert [level["side"] for level in levels].count("buy") == 3
+    assert [level["side"] for level in levels].count("sell") == 3
+    assert all(level["quantity"] == payload["lot_size"] for level in levels)
+    assert len(client.orders) == 6
+    assert all(str(order["size"]) == payload["lot_size"] for order in client.orders)
+
+
+def test_operator_start_uses_current_payload_after_prior_preview(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    old_payload = {
+        "bot_name": "Old Operator Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 4,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "2",
+    }
+    current_payload = {
+        **old_payload,
+        "bot_name": "Current Operator Grid",
+        "lower_price": "2420",
+        "upper_price": "2580",
+        "grid_count": 6,
+        "max_inventory_lots": "3",
+    }
+
+    lifecycle.preview_operator_grid(old_payload)
+    started = lifecycle.start_operator_grid(current_payload)
+
+    assert started["run"]["config"]["bot_name"] == "Current Operator Grid"
+    assert started["run"]["config"]["lower_price"] == "2420"
+    assert started["run"]["config"]["upper_price"] == "2580"
+    assert started["run"]["config"]["grid_count"] == 6
+
+
+def test_operator_preview_is_non_mutating_and_repeatable(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Repeatable Operator Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2420",
+        "upper_price": "2580",
+        "grid_count": 6,
+        "spacing_type": "geometric",
+        "lot_size": "1",
+        "max_inventory_lots": "3",
+    }
+    before = dict(payload)
+
+    first = lifecycle.preview_operator_grid(payload)
+    second = lifecycle.preview_operator_grid(payload)
+
+    assert payload == before
+    for field in ["bot_id", "created_at"]:
+        first["config"].pop(field, None)
+        second["config"].pop(field, None)
+    assert second["config"] == first["config"]
+    assert second["preview"]["levels"] == first["preview"]["levels"]
+
+
+@pytest.mark.parametrize("spacing", ["arithmetic", "geometric"])
+def test_neutral_grid_requires_approximately_balanced_two_sided_ladder(tmp_path, spacing):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    preview = lifecycle.preview_operator_grid(
+        {
+            "bot_name": "Balanced Neutral Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 5,
+            "spacing_type": spacing,
+            "lot_size": "1",
+            "max_inventory_lots": "3",
+        }
+    )["preview"]
+    sides = [level["side"] for level in preview["levels"]]
+
+    assert sides.count("buy") >= 1
+    assert sides.count("sell") >= 1
+    assert abs(sides.count("buy") - sides.count("sell")) <= 1
+
+
+@pytest.mark.parametrize(
+    "lower_price,upper_price,grid_count",
+    [
+        ("2420", "2505", 10),
+        ("2400", "2490", 5),
+    ],
+)
+def test_neutral_grid_rejects_unsuitable_range_without_replacing_operator_range(tmp_path, lower_price, upper_price, grid_count):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Unbalanced Neutral Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": lower_price,
+        "upper_price": upper_price,
+        "grid_count": grid_count,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "5",
+    }
+    before = dict(payload)
+
+    with pytest.raises(ValueError, match="Selected range is not suitable"):
+        lifecycle.preview_operator_grid(payload)
+
+    assert payload == before
 
 
 def test_bias_initial_ladder_uses_nature_specific_opening_orders(tmp_path):

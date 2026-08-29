@@ -39,6 +39,19 @@ def validate_grid_config(config: GridConfig, exchange_lot_size: Decimal | None =
         raise ValueError("DeltaGridBot V0.1 requires portfolio margin mode.")
 
 
+def validate_neutral_grid_suitability(config: GridConfig, reference_price: Decimal, tick_size: Decimal) -> None:
+    if config.grid_type != GridType.NEUTRAL:
+        return
+    prices = generate_prices(config, tick_size)
+    buy_count = len([price for price in prices if price < reference_price])
+    sell_count = len(prices) - buy_count
+    if buy_count == 0 or sell_count == 0 or abs(buy_count - sell_count) > 1:
+        raise ValueError(
+            "Selected range is not suitable for a Neutral grid at the current ETH price. "
+            "Adjust the range or choose Long/Short."
+        )
+
+
 def generate_prices(config: GridConfig, tick_size: Decimal) -> list[Decimal]:
     validate_grid_config(config)
     if config.spacing_type == SpacingType.ARITHMETIC:
@@ -55,6 +68,7 @@ def generate_prices(config: GridConfig, tick_size: Decimal) -> list[Decimal]:
 
 
 def build_grid_levels(config: GridConfig, reference_price: Decimal, tick_size: Decimal) -> list[GridLevel]:
+    validate_neutral_grid_suitability(config, reference_price, tick_size)
     prices = generate_prices(config, tick_size)
     levels: list[GridLevel] = []
 
@@ -142,6 +156,7 @@ def preview_grid(
     return {
         "reference_price": reference_price,
         "grid_type": config.grid_type.value,
+        "spacing_type": config.spacing_type.value,
         "lower_price": config.lower_price,
         "upper_price": config.upper_price,
         "levels": levels,

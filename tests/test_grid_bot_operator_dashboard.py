@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from grid_bot.operator_dashboard import health_plain_text, preview_edit_summary, split_pending_orders
+from grid_bot.operator_dashboard import health_plain_text, live_config, preview_edit_summary, split_pending_orders
 
 
 PAGE = Path("pages/DeltaGridBot_V01.py")
@@ -67,6 +67,20 @@ def test_edit_preview_summary_is_plain_language() -> None:
         "3 new orders will be placed",
         "0 orders will wait because of limits or market conditions",
     ]
+
+
+def test_live_config_uses_worker_config_when_active_run_is_not_embedded() -> None:
+    config = {
+        "grid_type": "neutral",
+        "lower_price": "2410.05",
+        "upper_price": "2590.05",
+        "grid_count": 6,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "3",
+    }
+
+    assert live_config({"config": config, "grid_nature": "long_bias"}) == config
 
 
 def test_dashboard_uses_live_fragment_without_full_page_refresh() -> None:

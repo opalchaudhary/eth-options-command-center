@@ -15,7 +15,7 @@ from .account_telemetry import AccountTelemetryCache, risk_increasing_action_all
 from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .exchange_truth import reconcile_exchange_truth
-from .grid_builder import build_grid_levels, preview_grid, quantize_price
+from .grid_builder import build_grid_levels, preview_grid, quantize_price, validate_grid_config, validate_neutral_grid_suitability
 from .models import GridConfig, GridStatus, GridType, OrderProposal, Side, SpacingType, new_id, to_record_dict, utc_now
 from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 from .supabase_repository import SupabaseGridRepository, SupabasePersistenceError
@@ -298,27 +298,46 @@ class DurableGridBotLifecycle:
         }
 
     def _config_from_operator_payload(self, payload: dict, spec, reference: Decimal, health: dict) -> GridConfig:
-        max_inventory = _decimal(payload.get("max_inventory_lots"), "1")
-        lot_size = max(_decimal(payload.get("lot_size"), str(spec.min_quantity)), spec.min_quantity)
+        required = [
+            "grid_type",
+            "lower_price",
+            "upper_price",
+            "grid_count",
+            "spacing_type",
+            "lot_size",
+            "max_inventory_lots",
+        ]
+        missing = [key for key in required if payload.get(key) in [None, ""]]
+        if missing:
+            raise ValueError(f"Missing operator grid field(s): {', '.join(missing)}.")
+        lower_price = _decimal(payload.get("lower_price"))
+        upper_price = _decimal(payload.get("upper_price"))
+        if quantize_price(lower_price, spec.tick_size) != lower_price or quantize_price(upper_price, spec.tick_size) != upper_price:
+            raise ValueError("Lower Range and Upper Range must align with the exchange tick size.")
+        max_inventory = _decimal(payload.get("max_inventory_lots"))
+        lot_size = _decimal(payload.get("lot_size"))
         account_equity = _decimal((health.get("account") or {}).get("account_equity"), "0")
         projected_exposure = max_inventory * reference * spec.contract_multiplier
         denominator = account_equity if account_equity > 0 else max(projected_exposure, Decimal("1"))
-        return GridConfig(
+        config = GridConfig(
             bot_id=payload.get("bot_id") or new_id("bot"),
             config_version=int(payload.get("config_version") or 1),
             bot_name=payload.get("bot_name") or "DeltaGridBot V0.1 Operator Grid",
             product_symbol=payload.get("product_symbol") or spec.symbol,
-            grid_type=GridType(payload.get("grid_type") or GridType.NEUTRAL.value),
-            lower_price=quantize_price(_decimal(payload.get("lower_price")), spec.tick_size),
-            upper_price=quantize_price(_decimal(payload.get("upper_price")), spec.tick_size),
-            grid_count=int(payload.get("grid_count") or 4),
-            spacing_type=SpacingType(payload.get("spacing_type") or SpacingType.ARITHMETIC.value),
+            grid_type=GridType(payload["grid_type"]),
+            lower_price=lower_price,
+            upper_price=upper_price,
+            grid_count=int(payload["grid_count"]),
+            spacing_type=SpacingType(payload["spacing_type"]),
             lot_size=lot_size,
             max_inventory_lots=max_inventory,
             allocated_capital=denominator,
             risk_capital=denominator,
             risk_thresholds=DEFAULT_RISK_THRESHOLDS,
         )
+        validate_grid_config(config, spec.min_quantity)
+        validate_neutral_grid_suitability(config, reference, spec.tick_size)
+        return config
 
     def preview_operator_grid(self, payload: dict) -> dict:
         product_symbol = payload.get("product_symbol") or "ETHUSD"

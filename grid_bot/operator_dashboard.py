@@ -216,6 +216,8 @@ def live_config(live: dict | None) -> dict:
     live = live or {}
     if live.get("active_run") and isinstance(live["active_run"], dict):
         return live["active_run"].get("config") or {}
+    if live.get("config") and isinstance(live["config"], dict):
+        return live["config"]
     return {
         "grid_type": live.get("grid_nature"),
         "config_version": live.get("config_version"),

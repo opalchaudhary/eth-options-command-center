@@ -142,6 +142,7 @@ class ContinuousGridBotWorker:
                     {
                         "run_id": run.get("run_id"),
                         "lifecycle_state": run.get("status"),
+                        "config": run.get("config") or {},
                         "config_version": (run.get("config") or {}).get("config_version"),
                         "grid_nature": (run.get("config") or {}).get("grid_type"),
                         "grid_levels": run.get("levels") or [],
