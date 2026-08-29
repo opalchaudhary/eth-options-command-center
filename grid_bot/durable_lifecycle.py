@@ -1818,13 +1818,24 @@ class DurableGridBotLifecycle:
 
         product_id = int(run["product"]["product_id"])
         cancelled_attempts = 0
-        for order in run.get("orders", {}).values():
-            if order.get("status") in START_TERMINAL_ORDER_STATUSES:
+        try:
+            exchange_open_gridbot_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
+        except Exception as exc:
+            return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": [str(exc)]})
+        for exchange_order in exchange_open_gridbot_orders:
+            cid = str(exchange_order.get("client_order_id") or "")
+            local = run.setdefault("orders", {}).get(cid)
+            if local and local.get("order_kind") == "safety_flatten":
                 continue
-            if order.get("order_kind") == "safety_flatten":
-                continue
-            if self._cancel_order_safely(product_id, order):
-                cancelled_attempts += 1
+            if local:
+                if self._cancel_order_safely(product_id, local):
+                    cancelled_attempts += 1
+            else:
+                try:
+                    self.client.cancel_order(product_id, str(exchange_order.get("id") or exchange_order.get("order_id")))
+                    cancelled_attempts += 1
+                except Exception:
+                    pass
         self._terminalize_never_submitted_orders(run)
         self._save(state)
 
