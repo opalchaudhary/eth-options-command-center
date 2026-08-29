@@ -1790,6 +1790,11 @@ class DurableGridBotLifecycle:
         if not run:
             raise RuntimeError("No active durable DeltaGridBot run found.")
         if run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
+            if self._db_enabled():
+                self.db.resolve_health_issue_codes(
+                    run["run_id"],
+                    {"LIFECYCLE_STUCK", "WORKER_STALLED", "RECONCILIATION_STALE"},
+                )
             return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
         if run.get("status") not in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
             previous_status = run.get("status")
@@ -1995,6 +2000,10 @@ class DurableGridBotLifecycle:
         if self._db_enabled():
             self.db.persist_summary(run, summary)
             self.db.release_active_run_guard(run["run_id"])
+            self.db.resolve_health_issue_codes(
+                run["run_id"],
+                {"LIFECYCLE_STUCK", "WORKER_STALLED", "RECONCILIATION_STALE"},
+            )
         self._save(state, include_children=False)
         return {"ok": True, "run": deepcopy(run), "summary": deepcopy(summary)}
 

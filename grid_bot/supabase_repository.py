@@ -663,6 +663,31 @@ class SupabaseGridRepository:
             "resolved": [row for row in rows if row.get("active") is False],
         }
 
+    def resolve_health_issue_codes(self, run_id: str, codes: set[str]) -> int:
+        now = utc_now()
+        rows = self.select(
+            "grid_health_events",
+            {
+                "select": "issue_key,code,active",
+                "run_id": f"eq.{run_id}",
+                "limit": 200,
+            },
+        )
+        resolved = 0
+        for row in rows:
+            if row.get("active") is not True or str(row.get("code") or "") not in codes:
+                continue
+            issue_key = row.get("issue_key")
+            if not issue_key:
+                continue
+            self.patch(
+                "grid_health_events",
+                {"issue_key": issue_key},
+                {"active": False, "resolved_at": now, "updated_at": now},
+            )
+            resolved += 1
+        return resolved
+
     def persist_summary(self, run: dict, summary: dict) -> None:
         self.insert_once(
             "grid_run_summaries",

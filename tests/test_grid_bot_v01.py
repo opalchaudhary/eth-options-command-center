@@ -2542,16 +2542,29 @@ def test_supabase_stop_external_close_generates_summary_and_releases_lock(tmp_pa
     db = _MemorySupabaseGridRepository()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", db=db, use_supabase=True)
     run = lifecycle.start_tiny_grid()["run"]
+    db.upsert(
+        "grid_health_events",
+        {
+            "issue_key": f"{run['run_id']}:LIFECYCLE_STUCK:",
+            "run_id": run["run_id"],
+            "code": "LIFECYCLE_STUCK",
+            "active": True,
+        },
+        on_conflict="issue_key",
+    )
     _seed_gridbot_inventory(client, run, side="buy", size="1")
     client.position_size = "0"
 
     stopped = lifecycle.stop(run["run_id"], "manual_external_close_recovery")
+    health_rows = list(db.tables["grid_health_events"].values())
 
     assert stopped["run"]["status"] == GridStatus.STOPPED.value
     assert db.select("grid_active_run_locks") == []
     assert len(db.tables["grid_run_summaries"]) == 1
     assert stopped["summary"]["accounting_status"] == "PARTIAL"
     assert stopped["summary"]["external_position_resolution"]["status"] == "EXTERNALLY_RESOLVED"
+    assert health_rows[0]["active"] is False
+    assert health_rows[0]["resolved_at"]
 
 
 def test_stale_unresolved_order_is_reconciled_from_delta_cancel_history(tmp_path):
