@@ -241,7 +241,7 @@ class SupabaseGridRepository:
             prefer="return=minimal",
         )
 
-    def persist_run_state(self, run: dict, status: str | None = None) -> None:
+    def persist_run_state(self, run: dict, status: str | None = None, include_children: bool = True) -> None:
         config = run.get("config") or {}
         product = run.get("product") or {}
         bot_id = run["bot_id"]
@@ -282,6 +282,8 @@ class SupabaseGridRepository:
             },
             on_conflict="run_id",
         )
+        if not include_children:
+            return
         self.persist_config(run)
         self.persist_levels(run)
         for order in (run.get("orders") or {}).values():

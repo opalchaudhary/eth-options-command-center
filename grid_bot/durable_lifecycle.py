@@ -192,11 +192,11 @@ class DurableGridBotLifecycle:
                 time.sleep(0.05)
         raise last_error or RuntimeError("Unable to load durable DeltaGridBot state.")
 
-    def _save(self, state: dict) -> None:
+    def _save(self, state: dict, *, include_children: bool = True) -> None:
         with self._save_lock:
             if self._db_enabled():
                 for run in (state.get("runs") or {}).values():
-                    self.db.persist_run_state(run)
+                    self.db.persist_run_state(run, include_children=include_children)
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
             tmp.write_text(json.dumps(_jsonable(state), indent=2, sort_keys=True), encoding="utf-8")
@@ -1837,7 +1837,7 @@ class DurableGridBotLifecycle:
                 except Exception:
                     pass
         self._terminalize_never_submitted_orders(run)
-        self._save(state)
+        self._save(state, include_children=False)
 
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
@@ -1900,7 +1900,7 @@ class DurableGridBotLifecycle:
                             "GRID_RUN_STOP_FLATTEN_RECOVERED",
                             {"client_order_id": recovered.get("client_order_id"), "inventory_before_recovery": str(gridbot_inventory)},
                         )
-                        self._save(state)
+                        self._save(state, include_children=False)
                         reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
                         state = self._load()
                         run = state["runs"][run["run_id"]]
@@ -1925,7 +1925,7 @@ class DurableGridBotLifecycle:
                             "updated_at": now,
                         }
                         self._event(state, run["run_id"], "GRID_RUN_STOP_EXTERNAL_POSITION_RESOLVED", run["external_position_resolution"])
-                        self._save(state)
+                        self._save(state, include_children=False)
                         break
                 return self._stop_attention(
                     state,
@@ -1995,7 +1995,7 @@ class DurableGridBotLifecycle:
         if self._db_enabled():
             self.db.persist_summary(run, summary)
             self.db.release_active_run_guard(run["run_id"])
-        self._save(state)
+        self._save(state, include_children=False)
         return {"ok": True, "run": deepcopy(run), "summary": deepcopy(summary)}
 
 
