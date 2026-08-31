@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -11,6 +12,7 @@ from .models import new_id, utc_now
 
 
 ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "EDITING", "REGRID_PENDING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
+SNAPSHOT_DEDUPE_SECONDS = int(os.getenv("GRIDBOT_V01_SNAPSHOT_DEDUPE_SECONDS", "60"))
 
 
 class SupabasePersistenceError(RuntimeError):
@@ -23,6 +25,49 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     return value
+
+
+def _decimalish(value: Any) -> str | None:
+    if value in [None, ""]:
+        return None
+    return str(value)
+
+
+def _risk_telemetry(risk: dict) -> dict:
+    telemetry = risk.get("account_risk_state") or {}
+    if not isinstance(telemetry, dict):
+        return {}
+    return telemetry
+
+
+def _risk_value(risk: dict, telemetry: dict, *keys: str) -> str | None:
+    for key in keys:
+        if key in risk and risk.get(key) not in [None, ""]:
+            return _decimalish(risk.get(key))
+        if key in telemetry and telemetry.get(key) not in [None, ""]:
+            return _decimalish(telemetry.get(key))
+    return None
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _snapshot_dedupe_signature(row: dict | None) -> tuple:
+    metrics = ((row or {}).get("margin_metrics") or (row or {}).get("margin_state") or {}) if isinstance(row, dict) else {}
+    return (
+        (row or {}).get("risk_state"),
+        (row or {}).get("active_config_version") or metrics.get("config_version"),
+        str((row or {}).get("inventory") if (row or {}).get("inventory") is not None else metrics.get("gridbot_inventory")),
+        str(metrics.get("delta_position")),
+        str((row or {}).get("open_orders") if (row or {}).get("open_orders") is not None else metrics.get("open_gridbot_orders")),
+        ((row or {}).get("payload") or {}).get("run", {}).get("status") if isinstance((row or {}).get("payload"), dict) else None,
+    )
 
 
 class SupabaseGridRepository:
@@ -541,13 +586,92 @@ class SupabaseGridRepository:
             )
 
     def persist_snapshot(self, run: dict, risk: dict, summary: dict | None = None) -> None:
+        config_version = int((run.get("config") or {}).get("config_version") or risk.get("config_version") or 1)
+        telemetry = _risk_telemetry(risk)
+        account_equity = _risk_value(risk, telemetry, "account_equity")
+        available_margin = _risk_value(risk, telemetry, "available_margin")
+        used_margin = _risk_value(risk, telemetry, "used_margin", "margin_used")
+        margin_utilisation_pct = _risk_value(risk, telemetry, "margin_utilisation_pct")
+        mark_price = _risk_value(risk, telemetry, "mark_price")
+        gridbot_inventory = _risk_value(risk, telemetry, "gridbot_inventory", "position")
+        delta_position = _risk_value(risk, telemetry, "delta_position", "position_lots")
+        position_notional = _risk_value(risk, telemetry, "position_notional")
+        open_buy_quantity = _risk_value(risk, telemetry, "open_buy_quantity_lots")
+        open_buy_notional = _risk_value(risk, telemetry, "open_buy_notional")
+        open_sell_quantity = _risk_value(risk, telemetry, "open_sell_quantity_lots")
+        open_sell_notional = _risk_value(risk, telemetry, "open_sell_notional")
+        liquidation_price = _risk_value(risk, telemetry, "liquidation_price")
+        grr = None
+        try:
+            equity = decimal_value(account_equity)
+            if equity > 0 and mark_price and gridbot_inventory:
+                grr = str((abs(decimal_value(gridbot_inventory)) * decimal_value(mark_price)) / equity)
+        except Exception:
+            grr = None
+        telemetry_freshness = {
+            "telemetry_status": telemetry.get("telemetry_status"),
+            "account_age_seconds": telemetry.get("account_age_seconds"),
+            "position_age_seconds": telemetry.get("position_age_seconds"),
+            "order_age_seconds": telemetry.get("order_age_seconds"),
+            "market_age_seconds": telemetry.get("market_age_seconds"),
+            "unavailable_fields": telemetry.get("unavailable_fields") or [],
+            "last_account_sync": telemetry.get("last_account_sync"),
+            "last_position_sync": telemetry.get("last_position_sync"),
+            "last_order_sync": telemetry.get("last_order_sync"),
+            "last_market_sync": telemetry.get("last_market_sync"),
+        }
+        reconciliation = risk.get("reconciliation") if isinstance(risk.get("reconciliation"), dict) else {}
+        replacements = risk.get("replacements") if isinstance(risk.get("replacements"), dict) else {}
+        compact_margin_state = {
+            "created_at": risk.get("created_at"),
+            "snapshot_reason": risk.get("snapshot_reason"),
+            "config_version": config_version,
+            "account_equity": account_equity,
+            "available_margin": available_margin,
+            "used_margin": used_margin,
+            "margin_utilisation_pct": margin_utilisation_pct,
+            "gridbot_inventory": gridbot_inventory,
+            "delta_position": delta_position,
+            "mark_price": mark_price,
+            "position_notional": position_notional,
+            "open_buy_quantity_lots": open_buy_quantity,
+            "open_buy_notional": open_buy_notional,
+            "open_sell_quantity_lots": open_sell_quantity,
+            "open_sell_notional": open_sell_notional,
+            "liquidation_price": liquidation_price,
+            "telemetry": telemetry_freshness,
+            "reconciliation": {
+                "errors": reconciliation.get("errors") or [],
+                "new_fills": reconciliation.get("new_fills"),
+                "filled_orders": reconciliation.get("filled_orders"),
+                "partial_fills": reconciliation.get("partial_fills"),
+                "request_count": reconciliation.get("request_count"),
+                "orders_checked": reconciliation.get("orders_checked"),
+                "orders_resolved": reconciliation.get("orders_resolved"),
+                "cancelled_orders": reconciliation.get("cancelled_orders"),
+                "manual_cancelled_orders": reconciliation.get("manual_cancelled_orders"),
+                "unresolved_orders": reconciliation.get("unresolved_orders"),
+                "position_mismatches": reconciliation.get("position_mismatches"),
+                "fill_ledger_mismatches": reconciliation.get("fill_ledger_mismatches"),
+                "duplicate_fills_ignored": reconciliation.get("duplicate_fills_ignored"),
+                "last_successful_reconcile": reconciliation.get("last_successful_reconcile"),
+            },
+            "replacements": {
+                "created": replacements.get("created"),
+                "deferred": replacements.get("deferred"),
+                "skipped": replacements.get("skipped"),
+                "existing": replacements.get("existing"),
+                "cancel_replaced": replacements.get("cancel_replaced"),
+                "metrics": replacements.get("metrics") or {},
+            },
+        }
         payload = {
             "snapshot_id": new_id("snap"),
             "run_id": run["run_id"],
             "timestamp": risk.get("created_at") or utc_now(),
             "eth_price": run.get("reference_price"),
-            "active_config_version": int((run.get("config") or {}).get("config_version") or 1),
-            "inventory": risk.get("position"),
+            "active_config_version": config_version,
+            "inventory": gridbot_inventory or risk.get("position"),
             "pending_exposure": None,
             "open_orders": risk.get("open_gridbot_orders"),
             "gross_grid_pnl": (summary or {}).get("gross_pnl"),
@@ -555,28 +679,57 @@ class SupabaseGridRepository:
             "inventory_pnl": None,
             "exchange_fees": (summary or {}).get("delta_fees"),
             "funding": (summary or {}).get("funding"),
-            "account_equity": None,
-            "margin_metrics": risk,
-            "grr": None,
+            "account_equity": account_equity,
+            "margin_metrics": compact_margin_state,
+            "grr": grr,
             "drawdown": None,
-            "risk_state": "GREEN",
+            "risk_state": risk.get("risk_state") or "GREEN",
             "execution_mode": run.get("execution_event_mode"),
-            "payload": {"run": {"status": run.get("status")}, "risk": risk},
+            "payload": {"run": {"status": run.get("status")}, "risk": compact_margin_state},
         }
+        latest_rows = self.select(
+            "grid_bot_snapshots",
+            {"select": "*", "run_id": f"eq.{run['run_id']}", "order": "timestamp.desc", "limit": 1},
+        )
+        if latest_rows:
+            latest = latest_rows[0]
+            latest_ts = _parse_ts(latest.get("timestamp"))
+            current_ts = _parse_ts(payload["timestamp"])
+            if (
+                latest_ts
+                and current_ts
+                and 0 <= (current_ts - latest_ts).total_seconds() <= SNAPSHOT_DEDUPE_SECONDS
+                and _snapshot_dedupe_signature(latest) == _snapshot_dedupe_signature(payload)
+            ):
+                return False
         self.insert_once("grid_bot_snapshots", payload, on_conflict="snapshot_id")
         self.insert_once(
             "grid_risk_snapshots",
             {
+                "snapshot_id": payload["snapshot_id"],
                 "run_id": run["run_id"],
                 "timestamp": payload["timestamp"],
-                "risk_state": "GREEN",
-                "margin_state": risk,
-                "current_exposure": {"position": risk.get("position")},
-                "projected_exposure": {"open_gridbot_orders": risk.get("open_gridbot_orders")},
+                "risk_state": payload["risk_state"],
+                "inventory_utilisation": None,
+                "grr": grr,
+                "margin_state": compact_margin_state,
+                "current_exposure": {
+                    "gridbot_inventory": gridbot_inventory,
+                    "delta_position": delta_position,
+                    "position_notional": position_notional,
+                },
+                "projected_exposure": {
+                    "open_gridbot_orders": risk.get("open_gridbot_orders"),
+                    "open_buy_quantity_lots": open_buy_quantity,
+                    "open_buy_notional": open_buy_notional,
+                    "open_sell_quantity_lots": open_sell_quantity,
+                    "open_sell_notional": open_sell_notional,
+                },
                 "risk_thresholds": (run.get("config") or {}).get("risk_thresholds") or {},
             },
             on_conflict="snapshot_id",
         )
+        return True
 
     def log_event(self, run: dict | None, event_type: str, payload: dict | None = None) -> None:
         self.insert_once(

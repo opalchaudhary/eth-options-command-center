@@ -25,6 +25,7 @@ POLL_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_POLL_SECONDS", "2"))
 SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS", "300"))
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
 ACCOUNT_TELEMETRY_SECONDS = float(os.getenv("GRIDBOT_V01_ACCOUNT_TELEMETRY_SECONDS", "30"))
+MATERIAL_INVENTORY_DELTA = Decimal(os.getenv("GRIDBOT_V01_SNAPSHOT_MATERIAL_INVENTORY_DELTA", "1"))
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -57,6 +58,7 @@ class ContinuousGridBotWorker:
         self._health_tracker = HealthIssueTracker()
         self._last_snapshot_monotonic = 0.0
         self._last_active_refresh_monotonic = 0.0
+        self._last_snapshot_signature: tuple | None = None
         self._state = {
             "ok": True,
             "worker_owner": "FastAPI backend process",
@@ -298,6 +300,39 @@ class ContinuousGridBotWorker:
         self._set_state(running=False, thread_alive=False, status="stopped")
         logger.info("DeltaGridBot V0.1 continuous worker stopped.")
 
+    def _snapshot_signature(self, run: dict, reconciliation: dict, replacement_result: dict, telemetry: Any) -> tuple:
+        telemetry_payload = telemetry.as_dict() if hasattr(telemetry, "as_dict") else (telemetry or {})
+        return (
+            run.get("status"),
+            int((run.get("config") or {}).get("config_version") or 1),
+            str(reconciliation.get("gridbot_inventory")),
+            str(reconciliation.get("delta_position")),
+            int(reconciliation.get("exchange_open_orders") or 0),
+            int(reconciliation.get("position_mismatches") or 0),
+            int(reconciliation.get("fill_ledger_mismatches") or 0),
+            int(reconciliation.get("unresolved_orders") or 0),
+            int(replacement_result.get("created") or 0),
+            int(replacement_result.get("deferred") or 0),
+            telemetry_payload.get("telemetry_status"),
+            telemetry_payload.get("account_equity"),
+            telemetry_payload.get("available_margin"),
+            telemetry_payload.get("used_margin"),
+            telemetry_payload.get("margin_utilisation_pct"),
+            telemetry_payload.get("mark_price"),
+        )
+
+    def _snapshot_materially_changed(self, signature: tuple) -> bool:
+        if self._last_snapshot_signature is None:
+            return True
+        if signature == self._last_snapshot_signature:
+            return False
+        previous_inventory = _decimal(self._last_snapshot_signature[2])
+        current_inventory = _decimal(signature[2])
+        if abs(current_inventory - previous_inventory) >= MATERIAL_INVENTORY_DELTA:
+            return True
+        material_indexes = {0, 1, 3, 4, 5, 6, 8, 9}
+        return any(signature[index] != self._last_snapshot_signature[index] for index in material_indexes)
+
     def _poll_once(self, run: dict) -> dict:
         before_fills = set((run.get("fills") or {}).keys())
         result = reconcile_exchange_truth(run, self.client, self.db if self.db.enabled else None, persist_order_updates=False)
@@ -310,7 +345,9 @@ class ContinuousGridBotWorker:
             self._set_state(last_fill={"fill_id": new_fill_ids[-1], "raw": (run.get("fills") or {}).get(new_fill_ids[-1])})
         if replacement_result.get("items"):
             self._set_state(last_replacement=replacement_result["items"][-1])
-        should_snapshot = bool(new_fill_ids or replacement_result.get("created") or replacement_result.get("deferred") or result.get("events"))
+        signature = self._snapshot_signature(run, result, replacement_result, telemetry)
+        should_snapshot = bool(new_fill_ids or replacement_result.get("created") or replacement_result.get("deferred"))
+        should_snapshot = should_snapshot or self._snapshot_materially_changed(signature)
         if time.monotonic() - self._last_snapshot_monotonic >= self.snapshot_interval_seconds:
             should_snapshot = True
         if self.db.enabled and should_snapshot:
@@ -323,11 +360,15 @@ class ContinuousGridBotWorker:
                 "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
                 "reconciliation": result,
                 "replacements": replacement_result,
+                "account_risk_state": telemetry.as_dict(),
+                "snapshot_reason": "periodic_or_material_change",
             }
             run.setdefault("risk_snapshots", []).append(risk)
-            self.db.persist_snapshot(run, risk, run.get("summary"))
+            persisted = self.db.persist_snapshot(run, risk, run.get("summary"))
             self._last_snapshot_monotonic = time.monotonic()
-            self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
+            self._last_snapshot_signature = signature
+            if persisted is not False:
+                self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
         self._set_state(
             account_risk_state=telemetry.as_dict(),
             accounting=build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=telemetry.position_lots).as_dict(),

@@ -2561,6 +2561,193 @@ def test_continuous_worker_no_change_polls_do_not_write_per_loop(tmp_path):
     assert after["patch"] == before["patch"]
 
 
+def test_continuous_worker_repeated_unresolved_events_do_not_snapshot_storm(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    client.orders = []
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+
+    for _ in range(5):
+        worker._poll_once(worker._run)
+
+    assert len(db.tables.get("grid_bot_snapshots", {})) == 1
+    assert len(db.tables.get("grid_risk_snapshots", {})) == 1
+
+
+def test_snapshot_material_change_ignores_regular_mark_and_margin_drift():
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
+    baseline = (
+        "RUNNING",
+        1,
+        "0",
+        "0",
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "HEALTHY",
+        "1000",
+        "990",
+        "10",
+        "1.0",
+        "2500",
+    )
+    worker._last_snapshot_signature = baseline
+    drift_only = (
+        "RUNNING",
+        1,
+        "0",
+        "0",
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "HEALTHY",
+        "1001",
+        "989",
+        "12",
+        "1.2",
+        "2504",
+    )
+
+    assert worker._snapshot_materially_changed(drift_only) is False
+
+    telemetry_status_only = list(baseline)
+    telemetry_status_only[10] = "DEGRADED"
+    assert worker._snapshot_materially_changed(tuple(telemetry_status_only)) is False
+
+
+def test_risk_snapshot_persists_account_margin_fields(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+
+    worker._poll_once(worker._run)
+
+    snapshot = next(iter(db.tables["grid_bot_snapshots"].values()))
+    risk_snapshot = next(iter(db.tables["grid_risk_snapshots"].values()))
+    margin_state = risk_snapshot["margin_state"]
+    assert snapshot["account_equity"] == "1000"
+    assert Decimal(snapshot["grr"]) == Decimal("0")
+    assert margin_state["available_margin"] == "990"
+    assert margin_state["used_margin"] == "10"
+    assert margin_state["margin_utilisation_pct"] == "1.00"
+    assert margin_state["gridbot_inventory"] == "0"
+    assert margin_state["delta_position"] == "0"
+    assert margin_state["mark_price"] == "2500"
+    assert margin_state["position_notional"] == "0.00"
+    assert Decimal(margin_state["open_buy_notional"]) > 0
+    assert margin_state["liquidation_price"] is None
+
+
+def test_risk_snapshot_preserves_zero_vs_unknown():
+    db = _CountingSupabaseGridRepository()
+    run = {
+        "run_id": "run-zero-unknown",
+        "bot_id": "bot-zero-unknown",
+        "status": "RUNNING",
+        "config": {"config_version": 1, "risk_thresholds": {}},
+        "reference_price": "2500",
+    }
+    db.persist_snapshot(
+        run,
+        {
+            "created_at": "2026-08-31T00:00:00+00:00",
+            "position": "0",
+            "gridbot_inventory": "0",
+            "open_gridbot_orders": 0,
+            "account_risk_state": {
+                "telemetry_status": "DEGRADED",
+                "account_equity": None,
+                "available_margin": "0",
+                "used_margin": None,
+                "margin_utilisation_pct": None,
+                "mark_price": "2500",
+                "position_lots": "0",
+                "open_buy_notional": "0",
+                "open_sell_notional": "0",
+            },
+        },
+    )
+
+    snapshot = next(iter(db.tables["grid_bot_snapshots"].values()))
+    margin_state = next(iter(db.tables["grid_risk_snapshots"].values()))["margin_state"]
+    assert snapshot["account_equity"] is None
+    assert margin_state["available_margin"] == "0"
+    assert margin_state["used_margin"] is None
+    assert margin_state["delta_position"] == "0"
+
+
+def test_snapshot_repository_dedupes_near_identical_rows():
+    db = _CountingSupabaseGridRepository()
+    run = {
+        "run_id": "run-dedupe",
+        "bot_id": "bot-dedupe",
+        "status": "RUNNING",
+        "config": {"config_version": 1, "risk_thresholds": {}},
+        "reference_price": "2500",
+    }
+    risk = {
+        "created_at": "2026-08-31T00:00:00+00:00",
+        "position": "0",
+        "gridbot_inventory": "0",
+        "open_gridbot_orders": 4,
+        "account_risk_state": {
+            "telemetry_status": "HEALTHY",
+            "account_equity": "1000",
+            "available_margin": "990",
+            "used_margin": "10",
+            "margin_utilisation_pct": "1",
+            "mark_price": "2500",
+            "position_lots": "0",
+        },
+    }
+    duplicate = {**risk, "created_at": "2026-08-31T00:00:05+00:00"}
+
+    assert db.persist_snapshot(run, risk) is True
+    assert db.persist_snapshot(run, duplicate) is False
+
+    assert len(db.tables.get("grid_bot_snapshots", {})) == 1
+    assert len(db.tables.get("grid_risk_snapshots", {})) == 1
+
+
+def test_edit_grid_persists_research_decision_context(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    result = lifecycle.edit_grid(
+        started["run"]["run_id"],
+        {"lower_price": "2450", "upper_price": "2550"},
+        reason="unit_research_context",
+    )
+
+    assert result["ok"] is True
+    changes = list(db.tables.get("grid_parameter_changes", {}).values())
+    context = changes[-1]["payload"]["decision_context"]
+    assert context["reason"] == "unit_research_context"
+    assert context["from_config_version"] == 1
+    assert context["to_config_version"] == 2
+    assert context["market"]["mark_price"] == "2500"
+    assert context["inventory"]["gridbot_inventory"] == "0"
+    assert context["inventory"]["remaining_inventory_basis"] == "0"
+    assert context["account"]["account_equity"] == "1000"
+    assert context["account"]["available_margin"] == "990"
+    assert context["orders_expected"]["cancel"] > 0
+    assert context["orders_expected"]["create"] == len(result["run"]["levels"])
+
+
 def test_paused_run_worker_refresh_does_not_write_per_loop(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()

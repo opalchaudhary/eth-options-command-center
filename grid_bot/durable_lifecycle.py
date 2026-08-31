@@ -157,6 +157,79 @@ def _config_fingerprint(config: dict) -> tuple:
     )
 
 
+def _compact_account_context(account_risk_state: dict | None) -> dict:
+    payload = account_risk_state or {}
+    return {
+        "telemetry_status": payload.get("telemetry_status"),
+        "account_equity": payload.get("account_equity"),
+        "available_margin": payload.get("available_margin"),
+        "used_margin": payload.get("used_margin"),
+        "margin_utilisation_pct": payload.get("margin_utilisation_pct"),
+        "delta_position": payload.get("position_lots"),
+        "mark_price": payload.get("mark_price"),
+        "position_notional": payload.get("position_notional"),
+        "open_buy_quantity_lots": payload.get("open_buy_quantity_lots"),
+        "open_buy_notional": payload.get("open_buy_notional"),
+        "open_sell_quantity_lots": payload.get("open_sell_quantity_lots"),
+        "open_sell_notional": payload.get("open_sell_notional"),
+        "liquidation_price": payload.get("liquidation_price"),
+        "unavailable_fields": payload.get("unavailable_fields") or [],
+        "freshness": {
+            "account_age_seconds": payload.get("account_age_seconds"),
+            "position_age_seconds": payload.get("position_age_seconds"),
+            "order_age_seconds": payload.get("order_age_seconds"),
+            "market_age_seconds": payload.get("market_age_seconds"),
+        },
+    }
+
+
+def _edit_decision_context(
+    *,
+    run: dict,
+    old_config: dict,
+    new_config: dict,
+    reason: str,
+    reference: Decimal,
+    reconciliation: dict,
+    account_risk_state: dict | None,
+    cancelled_orders: int,
+    deferred_superseded: int,
+    expected_create: int,
+    previous_status: str,
+) -> dict:
+    accounting = build_run_accounting(run, mark_price=_decimal((account_risk_state or {}).get("mark_price")))
+    active_orders = [
+        order
+        for order in (run.get("orders") or {}).values()
+        if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"
+    ]
+    return {
+        "decision_timestamp": utc_now(),
+        "reason": reason,
+        "previous_status": previous_status,
+        "from_config_version": int(old_config.get("config_version") or 1),
+        "to_config_version": int(new_config.get("config_version") or 1),
+        "market": {
+            "reference_price": str(reference),
+            "mark_price": (account_risk_state or {}).get("mark_price"),
+        },
+        "inventory": {
+            "gridbot_inventory": reconciliation.get("gridbot_inventory"),
+            "delta_position": reconciliation.get("delta_position") or (account_risk_state or {}).get("position_lots"),
+            "remaining_inventory_lots": str(accounting.remaining_inventory_lots),
+            "remaining_inventory_basis": str(accounting.remaining_inventory_basis),
+        },
+        "account": _compact_account_context(account_risk_state),
+        "orders_expected": {
+            "remain": len(active_orders),
+            "cancel": cancelled_orders,
+            "create": expected_create,
+            "defer": None,
+            "deferred_superseded": deferred_superseded,
+        },
+    }
+
+
 class DurableGridBotLifecycle:
     def __init__(
         self,
@@ -1124,6 +1197,12 @@ class DurableGridBotLifecycle:
             persist_order_updates=persist_order_updates,
         )
         replacement_result = self.process_replacements(run, result) if process_replacements else {"created": 0, "deferred": 0, "skipped": 0}
+        product_symbol = (run.get("config") or {}).get("product_symbol") or (run.get("product") or {}).get("symbol") or "ETHUSD"
+        try:
+            telemetry = self.account_telemetry.get(product_symbol)
+            account_risk_state = telemetry.as_dict()
+        except Exception as exc:
+            account_risk_state = {"telemetry_status": "UNAVAILABLE", "errors": [str(exc)[:300]]}
         risk = {
             "created_at": utc_now(),
             "position": result.get("delta_position"),
@@ -1133,6 +1212,8 @@ class DurableGridBotLifecycle:
             "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
             "reconciliation": result,
             "replacements": replacement_result,
+            "account_risk_state": account_risk_state,
+            "snapshot_reason": "lifecycle_reconcile",
         }
         run.setdefault("risk_snapshots", []).append(risk)
         for event in result.get("events", []):
@@ -1861,6 +1942,7 @@ class DurableGridBotLifecycle:
         allowed, telemetry_reasons = risk_increasing_action_allowed(telemetry)
         if not allowed:
             return self._editing_blocked(state, run, "critical_telemetry_unavailable", {"reason_codes": telemetry_reasons})
+        account_risk_state = telemetry.as_dict()
 
         product_id = int(run["product"]["product_id"])
         cancelled = 0
@@ -1904,6 +1986,19 @@ class DurableGridBotLifecycle:
             self.db.retire_config(run["run_id"], int(old_config["config_version"]))
             self.db.persist_config(run, reason="edit_grid")
             self.db.persist_levels(run)
+            decision_context = _edit_decision_context(
+                run=run,
+                old_config=old_config,
+                new_config=run["config"],
+                reason=reason,
+                reference=reference,
+                reconciliation=reconciliation,
+                account_risk_state=account_risk_state,
+                cancelled_orders=cancelled,
+                deferred_superseded=deferred_superseded,
+                expected_create=len(run["levels"]) if previous_status == GridStatus.RUNNING.value else 0,
+                previous_status=previous_status,
+            )
             self.db.insert_once(
                 "grid_parameter_changes",
                 {
@@ -1913,7 +2008,13 @@ class DurableGridBotLifecycle:
                     "from_config_version": int(old_config["config_version"]),
                     "to_config_version": int(run["config"]["config_version"]),
                     "reason": reason,
-                    "payload": {"old_config": old_config, "new_config": run["config"], "cancelled_orders": cancelled, "deferred_superseded": deferred_superseded},
+                    "payload": {
+                        "old_config": old_config,
+                        "new_config": run["config"],
+                        "cancelled_orders": cancelled,
+                        "deferred_superseded": deferred_superseded,
+                        "decision_context": decision_context,
+                    },
                     "created_at": utc_now(),
                 },
                 on_conflict="change_id",
