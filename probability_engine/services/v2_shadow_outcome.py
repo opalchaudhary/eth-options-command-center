@@ -72,16 +72,54 @@ class V2ShadowOutcomeRepository(SupabaseRepository):
         )
         return {row.get("prediction_id") for row in _records(rows) if row.get("prediction_id")}
 
-    def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
+    def outcome_payload(self, prediction_id, outcome, label_version="label_v2"):
         outcome_payload = {key: value for key, value in outcome.items() if key in self.outcome_columns}
-        payload = {
+        return {
             "prediction_id": prediction_id,
             "label_version": label_version,
             "target": outcome.get("metadata_json", {}).get("target"),
             "horizon": outcome.get("metadata_json", {}).get("horizon"),
             **outcome_payload,
         }
+
+    def safe_insert_outcome(self, prediction_id, outcome, label_version="label_v2"):
+        payload = self.outcome_payload(prediction_id, outcome, label_version=label_version)
         return self.safe_insert(payload)
+
+    def safe_insert_outcomes(self, outcomes, label_version="label_v2"):
+        payloads = [
+            self.outcome_payload(prediction_id, outcome, label_version=label_version)
+            for prediction_id, outcome in outcomes
+        ]
+        if not payloads:
+            return 0, 0
+        try:
+            response = requests.post(
+                f"{database_reader.SUPABASE_URL}/rest/v1/{self.table_name}",
+                headers={
+                    **database_reader.HEADERS,
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=ignore-duplicates,return=representation",
+                },
+                params={"on_conflict": "prediction_id,label_version,target"},
+                json=payloads,
+                timeout=20,
+            )
+            if response.status_code in [200, 201]:
+                rows = response.json() if response.text else []
+                return len(rows), 0
+            if response.status_code == 204:
+                return len(payloads), 0
+            raise RuntimeError(f"bulk outcome insert failed: {response.status_code} {response.text[:200]}")
+        except Exception:
+            created = 0
+            failed = 0
+            for prediction_id, outcome in outcomes:
+                if self.safe_insert_outcome(prediction_id, outcome, label_version=label_version):
+                    created += 1
+                else:
+                    failed += 1
+            return created, failed
 
 
 class V2ShadowPredictionEvaluationRepository(SupabaseRepository):
@@ -281,6 +319,14 @@ def range_bounds_from_metadata(metadata: dict[str, Any]) -> tuple[float | None, 
     return (float(lower), float(upper)) if lower is not None and upper is not None else (None, None)
 
 
+def outcome_group_key(prediction: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(prediction.get("symbol") or "ETHUSD"),
+        pd.Timestamp(prediction.get("prediction_timestamp")).tz_convert("UTC").isoformat(),
+        str(prediction.get("horizon") or "").upper(),
+    )
+
+
 class V2ShadowOutcomeEvaluator:
     def __init__(
         self,
@@ -294,7 +340,7 @@ class V2ShadowOutcomeEvaluator:
         self.outcome_repository = outcome_repository or V2ShadowOutcomeRepository()
         self.feature_snapshot_repository = feature_snapshot_repository or V2FeatureSnapshotEvaluationRepository()
         self.candle_fetcher = candle_fetcher or load_future_ohlcv
-        self.batch_limit = batch_limit if batch_limit is not None else get_probability_config().outcome_batch_limit
+        self.batch_limit = batch_limit if batch_limit is not None else get_probability_config().v2_outcome_batch_limit
 
     def run(self, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
@@ -334,28 +380,46 @@ class V2ShadowOutcomeEvaluator:
             }
 
         snapshots = self.feature_snapshot_repository.by_ids([row.get("feature_snapshot_id") for row in pending])
-        created = 0
+        ready_outcomes = []
         incomplete = 0
         failed = 0
+        ohlcv_fetch_count = 0
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in pending:
+            groups.setdefault(outcome_group_key(row), []).append(row)
+
+        for (_symbol, _prediction_timestamp, _horizon), group_rows in groups.items():
             try:
-                snapshot = snapshots.get(row.get("feature_snapshot_id"))
-                if not snapshot:
-                    incomplete += 1
+                window = prediction_window(group_rows[0])
+                if not window:
+                    incomplete += len(group_rows)
                     continue
-                start_at, end_at = prediction_window(row)
-                candles = self.candle_fetcher(row.get("symbol") or "ETHUSD", start_at, end_at)
-                outcome = evaluate_shadow_target(row, candles, snapshot)
-                if not outcome.get("ok"):
-                    incomplete += 1
-                    continue
-                outcome["evaluated_at"] = now.isoformat()
-                if self.outcome_repository.safe_insert_outcome(row.get("id"), outcome):
+                candles = self.candle_fetcher(group_rows[0].get("symbol") or "ETHUSD", *window)
+                ohlcv_fetch_count += 1
+                for row in group_rows:
+                    snapshot = snapshots.get(row.get("feature_snapshot_id"))
+                    if not snapshot:
+                        incomplete += 1
+                        continue
+                    outcome = evaluate_shadow_target(row, candles, snapshot)
+                    if not outcome.get("ok"):
+                        incomplete += 1
+                        continue
+                    outcome["evaluated_at"] = now.isoformat()
+                    ready_outcomes.append((row.get("id"), outcome))
+            except Exception:
+                failed += len(group_rows)
+
+        if hasattr(self.outcome_repository, "safe_insert_outcomes"):
+            created, persistence_failed = self.outcome_repository.safe_insert_outcomes(ready_outcomes)
+            failed += persistence_failed
+        else:
+            created = 0
+            for prediction_id, outcome in ready_outcomes:
+                if self.outcome_repository.safe_insert_outcome(prediction_id, outcome):
                     created += 1
                 else:
                     failed += 1
-            except Exception:
-                failed += 1
 
         return {
             "ok": failed == 0,
@@ -369,4 +433,7 @@ class V2ShadowOutcomeEvaluator:
             "failed_count": failed,
             "batch_limit": batch_limit,
             "candidate_pages_scanned": page + 1 if "page" in locals() else 0,
+            "ohlcv_fetch_count": ohlcv_fetch_count,
+            "outcome_group_count": len(groups),
+            "bulk_persistence": hasattr(self.outcome_repository, "safe_insert_outcomes"),
         }

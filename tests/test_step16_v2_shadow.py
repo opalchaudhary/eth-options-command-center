@@ -173,6 +173,7 @@ class FakeV2OutcomeRepository:
     def __init__(self, existing=None):
         self.existing = set(existing or [])
         self.inserted = []
+        self.bulk_calls = 0
 
     def existing_prediction_ids(self, prediction_ids, label_version="label_v2"):
         return self.existing.intersection(prediction_ids)
@@ -183,6 +184,17 @@ class FakeV2OutcomeRepository:
         self.existing.add(prediction_id)
         self.inserted.append({"prediction_id": prediction_id, "label_version": label_version, **outcome})
         return True
+
+    def safe_insert_outcomes(self, outcomes, label_version="label_v2"):
+        self.bulk_calls += 1
+        created = 0
+        failed = 0
+        for prediction_id, outcome in outcomes:
+            if self.safe_insert_outcome(prediction_id, outcome, label_version=label_version):
+                created += 1
+            else:
+                failed += 1
+        return created, failed
 
 
 class FakeV2SnapshotRepository:
@@ -218,6 +230,8 @@ def test_v2_shadow_outcome_evaluator_persists_mature_prediction():
     assert inserted["metadata_json"]["target"] == "path_inside_70"
     assert inserted["metadata_json"]["horizon"] == "1H"
     assert inserted["metadata_json"]["manifest_hash"] == FROZEN_MANIFEST_HASH
+    assert result["ohlcv_fetch_count"] == 1
+    assert result["outcome_group_count"] == 1
 
 
 def test_v2_shadow_outcome_repository_strips_non_schema_fields():
@@ -257,6 +271,58 @@ def test_v2_shadow_outcome_repository_strips_non_schema_fields():
     assert "ok" not in repository.payload
 
 
+def test_v2_shadow_outcome_repository_bulk_insert_ignores_duplicates(monkeypatch):
+    from probability_engine.services import v2_shadow_outcome
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeRepository
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 201
+        text = "[]"
+
+        def json(self):
+            return []
+
+    def fake_post(url, headers, params, json, timeout):
+        captured.update(
+            {
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "json": json,
+                "timeout": timeout,
+            }
+        )
+        return FakeResponse()
+
+    monkeypatch.setattr(v2_shadow_outcome.requests, "post", fake_post)
+    repository = V2ShadowOutcomeRepository()
+
+    created, failed = repository.safe_insert_outcomes(
+        [
+            (
+                "v2-1",
+                {
+                    "ok": True,
+                    "outcome": False,
+                    "actual_open": 100,
+                    "evaluated_at": "2026-01-01T01:00:00+00:00",
+                    "metadata_json": {"target": "path_inside_70", "horizon": "1H"},
+                },
+            )
+        ]
+    )
+
+    assert created == 0
+    assert failed == 0
+    assert captured["params"] == {"on_conflict": "prediction_id,label_version,target"}
+    assert "resolution=ignore-duplicates" in captured["headers"]["Prefer"]
+    assert captured["json"][0]["prediction_id"] == "v2-1"
+    assert captured["json"][0]["target"] == "path_inside_70"
+    assert "ok" not in captured["json"][0]
+
+
 def test_v2_shadow_outcome_evaluator_skips_immature_and_existing_rows():
     from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
 
@@ -279,3 +345,141 @@ def test_v2_shadow_outcome_evaluator_skips_immature_and_existing_rows():
     assert result["created_count"] == 0
     assert result["skipped_existing_count"] == 1
     assert outcomes.inserted == []
+
+
+def test_v2_shadow_outcome_evaluator_reuses_future_path_by_timestamp_horizon():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction("inside", target="path_inside_70", horizon="1H", prediction_timestamp=start),
+        _v2_prediction("breached", target="range_breached", horizon="1H", prediction_timestamp=start),
+        _v2_prediction("both", target="both_side_breach", horizon="1H", prediction_timestamp=start),
+    ]
+    calls = []
+
+    def candle_fetcher(symbol, start_at, end_at):
+        calls.append((symbol, start_at, end_at))
+        return _v2_candles(start, high=106, low=94)
+
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=candle_fetcher,
+        batch_limit=10,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["attempted_count"] == 3
+    assert result["created_count"] == 3
+    assert result["ohlcv_fetch_count"] == 1
+    assert result["outcome_group_count"] == 1
+    assert len(calls) == 1
+    by_id = {row["prediction_id"]: row["outcome"] for row in outcomes.inserted}
+    assert by_id == {"inside": False, "breached": True, "both": True}
+
+
+def test_v2_shadow_grouped_evaluator_matches_reference_per_row_semantics():
+    from probability_engine.services.v2_shadow_outcome import (
+        V2ShadowOutcomeEvaluator,
+        evaluate_shadow_target,
+    )
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    targets = [
+        "path_inside_70",
+        "range_breached",
+        "both_side_breach",
+        "upside_breakout",
+        "downside_breakdown",
+        "upper_breach_only",
+        "lower_breach_only",
+        "realized_over_range_width_ge_1",
+        "up_excursion_ge_1_0_atr",
+        "down_excursion_ge_1_0_atr",
+    ]
+    rows = [
+        _v2_prediction(target, target=target, horizon="1H", prediction_timestamp=start)
+        for target in targets
+    ]
+    candles = _v2_candles(start, high=106, low=94)
+    snapshot = FakeV2SnapshotRepository().by_ids(["snap-1"])["snap-1"]
+    expected = {
+        row["id"]: evaluate_shadow_target(row, candles, snapshot)["outcome"]
+        for row in rows
+    }
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: candles,
+        batch_limit=20,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    actual = {row["prediction_id"]: row["outcome"] for row in outcomes.inserted}
+    assert result["created_count"] == len(rows)
+    assert actual == expected
+    assert result["ohlcv_fetch_count"] == 1
+    assert outcomes.bulk_calls == 1
+
+
+def test_v2_shadow_grouped_evaluator_marks_group_incomplete_without_persistence():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction("inside", target="path_inside_70", horizon="1H", prediction_timestamp=start),
+        _v2_prediction("breached", target="range_breached", horizon="1H", prediction_timestamp=start),
+    ]
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start, count=3),
+        batch_limit=10,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["created_count"] == 0
+    assert result["skipped_incomplete_count"] == 2
+    assert outcomes.inserted == []
+
+
+def test_v2_shadow_outcome_evaluator_uses_v2_specific_batch_env(monkeypatch):
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    monkeypatch.setenv("PROBABILITY_OUTCOME_BATCH_LIMIT", "25")
+    monkeypatch.setenv("PROBABILITY_V2_OUTCOME_BATCH_SIZE", "75")
+
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository([]),
+        outcome_repository=FakeV2OutcomeRepository(),
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: pd.DataFrame(),
+    )
+
+    assert evaluator.batch_limit == 75
+
+
+def test_v2_shadow_outcome_evaluator_falls_back_to_shared_batch_env(monkeypatch):
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    monkeypatch.setenv("PROBABILITY_OUTCOME_BATCH_LIMIT", "50")
+    monkeypatch.delenv("PROBABILITY_V2_OUTCOME_BATCH_SIZE", raising=False)
+
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository([]),
+        outcome_repository=FakeV2OutcomeRepository(),
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: pd.DataFrame(),
+    )
+
+    assert evaluator.batch_limit == 50

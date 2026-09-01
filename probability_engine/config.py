@@ -57,6 +57,7 @@ class ProbabilityEngineConfig:
     v2_shadow_feature_version: str = field(default_factory=lambda: os.getenv("PROBABILITY_V2_SHADOW_FEATURE_VERSION", "probability_v2_features_v1"))
     v2_shadow_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_SHADOW_INTERVAL", 300))
     v2_shadow_history_days: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_SHADOW_HISTORY_DAYS", 120))
+    v2_outcome_batch_limit: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_BATCH_SIZE", _int_env("PROBABILITY_OUTCOME_BATCH_LIMIT", 25)))
 
 
 def get_probability_config() -> ProbabilityEngineConfig:
