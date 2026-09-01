@@ -2310,6 +2310,7 @@ class DurableGridBotLifecycle:
                     cancelled_attempts += 1
                 except Exception:
                     pass
+        cancelled_attempts += self._cancel_known_gridbot_resting_orders(run, product_id)
         self._terminalize_never_submitted_orders(run)
         self._save(state, include_children=False)
 
@@ -2348,6 +2349,7 @@ class DurableGridBotLifecycle:
                         self._cancel_order_safely(product_id, local)
                     else:
                         self.client.cancel_order(product_id, str(exchange_order.get("id") or exchange_order.get("order_id")))
+                self._cancel_known_gridbot_resting_orders(run, product_id)
                 self._save(state)
                 reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
                 state = self._load()
