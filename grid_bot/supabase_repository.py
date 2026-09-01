@@ -938,6 +938,14 @@ class SupabaseGridRepository:
             ),
             None,
         )
+        latest_external_adjustment = next(
+            (
+                row.get("payload") or {}
+                for row in event_rows
+                if row.get("event_type") in {"GRID_RUN_EXTERNAL_POSITION_CHANGE", "GRID_RUN_FORCED_POSITION_REDUCTION"}
+            ),
+            None,
+        )
         product_id = bot.get("product_id") or 1699
         startup_stage = latest_stage or ("RUNNING" if run_row.get("status") == "RUNNING" else run_row.get("status"))
         startup = {
@@ -949,7 +957,7 @@ class SupabaseGridRepository:
             "last_startup_progress_at": latest_stage_at,
             "last_successful_delta_truth_check": latest_truth_at,
         }
-        return {
+        run_state = {
             "run_id": run_id,
             "bot_id": run_row["bot_id"],
             "status": run_row.get("status"),
@@ -1018,6 +1026,20 @@ class SupabaseGridRepository:
             "start_stage": startup_stage,
             "startup": startup,
         }
+        if latest_external_adjustment:
+            run_state["external_position_adjustment"] = latest_external_adjustment
+            run_state["external_position_resolution"] = {
+                "status": "EXTERNALLY_CHANGED",
+                "reason": latest_external_adjustment.get("reason"),
+                "classification": latest_external_adjustment.get("classification"),
+                "gridbot_inventory_before_resolution": latest_external_adjustment.get("ledger_inventory"),
+                "delta_position": latest_external_adjustment.get("delta_position"),
+                "external_adjustment_lots": latest_external_adjustment.get("external_adjustment_lots"),
+                "resolved_at": latest_external_adjustment.get("detected_at"),
+                "accounting_status": "PARTIAL",
+                "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
+            }
+        return run_state
 
     def status_payload(self) -> dict:
         active = self.active_run()

@@ -771,6 +771,24 @@ def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
     assert client.open_orders(1699)["result"] == []
 
 
+def test_edit_grid_external_position_change_fails_closed_to_paused(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    before_fills = len(client.fill_rows)
+    client.position_size = "0"
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="external_before_edit")
+
+    assert edited["ok"] is False
+    assert edited["run"]["status"] == GridStatus.PAUSED.value
+    assert edited["run"]["external_position_adjustment"]["classification"] == "MANUAL_FULL_CLOSE_OR_EXTERNAL_FLAT"
+    assert len(client.fill_rows) == before_fills
+    assert client.open_orders(1699)["result"] == []
+    assert int(edited["run"]["config"]["config_version"]) == 1
+
+
 def test_stop_preempts_editing_state(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -1024,6 +1042,26 @@ def test_stop_does_not_external_resolve_nonzero_delta_exposure(tmp_path):
     assert "external_position_resolution" not in stopped["run"]
 
 
+def test_stop_after_external_partial_reduction_flattens_actual_delta_position(tmp_path):
+    client = _FlattenFillsClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    lifecycle.pause(run["run_id"])
+    client.position_size = "0.5"
+    paused = lifecycle.resume(run["run_id"])
+
+    stopped = lifecycle.stop(run["run_id"], "external_partial_stop")
+
+    assert paused["run"]["external_position_adjustment"]["classification"] == "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION"
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert client.flatten_payloads[-1]["side"] == "sell"
+    assert client.flatten_payloads[-1]["size"] == "0.5"
+    assert stopped["summary"]["final_delta_position"] == "0.0"
+    assert stopped["summary"]["external_position_resolution"]["status"] == "EXTERNALLY_RESOLVED"
+    assert stopped["summary"]["accounting_status"] == "PARTIAL"
+
+
 def test_stop_external_close_recovery_is_idempotent(tmp_path):
     client = _FlattenFillsClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -1251,6 +1289,99 @@ def test_resume_reconciles_before_placement_rebuilds_reservations_and_is_idempot
     assert len(client.open_orders(1699)["result"]) == order_count_after_first_resume
     assert all("projected_inventory_if_filled" in order for order in resumed_orders)
     assert resumed["reconciliation"]["gridbot_inventory"] == signed_position
+
+
+def test_resume_external_partial_reduction_pauses_without_fake_fills_or_replacements(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    lifecycle.pause(run["run_id"])
+    before_fills = len(client.fill_rows)
+    client.position_size = "0.5"
+
+    resumed = lifecycle.resume(run["run_id"])
+
+    assert resumed["ok"] is False
+    assert resumed["run"]["status"] == GridStatus.PAUSED.value
+    assert resumed["requires_attention"] is True
+    assert resumed["run"]["external_position_adjustment"]["classification"] == "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION"
+    assert resumed["run"]["external_position_adjustment"]["external_adjustment_lots"] == "-0.5"
+    assert len(client.fill_rows) == before_fills
+    assert not [order for order in resumed["run"]["orders"].values() if order.get("order_kind") == "replacement" and order.get("exchange_order_id")]
+    assert client.open_orders(1699)["result"] == []
+
+
+def test_resume_manual_full_close_pauses_and_uses_delta_operational_flat(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="sell", size="1")
+    lifecycle.pause(run["run_id"])
+    client.position_size = "0"
+
+    resumed = lifecycle.resume(run["run_id"])
+    health = evaluate_gridbot_health(
+        {"running": False, "thread_alive": True, "lifecycle_state": GridStatus.PAUSED.value},
+        resumed["run"],
+        resumed["reconciliation"],
+    )
+
+    assert resumed["run"]["external_position_adjustment"]["classification"] == "MANUAL_FULL_CLOSE_OR_EXTERNAL_FLAT"
+    assert resumed["run"]["external_position_adjustment"]["delta_position"] == "0"
+    assert len(resumed["run"].get("fills") or {}) == 1
+    assert "EXTERNAL_POSITION_CHANGE" in {issue["code"] for issue in health["active_issues"]}
+    assert "POSITION_MISMATCH" not in {issue["code"] for issue in health["active_issues"]}
+
+
+def test_resume_forced_reduction_classification_requires_liquidation_evidence(tmp_path):
+    class HighMarginClient(_FakeLifecycleClient):
+        def wallet(self):
+            return {
+                "success": True,
+                "meta": {"net_equity": "1000"},
+                "result": [{"asset_symbol": "USD", "balance": "1000", "available_balance": "0", "blocked_margin": "1000"}],
+            }
+
+    client = HighMarginClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+    lifecycle.pause(run["run_id"])
+    client.position_size = "0"
+
+    resumed = lifecycle.resume(run["run_id"])
+    events = [event["event_type"] for event in lifecycle.status()["events"]]
+
+    assert resumed["run"]["external_position_adjustment"]["classification"] == "FORCED_LIQUIDATION_OR_REDUCTION"
+    assert "GRID_RUN_FORCED_POSITION_REDUCTION" in events
+
+
+def test_resume_unresolved_truth_fails_closed_to_paused(tmp_path):
+    class UnresolvedClient(_FakeLifecycleClient):
+        def order_history(self, product_id=None, start_time=None, end_time=None, after=None, page_size=50):
+            return {"success": True, "result": []}
+
+        def get_order(self, order_id):
+            exc = RuntimeError("404 not found")
+            exc.response = type("Response", (), {"status_code": 404})()
+            raise exc
+
+    client = UnresolvedClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    lifecycle.pause(run["run_id"])
+    state = lifecycle._load()
+    order = next(iter(state["runs"][run["run_id"]]["orders"].values()))
+    order["status"] = "open"
+    order["remaining_quantity"] = "1"
+    lifecycle._save(state)
+
+    resumed = lifecycle.resume(run["run_id"])
+
+    assert resumed["ok"] is False
+    assert resumed["run"]["status"] == GridStatus.PAUSED.value
+    assert resumed["diagnostics"]["reason"] == "truth_unavailable_or_unresolved"
 
 
 def test_restart_while_pausing_or_resuming_can_complete_requested_lifecycle(tmp_path):
@@ -2353,6 +2484,21 @@ def test_replacement_partial_fill_leaves_only_remaining_obligation(tmp_path):
     assert source_entitlement["replacement_qty_already_filled"] == "4"
     assert source_entitlement["replacement_qty_currently_open"] == "6"
     assert source_entitlement["replacement_deficit_qty"] == "0"
+
+
+def test_replacement_processing_skips_external_position_mismatch(tmp_path):
+    client = _FakeLifecycleClient()
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-1", fill_size="1")
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+
+    result = lifecycle.process_replacements(
+        run,
+        {"gridbot_inventory": "1", "delta_position": "0", "position_mismatches": 1},
+    )
+
+    assert result["created"] == 0
+    assert result["items"][0]["reason"] == "external_position_change"
+    assert not [order for order in run["orders"].values() if order.get("order_kind") == "replacement" and order.get("exchange_order_id")]
 
 
 def test_multiple_replacement_partial_fills_restore_opening_opportunity_once(tmp_path):
@@ -3575,6 +3721,29 @@ def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_
     assert health["overall_status"] == "CRITICAL"
     assert health["safe_for_risk_increase"] is False
     assert health["safe_for_risk_reduce"] is False
+    assert health["operator_attention_required"] is True
+
+
+def test_gridbot_health_classifies_external_position_change_without_generic_mismatch():
+    run = {
+        "run_id": "run-external",
+        "status": GridStatus.PAUSED.value,
+        "config": {"grid_type": "long_bias", "max_inventory_lots": "2"},
+        "external_position_adjustment": {
+            "classification": "MANUAL_FULL_CLOSE_OR_EXTERNAL_FLAT",
+            "ledger_inventory": "3",
+            "delta_position": "0",
+            "external_adjustment_lots": "-3",
+        },
+    }
+
+    health = evaluate_gridbot_health({}, run, {"gridbot_inventory": "3", "delta_position": "0", "position_mismatches": 1})
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert "EXTERNAL_POSITION_CHANGE" in codes
+    assert "POSITION_MISMATCH" not in codes
+    assert "POSITION_ATTRIBUTION_UNSAFE" not in codes
+    assert "MAX_INVENTORY_VIOLATION" not in codes
     assert health["operator_attention_required"] is True
 
 

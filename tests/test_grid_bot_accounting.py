@@ -272,3 +272,15 @@ def test_external_position_resolution_from_summary_keeps_historical_accounting_p
     assert accounting.accounting_status == "PARTIAL"
     assert accounting.funding_attribution_status == "PARTIALLY_ATTRIBUTED"
     assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" in accounting.warnings
+
+
+def test_external_position_adjustment_keeps_accounting_partial_without_fake_close():
+    run = _run([_fill("entry", "buy", "3000", size="2", fee="1")], status="PAUSED")
+    run["external_position_adjustment"] = {"classification": "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION"}
+
+    accounting = build_run_accounting(run, mark_price=Decimal("3010"), account_position_lots=Decimal("1"))
+
+    assert accounting.remaining_inventory_lots == Decimal("2")
+    assert accounting.unrealized_pnl is None
+    assert accounting.live_net_pnl is None
+    assert accounting.accounting_status == "PARTIAL"

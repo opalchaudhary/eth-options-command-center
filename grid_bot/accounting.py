@@ -501,7 +501,7 @@ def build_run_accounting(
     if len([key for key in trading_fee_cost_keys if key]) != len(set(key for key in trading_fee_cost_keys if key)):
         warnings.append("DUPLICATE_EXCHANGE_COST")
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
-    external_resolution = run.get("external_position_resolution") or summary.get("external_position_resolution") or {}
+    external_resolution = run.get("external_position_adjustment") or run.get("external_position_resolution") or summary.get("external_position_resolution") or {}
     stop_diagnostics = run.get("stop_diagnostics") or {}
     if external_resolution or stop_diagnostics.get("reason") in {"attribution_mismatch", "unresolved_gridbot_order", "flatten_state_ambiguous"}:
         warnings.append("EXTERNAL_POSITION_CLOSE_UNATTRIBUTED")

@@ -363,7 +363,12 @@ class ContinuousGridBotWorker:
         before_telemetry_counts = dict(self.account_telemetry.request_counts)
         telemetry = self.account_telemetry.get("ETHUSD")
         telemetry_refreshed = dict(self.account_telemetry.request_counts) != before_telemetry_counts
-        replacement_result = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled).process_replacements(run, result)
+        lifecycle = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled)
+        if int(result.get("position_mismatches") or 0):
+            lifecycle._safe_pause_for_external_position_change(lifecycle._load(), run, result, reason="worker_reconcile", previous_status=run.get("status"))
+            replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "external_position_change"}], "metrics": {}}
+        else:
+            replacement_result = lifecycle.process_replacements(run, result)
         new_fill_ids = [fill_id for fill_id in (run.get("fills") or {}) if fill_id not in before_fills]
         if new_fill_ids:
             self._set_state(last_fill={"fill_id": new_fill_ids[-1], "raw": (run.get("fills") or {}).get(new_fill_ids[-1])})

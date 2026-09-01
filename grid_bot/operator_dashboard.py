@@ -25,6 +25,8 @@ TERMINAL_ORDER_STATUSES = {
 
 HEALTH_MESSAGES = {
     "POSITION_MISMATCH": "Delta position does not match the bot's records.",
+    "EXTERNAL_POSITION_CHANGE": "Delta position changed outside the GridBot. Trading has been paused until the position is reconciled.",
+    "FORCED_LIQUIDATION": "Delta forcibly reduced or liquidated the position. Grid trading has been paused.",
     "POSITION_ATTRIBUTION_UNSAFE": "Position problem: account exposure cannot be safely matched to this bot.",
     "TELEMETRY_STALE": "Account information is delayed.",
     "CRITICAL_TELEMETRY_UNAVAILABLE": "Important account information is unavailable.",
@@ -159,7 +161,7 @@ def health_issue_source(code: Any) -> str:
         return "Telemetry"
     if code.startswith("ACCOUNTING") or code == "DUPLICATE_EXCHANGE_COST_PROTECTION":
         return "Accounting"
-    if code.startswith("POSITION") or "INVENTORY" in code or code == "FILL_LEDGER_MISMATCH":
+    if code.startswith("POSITION") or code in {"EXTERNAL_POSITION_CHANGE", "FORCED_LIQUIDATION"} or "INVENTORY" in code or code == "FILL_LEDGER_MISMATCH":
         return "Position / Inventory"
     if code.startswith("LIFECYCLE") or code.startswith("STOP"):
         return "Lifecycle"

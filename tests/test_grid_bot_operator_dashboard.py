@@ -149,6 +149,8 @@ def test_health_text_is_plain_language_and_source_labelled() -> None:
     assert details == ["Supabase / Database: Trading records are temporarily unavailable."]
     assert health_issue_text({"code": "DELTA_TIMEOUT"}) == "Delta / Exchange: Delta is taking too long to answer."
     assert health_plain_text({"active_issues": [{"code": "ACCOUNTING_INCOMPLETE"}]}) == ("Profit information is incomplete.", [])
+    assert "changed outside the GridBot" in health_issue_text({"code": "EXTERNAL_POSITION_CHANGE"})
+    assert "forcibly reduced" in health_issue_text({"code": "FORCED_LIQUIDATION"})
 
 
 def test_edit_preview_summary_is_plain_language() -> None:

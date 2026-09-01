@@ -26,7 +26,9 @@ class HealthSeverity(str, Enum):
 ATTENTION_CODES = {
     "ACTIVE_LOCK_CONTRADICTION",
     "ACCOUNTING_MISMATCH",
+    "EXTERNAL_POSITION_CHANGE",
     "FILL_LEDGER_MISMATCH",
+    "FORCED_LIQUIDATION",
     "GRID_NATURE_INVENTORY_VIOLATION",
     "GRID_ORDER_ORPHAN",
     "GRID_ORDER_MISSING_UNEXPECTEDLY",
@@ -212,8 +214,14 @@ def evaluate_gridbot_health(
     new_fills = int(reconciliation.get("new_fills") or 0)
     inventory = _decimal(reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"))
     position = _decimal(reconciliation.get("delta_position") or state.get("delta_position"))
+    external_adjustment = (run or {}).get("external_position_adjustment") or (run or {}).get("external_position_resolution")
+    operational_inventory = position if external_adjustment else inventory
     transient_fill_position_catchup = bool(new_fills and abs(position - inventory) <= new_fills)
-    if int(reconciliation.get("position_mismatches") or state.get("position_mismatches") or 0) > 0 and not transient_fill_position_catchup:
+    if external_adjustment:
+        classification = str(external_adjustment.get("classification") or "")
+        code = "FORCED_LIQUIDATION" if classification == "FORCED_LIQUIDATION_OR_REDUCTION" else "EXTERNAL_POSITION_CHANGE"
+        issues.append(_issue(code, HealthSeverity.CRITICAL, "Delta position changed outside the GridBot.", run_for_issue, external_position_adjustment=external_adjustment))
+    elif int(reconciliation.get("position_mismatches") or state.get("position_mismatches") or 0) > 0 and not transient_fill_position_catchup:
         issues.append(
             _issue(
                 "POSITION_MISMATCH",
@@ -237,14 +245,14 @@ def evaluate_gridbot_health(
             issues.append(_issue("FILL_LEDGER_MISMATCH", HealthSeverity.CRITICAL, "Fill ledger exceeds requested order quantity.", run_for_issue, **payload))
 
     max_inventory = abs(_decimal((run.get("config") or {}).get("max_inventory_lots")))
-    if max_inventory and abs(inventory) > max_inventory:
-        issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(inventory), max_inventory=str(max_inventory)))
+    if max_inventory and abs(operational_inventory) > max_inventory:
+        issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(operational_inventory), max_inventory=str(max_inventory)))
     grid_type = str((run.get("config") or {}).get("grid_type") or "")
-    if grid_type == GridType.LONG_BIAS.value and inventory < 0:
-        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Long grid is unexpectedly net short.", run_for_issue, inventory=str(inventory)))
-    if grid_type == GridType.SHORT_BIAS.value and inventory > 0:
-        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Short grid is unexpectedly net long.", run_for_issue, inventory=str(inventory)))
-    if abs(position - inventory) > 0 and not transient_fill_position_catchup:
+    if grid_type == GridType.LONG_BIAS.value and operational_inventory < 0:
+        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Long grid is unexpectedly net short.", run_for_issue, inventory=str(operational_inventory)))
+    if grid_type == GridType.SHORT_BIAS.value and operational_inventory > 0:
+        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Short grid is unexpectedly net long.", run_for_issue, inventory=str(operational_inventory)))
+    if not external_adjustment and abs(position - inventory) > 0 and not transient_fill_position_catchup:
         issues.append(_issue("POSITION_ATTRIBUTION_UNSAFE", HealthSeverity.CRITICAL, "Account exposure cannot be safely attributed to this GridBot.", run_for_issue, delta_position=str(position), gridbot_inventory=str(inventory)))
 
     open_orders = _open_orders(run)

@@ -1087,7 +1087,101 @@ class DurableGridBotLifecycle:
         allowed, reasons = risk_increasing_action_allowed(telemetry)
         if not allowed:
             raise RuntimeError(f"Resume requires fresh critical telemetry before placement: {','.join(reasons)}")
-        return _decimal(reconciliation.get("gridbot_inventory"), str(telemetry.position_lots or "0"))
+        return _decimal(reconciliation.get("delta_position"), str(telemetry.position_lots or "0"))
+
+    def _classify_external_position_change(self, run: dict, reconciliation: dict, telemetry_payload: dict | None = None) -> str:
+        ledger = _decimal(reconciliation.get("gridbot_inventory"))
+        delta = _decimal(reconciliation.get("delta_position"))
+        payload = telemetry_payload or {}
+        margin = _decimal(payload.get("margin_utilisation_pct"))
+        liquidation_price = payload.get("liquidation_price")
+        if margin >= Decimal("100") or liquidation_price not in [None, "", "N/A"]:
+            return "FORCED_LIQUIDATION_OR_REDUCTION"
+        if delta == 0 and ledger != 0:
+            return "MANUAL_FULL_CLOSE_OR_EXTERNAL_FLAT"
+        if abs(delta) < abs(ledger) and ledger * delta >= 0:
+            return "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION"
+        if abs(delta) > abs(ledger):
+            return "EXTERNAL_POSITION_INCREASE"
+        return "UNKNOWN_EXTERNAL_CAUSE"
+
+    def _safe_pause_for_external_position_change(self, state: dict, run: dict, reconciliation: dict, *, reason: str, previous_status: str | None = None) -> dict:
+        state.setdefault("runs", {})[run["run_id"]] = run
+        product_symbol = run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD"
+        try:
+            telemetry_payload = self.account_telemetry.get(product_symbol, force=True).as_dict()
+        except Exception:
+            telemetry_payload = {}
+        product_id = int(run["product"]["product_id"])
+        cancelled = self._cancel_known_gridbot_resting_orders(run, product_id)
+        try:
+            for exchange_order in _gridbot_orders(_result_rows(self.client.open_orders(product_id))):
+                cid = str(exchange_order.get("client_order_id") or "")
+                local = run.setdefault("orders", {}).get(cid)
+                if local and local.get("order_kind") == "safety_flatten":
+                    continue
+                if local:
+                    if self._cancel_order_safely(product_id, local):
+                        cancelled += 1
+                else:
+                    self.client.cancel_order(product_id, str(exchange_order.get("id") or exchange_order.get("order_id")))
+                    cancelled += 1
+        except Exception as exc:
+            run["external_position_cancel_error"] = str(exc)[:300]
+        ledger = _decimal(reconciliation.get("gridbot_inventory"))
+        delta = _decimal(reconciliation.get("delta_position"))
+        now = utc_now()
+        classification = self._classify_external_position_change(run, reconciliation, telemetry_payload)
+        adjustment = {
+            "type": "EXTERNAL_POSITION_CHANGE",
+            "classification": classification,
+            "ledger_inventory": str(ledger),
+            "delta_position": str(delta),
+            "external_adjustment_lots": str(delta - ledger),
+            "previous_status": previous_status or run.get("status"),
+            "reason": reason,
+            "cancelled_orders": cancelled,
+            "detected_at": now,
+            "accounting_status": "PARTIAL",
+            "cause": "UNKNOWN_EXTERNAL_CAUSE" if classification != "FORCED_LIQUIDATION_OR_REDUCTION" else "FORCED_REDUCTION_EVIDENCE",
+        }
+        run["external_position_adjustment"] = adjustment
+        run["external_position_resolution"] = {
+            "status": "EXTERNALLY_CHANGED",
+            "reason": reason,
+            "classification": classification,
+            "gridbot_inventory_before_resolution": str(ledger),
+            "delta_position": str(delta),
+            "external_adjustment_lots": str(delta - ledger),
+            "resolved_at": now,
+            "accounting_status": "PARTIAL",
+            "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
+        }
+        run["status"] = GridStatus.PAUSED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
+        run["resume_diagnostics"] = {
+            "reason": "external_position_change",
+            "message": "Delta position changed outside the GridBot. Trading has been paused until the position is reconciled.",
+            "updated_at": now,
+            "reconciliation": reconciliation,
+            "external_position_adjustment": adjustment,
+        }
+        self._event(state, run["run_id"], "GRID_RUN_EXTERNAL_POSITION_CHANGE", adjustment)
+        if classification == "FORCED_LIQUIDATION_OR_REDUCTION":
+            self._event(state, run["run_id"], "GRID_RUN_FORCED_POSITION_REDUCTION", adjustment)
+        self._save(state)
+        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["resume_diagnostics"]), "reconciliation": reconciliation}
+
+    def _resume_blocked(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
+        now = utc_now()
+        run["status"] = GridStatus.PAUSED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
+        run["resume_diagnostics"] = {"reason": reason, "updated_at": now, **diagnostics}
+        self._event(state, run["run_id"], "GRID_RUN_RESUME_BLOCKED", run["resume_diagnostics"])
+        self._save(state)
+        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["resume_diagnostics"])}
 
     def _place_proposal(
         self,
@@ -1341,7 +1435,15 @@ class DurableGridBotLifecycle:
             outcome["items"].append({"state": "skipped", "reason": "run_not_running", "status": run.get("status")})
             outcome["metrics"] = self._replacement_metrics(run)
             return outcome
-        inventory = _decimal((reconciliation or {}).get("gridbot_inventory"), str(_position_size(self.client, product_id)))
+        if int((reconciliation or {}).get("position_mismatches") or 0):
+            outcome["skipped"] = len(run.get("fills") or {})
+            outcome["items"].append({"state": "skipped", "reason": "external_position_change"})
+            outcome["metrics"] = self._replacement_metrics(run)
+            return outcome
+        operational_inventory_value = (reconciliation or {}).get("delta_position")
+        if operational_inventory_value in [None, ""]:
+            operational_inventory_value = (reconciliation or {}).get("gridbot_inventory")
+        inventory = _decimal(operational_inventory_value, str(_position_size(self.client, product_id)))
         outcome["skipped"] = int(run.pop("_replacement_refresh_skipped", 0) or 0)
         for group_key, group in sorted((run.get("replacement_entitlements") or {}).items()):
             result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory)
@@ -1784,17 +1886,26 @@ class DurableGridBotLifecycle:
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
-        inventory = self._assert_resume_ready(run, reconciled["reconciliation"])
+        reconciliation = reconciled["reconciliation"]
+        if int(reconciliation.get("position_mismatches") or 0):
+            return self._safe_pause_for_external_position_change(state, run, reconciliation, reason="resume_preflight", previous_status=GridStatus.RESUMING.value)
+        try:
+            inventory = self._assert_resume_ready(run, reconciliation)
+        except RuntimeError as exc:
+            return self._resume_blocked(state, run, "truth_unavailable_or_unresolved", {"error": str(exc)[:500], "reconciliation": reconciliation})
 
-        for level in run["levels"]:
-            existing_open = [
-                order
-                for order in run.get("orders", {}).values()
-                if order["level_id"] == level["level_id"] and order.get("status") not in START_TERMINAL_ORDER_STATUSES
-            ]
-            if not existing_open:
-                proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory)
+        try:
+            for level in run["levels"]:
+                existing_open = [
+                    order
+                    for order in run.get("orders", {}).values()
+                    if order["level_id"] == level["level_id"] and order.get("status") not in START_TERMINAL_ORDER_STATUSES
+                ]
+                if not existing_open:
+                    proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
+                    self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory)
+        except Exception as exc:
+            return self._resume_blocked(state, run, "placement_failed", {"error": str(exc)[:500]})
         self._save(state)
 
         verified = self.reconcile(run["run_id"], process_replacements=False)
@@ -1804,16 +1915,13 @@ class DurableGridBotLifecycle:
         unresolved = int(verified["reconciliation"].get("unresolved_orders") or 0)
         mismatches = int(verified["reconciliation"].get("position_mismatches") or 0)
         if errors or unresolved or mismatches:
-            self._event(
+            if mismatches:
+                return self._safe_pause_for_external_position_change(state, run, verified["reconciliation"], reason="resume_verification", previous_status=GridStatus.RESUMING.value)
+            return self._resume_blocked(
                 state,
-                run["run_id"],
-                "GRID_RUN_RESUME_BLOCKED",
-                {"errors": errors, "unresolved_orders": unresolved, "position_mismatches": mismatches},
-            )
-            self._save(state)
-            raise RuntimeError(
-                "Resume placement could not be verified: "
-                f"errors={errors}, unresolved_orders={unresolved}, position_mismatches={mismatches}"
+                run,
+                "verification_failed",
+                {"errors": errors, "unresolved_orders": unresolved, "position_mismatches": mismatches, "reconciliation": verified["reconciliation"]},
             )
         now = utc_now()
         run["status"] = GridStatus.RUNNING.value
@@ -1969,7 +2077,10 @@ class DurableGridBotLifecycle:
         }
 
     def _editing_blocked(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
-        run["status"] = GridStatus.EDITING.value
+        now = utc_now()
+        run["status"] = GridStatus.PAUSED.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
         run["edit_diagnostics"] = {"reason": reason, "updated_at": utc_now(), **diagnostics}
         self._event(state, run["run_id"], "GRID_RUN_EDIT_BLOCKED", run["edit_diagnostics"])
         self._save(state)
@@ -2025,6 +2136,8 @@ class DurableGridBotLifecycle:
         if run.get("status") == GridStatus.STOPPING.value:
             return self.stop(run["run_id"], reason="stop_preempted_edit")
         reconciliation = reconciliation_result["reconciliation"]
+        if int(reconciliation.get("position_mismatches") or 0):
+            return self._safe_pause_for_external_position_change(state, run, reconciliation, reason="edit_preflight", previous_status=previous_status)
         if reconciliation.get("errors"):
             return self._editing_blocked(state, run, "exchange_truth_unavailable", {"errors": reconciliation.get("errors")})
         if int(reconciliation.get("unresolved_orders") or 0) or int(reconciliation.get("fill_ledger_mismatches") or 0):
@@ -2149,7 +2262,9 @@ class DurableGridBotLifecycle:
         verified = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)
         state = self._load()
         run = state["runs"][run["run_id"]]
-        if verified["reconciliation"].get("errors"):
+        if int(verified["reconciliation"].get("position_mismatches") or 0):
+            return self._safe_pause_for_external_position_change(state, run, verified["reconciliation"], reason="edit_verification", previous_status=previous_status)
+        if verified["reconciliation"].get("errors") or int(verified["reconciliation"].get("unresolved_orders") or 0) or int(verified["reconciliation"].get("fill_ledger_mismatches") or 0):
             return self._editing_blocked(state, run, "verification_failed", {"reconciliation": verified["reconciliation"]})
         now = utc_now()
         run["status"] = GridStatus.RUNNING.value if previous_status == GridStatus.RUNNING.value else GridStatus.PAUSED.value
@@ -2362,6 +2477,57 @@ class DurableGridBotLifecycle:
                     return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": reconciliation.get("errors")})
                 continue
             if gridbot_inventory != delta_position:
+                external_adjustment = run.get("external_position_adjustment") or run.get("external_position_resolution") or {}
+                if external_adjustment:
+                    if delta_position != 0:
+                        try:
+                            self._recover_or_place_flatten_order(run, product_id, delta_position)
+                            self._event(
+                                state,
+                                run["run_id"],
+                                "GRID_RUN_STOP_EXTERNAL_POSITION_FLATTEN_SUBMITTED",
+                                {
+                                    "operational_delta_position": str(delta_position),
+                                    "ledger_gridbot_inventory": str(gridbot_inventory),
+                                    "side": (Side.SELL if delta_position > 0 else Side.BUY).value,
+                                },
+                            )
+                            self._save(state)
+                        except Exception as exc:
+                            return self._stop_attention(
+                                state,
+                                run,
+                                reason,
+                                {"reason": "external_delta_flatten_submission_failed", "error": str(exc)[:500], "delta_position": str(delta_position)},
+                            )
+                        reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
+                        state = self._load()
+                        run = state["runs"][run["run_id"]]
+                        reconciliation = reconciled["reconciliation"]
+                        if reconciliation.get("errors"):
+                            return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_external_delta_flatten", "errors": reconciliation.get("errors")})
+                        continue
+                    if open_gridbot_orders == 0:
+                        now = utc_now()
+                        run["external_position_resolution"] = {
+                            "status": "EXTERNALLY_RESOLVED",
+                            "reason": "external_position_change_delta_flat",
+                            "classification": external_adjustment.get("classification"),
+                            "gridbot_inventory_before_resolution": str(gridbot_inventory),
+                            "delta_position": str(delta_position),
+                            "external_adjustment_lots": external_adjustment.get("external_adjustment_lots"),
+                            "resolved_at": now,
+                            "accounting_status": "PARTIAL",
+                            "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
+                        }
+                        run["stop_diagnostics"] = {
+                            **(run.get("stop_diagnostics") or {}),
+                            "external_position_resolution": deepcopy(run["external_position_resolution"]),
+                            "updated_at": now,
+                        }
+                        self._event(state, run["run_id"], "GRID_RUN_STOP_EXTERNAL_POSITION_RESOLVED", run["external_position_resolution"])
+                        self._save(state, include_children=False)
+                        break
                 if gridbot_inventory != 0:
                     try:
                         recovered = self._recover_flatten_order(run, product_id, gridbot_inventory)
