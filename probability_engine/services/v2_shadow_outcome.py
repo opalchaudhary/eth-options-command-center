@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import time
 
 import pandas as pd
 import requests
@@ -132,11 +133,46 @@ class V2ShadowPredictionEvaluationRepository(SupabaseRepository):
                 "prediction_timestamp": f"lte.{before_iso}",
                 "record_type": "eq.LIVE",
                 "abstained": "eq.false",
-                "order": "prediction_timestamp.asc,target.asc,horizon.asc",
+                "order": "prediction_timestamp.asc,horizon.asc,target.asc,id.asc",
                 "limit": str(limit),
                 "offset": str(offset),
             }
         )
+
+    def mature_candidates_after(self, before_iso, after_timestamp_iso=None, limit=100):
+        params = {
+            "select": PREDICTION_SELECT,
+            "prediction_timestamp": f"lte.{before_iso}",
+            "record_type": "eq.LIVE",
+            "abstained": "eq.false",
+            "order": "prediction_timestamp.asc,horizon.asc,target.asc,id.asc",
+            "limit": str(limit),
+        }
+        if after_timestamp_iso:
+            params["prediction_timestamp"] = f"gt.{after_timestamp_iso}"
+            params["and"] = f"(prediction_timestamp.lte.{before_iso})"
+        return self.read(params=params)
+
+    def pending_mature_candidates(self, before_iso, limit=100, label_version="label_v2"):
+        rows = self.read(
+            params={
+                "select": (
+                    f"{PREDICTION_SELECT},"
+                    "probability_v2_shadow_outcomes!left(prediction_id,label_version,target)"
+                ),
+                "prediction_timestamp": f"lte.{before_iso}",
+                "record_type": "eq.LIVE",
+                "abstained": "eq.false",
+                "probability_v2_shadow_outcomes": "is.null",
+                "order": "prediction_timestamp.asc,horizon.asc,target.asc,id.asc",
+                "limit": str(limit),
+            }
+        )
+        clean_rows = []
+        for row in _records(rows):
+            row.pop("probability_v2_shadow_outcomes", None)
+            clean_rows.append(row)
+        return clean_rows
 
 
 class V2FeatureSnapshotEvaluationRepository(SupabaseRepository):
@@ -341,28 +377,112 @@ class V2ShadowOutcomeEvaluator:
         self.feature_snapshot_repository = feature_snapshot_repository or V2FeatureSnapshotEvaluationRepository()
         self.candle_fetcher = candle_fetcher or load_future_ohlcv
         self.batch_limit = batch_limit if batch_limit is not None else get_probability_config().v2_outcome_batch_limit
+        self.max_candidate_pages = get_probability_config().v2_outcome_candidate_max_pages
 
-    def run(self, now: datetime | None = None) -> dict[str, Any]:
-        now = now or datetime.now(timezone.utc)
-        batch_limit = max(1, int(self.batch_limit or 25))
+    def select_pending(self, now: datetime, batch_limit: int) -> dict[str, Any]:
         candidate_limit = batch_limit * 4
+        max_candidate_pages = max(1, int(self.max_candidate_pages or 800))
         before_iso = (now - timedelta(minutes=min(HORIZON_MINUTES.values()))).isoformat()
+        started = time.perf_counter()
         candidates = []
         mature = []
         pending = []
         existing_ids = set()
+        outcome_lookup_count = 0
+        prediction_query_count = 0
+        cursor_timestamp = None
+        exhausted = False
 
-        for page in range(20):
-            rows = _records(self.prediction_repository.mature_candidates(before_iso, limit=candidate_limit, offset=page * candidate_limit))
+        if hasattr(self.prediction_repository, "pending_mature_candidates"):
+            rows = _records(
+                self.prediction_repository.pending_mature_candidates(
+                    before_iso,
+                    limit=batch_limit,
+                    label_version="label_v2",
+                )
+            )
+            prediction_query_count = 1
+            candidates.extend(rows)
+            mature.extend(row for row in rows if is_mature(row, now=now))
+            existing_ids = self.outcome_repository.existing_prediction_ids([row.get("id") for row in mature])
+            outcome_lookup_count = 1
+            pending = [row for row in mature if row.get("id") not in existing_ids][:batch_limit]
+            exhausted = len(rows) < batch_limit
+            selected_timestamps = [pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") for row in pending]
+            return {
+                "pending": pending,
+                "candidates": candidates,
+                "mature": mature,
+                "existing_ids": existing_ids,
+                "candidate_pages_scanned": 1,
+                "prediction_query_count": prediction_query_count,
+                "outcome_lookup_count": outcome_lookup_count,
+                "selector_runtime_seconds": time.perf_counter() - started,
+                "selector_exhausted": exhausted,
+                "oldest_selected_timestamp": min(selected_timestamps).isoformat() if selected_timestamps else None,
+                "newest_selected_timestamp": max(selected_timestamps).isoformat() if selected_timestamps else None,
+            }
+
+        for page in range(max_candidate_pages):
+            if hasattr(self.prediction_repository, "mature_candidates_after"):
+                rows = _records(
+                    self.prediction_repository.mature_candidates_after(
+                        before_iso,
+                        after_timestamp_iso=cursor_timestamp,
+                        limit=candidate_limit,
+                    )
+                )
+            else:
+                rows = _records(
+                    self.prediction_repository.mature_candidates(
+                        before_iso,
+                        limit=candidate_limit,
+                        offset=page * candidate_limit,
+                    )
+                )
+            prediction_query_count += 1
+            if not rows:
+                exhausted = True
+                break
+
             candidates.extend(rows)
             page_mature = [row for row in rows if is_mature(row, now=now)]
             mature.extend(page_mature)
             page_existing = self.outcome_repository.existing_prediction_ids([row.get("id") for row in page_mature])
+            outcome_lookup_count += 1
             existing_ids.update(page_existing)
             pending.extend(row for row in page_mature if row.get("id") not in page_existing)
             pending = pending[:batch_limit]
-            if len(pending) >= batch_limit or len(rows) < candidate_limit:
+            cursor_timestamp = pd.Timestamp(rows[-1].get("prediction_timestamp")).tz_convert("UTC").isoformat()
+            if len(pending) >= batch_limit:
                 break
+            if len(rows) < candidate_limit:
+                exhausted = True
+                break
+
+        selected_timestamps = [pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") for row in pending]
+        return {
+            "pending": pending,
+            "candidates": candidates,
+            "mature": mature,
+            "existing_ids": existing_ids,
+            "candidate_pages_scanned": page + 1 if "page" in locals() else 0,
+            "prediction_query_count": prediction_query_count,
+            "outcome_lookup_count": outcome_lookup_count,
+            "selector_runtime_seconds": time.perf_counter() - started,
+            "selector_exhausted": exhausted,
+            "oldest_selected_timestamp": min(selected_timestamps).isoformat() if selected_timestamps else None,
+            "newest_selected_timestamp": max(selected_timestamps).isoformat() if selected_timestamps else None,
+        }
+
+    def run(self, now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(timezone.utc)
+        batch_limit = max(1, int(self.batch_limit or 25))
+        selection = self.select_pending(now=now, batch_limit=batch_limit)
+        candidates = selection["candidates"]
+        mature = selection["mature"]
+        pending = selection["pending"]
+        existing_ids = selection["existing_ids"]
 
         if not pending:
             return {
@@ -376,7 +496,13 @@ class V2ShadowOutcomeEvaluator:
                 "skipped_incomplete_count": 0,
                 "failed_count": 0,
                 "batch_limit": batch_limit,
-                "candidate_pages_scanned": page + 1 if "page" in locals() else 0,
+                "candidate_pages_scanned": selection["candidate_pages_scanned"],
+                "prediction_query_count": selection["prediction_query_count"],
+                "outcome_lookup_count": selection["outcome_lookup_count"],
+                "selector_runtime_seconds": round(selection["selector_runtime_seconds"], 3),
+                "selector_exhausted": selection["selector_exhausted"],
+                "oldest_selected_timestamp": selection["oldest_selected_timestamp"],
+                "newest_selected_timestamp": selection["newest_selected_timestamp"],
             }
 
         snapshots = self.feature_snapshot_repository.by_ids([row.get("feature_snapshot_id") for row in pending])
@@ -432,7 +558,13 @@ class V2ShadowOutcomeEvaluator:
             "skipped_incomplete_count": incomplete,
             "failed_count": failed,
             "batch_limit": batch_limit,
-            "candidate_pages_scanned": page + 1 if "page" in locals() else 0,
+            "candidate_pages_scanned": selection["candidate_pages_scanned"],
+            "prediction_query_count": selection["prediction_query_count"],
+            "outcome_lookup_count": selection["outcome_lookup_count"],
+            "selector_runtime_seconds": round(selection["selector_runtime_seconds"], 3),
+            "selector_exhausted": selection["selector_exhausted"],
+            "oldest_selected_timestamp": selection["oldest_selected_timestamp"],
+            "newest_selected_timestamp": selection["newest_selected_timestamp"],
             "ohlcv_fetch_count": ohlcv_fetch_count,
             "outcome_group_count": len(groups),
             "bulk_persistence": hasattr(self.outcome_repository, "safe_insert_outcomes"),

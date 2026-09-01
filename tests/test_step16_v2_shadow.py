@@ -161,12 +161,22 @@ def _v2_candles(start, count=12, high=104, low=96, close=101):
 
 class FakeV2PredictionRepository:
     def __init__(self, rows):
-        self.rows = rows
+        self.rows = sorted(rows, key=lambda row: (row["prediction_timestamp"], row["horizon"], row["target"], row["id"]))
+        self.keyset_calls = 0
 
     def mature_candidates(self, before_iso, limit=100, offset=0):
         before = pd.Timestamp(before_iso)
         pending = [row for row in self.rows if pd.Timestamp(row["prediction_timestamp"]) <= before]
         return pending[offset : offset + limit]
+
+    def mature_candidates_after(self, before_iso, after_timestamp_iso=None, limit=100):
+        self.keyset_calls += 1
+        before = pd.Timestamp(before_iso)
+        after = pd.Timestamp(after_timestamp_iso) if after_timestamp_iso else None
+        pending = [row for row in self.rows if pd.Timestamp(row["prediction_timestamp"]) <= before]
+        if after is not None:
+            pending = [row for row in pending if pd.Timestamp(row["prediction_timestamp"]) > after]
+        return pending[:limit]
 
 
 class FakeV2OutcomeRepository:
@@ -345,6 +355,74 @@ def test_v2_shadow_outcome_evaluator_skips_immature_and_existing_rows():
     assert result["created_count"] == 0
     assert result["skipped_existing_count"] == 1
     assert outcomes.inserted == []
+
+
+def test_v2_shadow_outcome_selector_reaches_beyond_completed_prefix(monkeypatch):
+    from probability_engine.services import v2_shadow_outcome
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    monkeypatch.setattr(v2_shadow_outcome, "get_probability_config", lambda: type("Config", (), {"v2_outcome_candidate_max_pages": 80})())
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    completed = [
+        _v2_prediction(f"done-{index}", prediction_timestamp=start + timedelta(minutes=5 * index))
+        for index in range(2000)
+    ]
+    pending = [
+        _v2_prediction(f"pending-{index}", prediction_timestamp=start + timedelta(minutes=5 * (2000 + index)))
+        for index in range(30)
+    ]
+    immature = [
+        _v2_prediction("immature", prediction_timestamp=start + timedelta(days=20))
+    ]
+    repo = FakeV2PredictionRepository(completed + pending + immature)
+    outcomes = FakeV2OutcomeRepository(existing={row["id"] for row in completed})
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=repo,
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at),
+        batch_limit=25,
+    )
+
+    result = evaluator.run(now=start + timedelta(days=15))
+
+    assert result["attempted_count"] == 25
+    assert result["created_count"] == 25
+    assert result["candidate_pages_scanned"] > 20
+    assert result["prediction_query_count"] == result["candidate_pages_scanned"]
+    assert result["outcome_lookup_count"] == result["candidate_pages_scanned"]
+    assert result["oldest_selected_timestamp"] == pd.Timestamp(pending[0]["prediction_timestamp"]).tz_convert("UTC").isoformat()
+    assert {row["prediction_id"] for row in outcomes.inserted} == {row["id"] for row in pending[:25]}
+
+
+def test_v2_shadow_outcome_selector_rerun_advances_without_duplicates(monkeypatch):
+    from probability_engine.services import v2_shadow_outcome
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    monkeypatch.setattr(v2_shadow_outcome, "get_probability_config", lambda: type("Config", (), {"v2_outcome_candidate_max_pages": 20})())
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction(f"pending-{index}", prediction_timestamp=start + timedelta(minutes=5 * index))
+        for index in range(12)
+    ]
+    prediction_repo = FakeV2PredictionRepository(rows)
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=prediction_repo,
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at),
+        batch_limit=5,
+    )
+
+    first = evaluator.run(now=start + timedelta(days=1))
+    second = evaluator.run(now=start + timedelta(days=1))
+
+    assert first["created_count"] == 5
+    assert second["created_count"] == 5
+    assert {row["prediction_id"] for row in outcomes.inserted[:5]} == {row["id"] for row in rows[:5]}
+    assert {row["prediction_id"] for row in outcomes.inserted[5:]} == {row["id"] for row in rows[5:10]}
+    assert len({row["prediction_id"] for row in outcomes.inserted}) == 10
 
 
 def test_v2_shadow_outcome_evaluator_reuses_future_path_by_timestamp_horizon():
