@@ -237,11 +237,12 @@ def pnl_values(live: dict | None) -> dict:
     if net in [None, "", "N/A"]:
         net = accounting.get("net_realized_pnl")
     net_value = None if net in [None, "", "N/A"] else net
+    unavailable = status == "UNAVAILABLE"
     return {
         "net": None if incomplete else net_value,
-        "realized": accounting.get("net_realized_pnl"),
-        "unrealized": accounting.get("unrealized_pnl"),
-        "fees": accounting.get("trading_fees"),
+        "realized": None if unavailable else accounting.get("net_realized_pnl"),
+        "unrealized": None if unavailable else accounting.get("unrealized_pnl"),
+        "fees": None if unavailable else accounting.get("trading_fees"),
         "cycles": accounting.get("cycles_completed") or 0,
         "incomplete": incomplete,
     }

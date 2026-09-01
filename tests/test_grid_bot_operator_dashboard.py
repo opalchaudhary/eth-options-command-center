@@ -130,6 +130,8 @@ def test_pnl_values_distinguish_zero_unavailable_and_partial() -> None:
     assert unavailable["realized"] is None
     assert unavailable["unrealized"] is None
     assert explicit_unavailable["net"] is None
+    assert explicit_unavailable["realized"] is None
+    assert explicit_unavailable["fees"] is None
     assert partial["net"] is None
     assert partial["realized"] == "10"
     assert partial["fees"] == "1"
