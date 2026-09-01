@@ -15,13 +15,13 @@ TERMINAL_STATES = {
     "MANUAL_CANCELLED",
     "REJECTED",
     "UNKNOWN",
-    "UNRESOLVED",
     "DEFERRED",
     "BLOCKED",
     "ABANDONED_BY_STOP",
     "CANCELLED_BEFORE_SUBMISSION",
     "SUPERSEDED",
     "NOT_SUBMITTED",
+    "NEVER_SUBMITTED",
 }
 
 
@@ -156,8 +156,12 @@ def normalize_order_state(row: dict | None, executed: Decimal, requested: Decima
         return "FILLED"
     if raw in {"open", "pending", "live"}:
         return "PARTIALLY_FILLED" if executed > 0 else "OPEN"
-    if raw in {"filled", "closed"}:
+    if raw in {"filled"}:
         return "FILLED"
+    if raw == "closed":
+        if remaining == 0:
+            return "FILLED"
+        return "PARTIALLY_FILLED" if executed > 0 else "CANCELLED"
     if raw in {"cancelled", "canceled", "user_cancelled"}:
         return "MANUAL_CANCELLED" if executed == 0 else "CANCELLED"
     if raw in {"rejected", "failed"}:
@@ -232,6 +236,7 @@ def reconcile_exchange_truth(
     open_by_client = {client_order_id(row): row for row in open_rows if client_order_id(row)}
     history_by_client = {client_order_id(row): row for row in order_history if client_order_id(row)}
     history_by_exchange = {exchange_order_id(row): row for row in order_history if exchange_order_id(row)}
+    direct_by_exchange: dict[str, dict] = {}
 
     orders = run.setdefault("orders", {})
     persisted_fills = run.setdefault("fills", {})
@@ -267,17 +272,40 @@ def reconcile_exchange_truth(
         if local_status in TERMINAL_STATES and local_status not in {"UNRESOLVED", "ABANDONED_BY_STOP"} and order.get("status") != "open":
             continue
         exchange = open_by_client.get(cid)
-        history = history_by_client.get(cid) or history_by_exchange.get(str(order.get("exchange_order_id") or ""))
+        local_exchange_id = str(order.get("exchange_order_id") or "")
+        history = history_by_client.get(cid) or history_by_exchange.get(local_exchange_id)
+        direct_lookup_used = False
+        if not exchange and not history and local_exchange_id and hasattr(client, "get_order"):
+            try:
+                direct_order = direct_by_exchange.get(local_exchange_id)
+                if direct_order is None:
+                    direct_rows = result_rows(client.get_order(local_exchange_id))
+                    result.request_count += 1
+                    direct_order = direct_rows[0] if direct_rows else {}
+                    direct_by_exchange[local_exchange_id] = direct_order
+                if direct_order:
+                    history = direct_order
+                    direct_lookup_used = True
+            except Exception as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code != 404:
+                    result.errors.append(str(exc))
+                    return result.as_dict()
         order_fills = [fill.get("raw") or fill for fill in all_fills if fill_matches_order(fill.get("raw") or fill, order)]
         executed = sum((fill_quantity(fill) for fill in order_fills), Decimal("0"))
         requested = order_quantity(order)
-        remaining = exchange_remaining(exchange, max(Decimal("0"), requested - executed)) if exchange else max(Decimal("0"), requested - executed)
-
         evidence = exchange or history
+        remaining = exchange_remaining(evidence, max(Decimal("0"), requested - executed)) if evidence else max(Decimal("0"), requested - executed)
+
         state = normalize_order_state(evidence, executed, requested, remaining)
         if not exchange and not history and executed == 0:
-            state = "UNRESOLVED"
-            _event(result, "ORDER_UNRESOLVED", {"client_order_id": cid, "exchange_order_id": order.get("exchange_order_id")})
+            if not order.get("exchange_order_id"):
+                state = "AMBIGUOUS_SUBMISSION" if local_status in {"SUBMITTED", "PENDING", "PROPOSED", "OPEN", "AMBIGUOUS_SUBMISSION"} else "NEVER_SUBMITTED"
+                if state == "AMBIGUOUS_SUBMISSION":
+                    _event(result, "ORDER_UNRESOLVED", {"client_order_id": cid, "exchange_order_id": order.get("exchange_order_id"), "reason": "ambiguous_submission"})
+            else:
+                state = "UNRESOLVED"
+                _event(result, "ORDER_UNRESOLVED", {"client_order_id": cid, "exchange_order_id": order.get("exchange_order_id")})
         elif state in {"FILLED", "REJECTED"} or (state in {"CANCELLED", "MANUAL_CANCELLED"} and executed == 0):
             remaining = Decimal("0")
 
@@ -295,6 +323,9 @@ def reconcile_exchange_truth(
         order["last_reconciled_at"] = utc_now()
         if evidence:
             order["raw"] = evidence
+            adopted_exchange_id = exchange_order_id(evidence)
+            if adopted_exchange_id:
+                order["exchange_order_id"] = adopted_exchange_id
         changed = (
             previous_status != order["status"]
             or previous_filled != order["filled_quantity"]
@@ -314,6 +345,10 @@ def reconcile_exchange_truth(
             result.manual_cancelled_orders += 1
         elif state == "UNRESOLVED":
             result.unresolved_orders += 1
+        elif state == "AMBIGUOUS_SUBMISSION":
+            result.unresolved_orders += 1
+        if direct_lookup_used and state in {"OPEN", "PARTIALLY_FILLED"}:
+            result.exchange_open_orders += 1
 
     if result.gridbot_inventory != result.delta_position:
         result.position_mismatches += 1

@@ -844,6 +844,19 @@ class SupabaseGridRepository:
             resolved += 1
         return resolved
 
+    def resolve_terminal_health_issues(self, run_id: str, *, keep_codes: set[str] | None = None) -> int:
+        terminal_cleanup_codes = {
+            "GRID_ORDER_UNRESOLVED",
+            "GRID_ORDER_MISSING_UNEXPECTEDLY",
+            "LIFECYCLE_STUCK",
+            "POSITION_MISMATCH",
+            "POSITION_ATTRIBUTION_UNSAFE",
+            "STOPPED_WITH_EXPOSURE",
+            "WORKER_DEAD_RUNNING",
+            "RECONCILIATION_STALE",
+        }
+        return self.resolve_health_issue_codes(run_id, terminal_cleanup_codes - (keep_codes or set()))
+
     def persist_summary(self, run: dict, summary: dict) -> None:
         self.insert_once(
             "grid_run_summaries",
@@ -909,6 +922,22 @@ class SupabaseGridRepository:
             ),
             None,
         )
+        latest_stage_at = next(
+            (
+                row.get("created_at")
+                for row in event_rows
+                if row.get("event_type") == "GRID_RUN_START_STAGE" and (row.get("payload") or {}).get("start_stage")
+            ),
+            None,
+        )
+        latest_truth_at = next(
+            (
+                (row.get("payload") or {}).get("last_successful_reconcile") or row.get("created_at")
+                for row in event_rows
+                if row.get("event_type") == "REST_RECONCILED"
+            ),
+            None,
+        )
         product_id = bot.get("product_id") or 1699
         startup_stage = latest_stage or ("RUNNING" if run_row.get("status") == "RUNNING" else run_row.get("status"))
         startup = {
@@ -917,6 +946,8 @@ class SupabaseGridRepository:
             "orders_submitted": len(orders),
             "orders_verified": len([row for row in orders if row.get("exchange_order_id")]),
             "last_error": latest_failure,
+            "last_startup_progress_at": latest_stage_at,
+            "last_successful_delta_truth_check": latest_truth_at,
         }
         return {
             "run_id": run_id,

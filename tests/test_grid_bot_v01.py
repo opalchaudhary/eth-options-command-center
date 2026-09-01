@@ -1600,6 +1600,136 @@ def test_operator_background_start_returns_starting_then_reaches_running(tmp_pat
     assert status["startup"]["orders_submitted"] == 4
 
 
+def test_starting_restart_recovery_promotes_existing_exchange_exposure(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    run_id = begun["run"]["run_id"]
+    run = lifecycle._load()["runs"][run_id]
+    proposal = lifecycle._proposal_for_level(run_id, run["levels"][2], 1)
+    created = lifecycle._place_proposal(run, 1699, proposal, "initial_grid")
+    client.fill_rows.append(
+        {
+            "id": "fill-existing",
+            "order_id": created["exchange_order_id"],
+            "side": created["side"],
+            "price": created["price"],
+            "size": created["requested_quantity"],
+            "commission": "0.01",
+        }
+    )
+    client.orders[0]["state"] = "filled"
+    client.orders[0]["unfilled_size"] = "0"
+    client.position_size = "-1"
+    state = lifecycle._load()
+    state["runs"][run_id] = run
+    lifecycle._save(state)
+
+    recovered = DurableGridBotLifecycle(client, path, use_supabase=False).complete_operator_grid_start(run_id)
+
+    assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert recovered["run"]["fills"]
+    assert recovered["run"]["orders"][proposal.client_order_id]["status"] == "filled"
+    assert len(client.orders) == 1
+
+
+def test_starting_delta_auth_failure_retains_active_run_and_lock(tmp_path):
+    class AuthFailClient(_FakeLifecycleClient):
+        fail_open_orders = False
+
+        def open_orders(self, product_id=None):
+            if not self.fail_open_orders:
+                return super().open_orders(product_id)
+            raise RuntimeError("401 unauthorized")
+
+    client = AuthFailClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    client.fail_open_orders = True
+
+    recovered = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+    status = lifecycle.status()
+
+    assert recovered["ok"] is False
+    assert recovered["run"]["status"] == GridStatus.STARTING.value
+    assert recovered["start_stage"] == "TRUTH_UNAVAILABLE"
+    assert status["active_run_id"] == begun["run"]["run_id"]
+
+
+def test_ambiguous_submission_is_adopted_without_duplicate_order(tmp_path):
+    class AmbiguousOnceClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def place_order(self, payload):
+            if not self.failed:
+                self.failed = True
+                row = {
+                    "id": str(self.next_order_id),
+                    "client_order_id": payload["client_order_id"],
+                    "side": payload["side"],
+                    "size": payload["size"],
+                    "unfilled_size": payload["size"],
+                    "limit_price": payload["limit_price"],
+                    "state": "open",
+                }
+                self.next_order_id += 1
+                self.orders.append(row)
+                raise RuntimeError("timeout after submit")
+            return super().place_order(payload)
+
+    client = AmbiguousOnceClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    blocked = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+    assert blocked["run"]["status"] == GridStatus.STARTING.value
+
+    recovered = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+
+    assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert len({order["client_order_id"] for order in client.orders}) == len(client.orders)
+    assert len(client.orders) == 1
+
+
 def test_operator_grid_start_does_not_resurrect_run_when_stop_races_placement(tmp_path):
     class StopDuringPlacementClient(_FakeLifecycleClient):
         def __init__(self):
@@ -1686,13 +1816,13 @@ def test_background_start_failure_persists_start_failed(tmp_path):
             "max_inventory_lots": "2",
         }
     )
-    with pytest.raises(RuntimeError):
-        lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+    result = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
     status = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()
     failed = status["runs"][0]
-    assert failed["status"] == "START_FAILED"
-    assert status["active_run_id"] is None
-    assert failed["startup"]["start_stage"] == "START_FAILED"
+    assert result["ok"] is False
+    assert failed["status"] == "STARTING"
+    assert status["active_run_id"] == begun["run"]["run_id"]
+    assert failed["startup"]["start_stage"] == "TRUTH_UNAVAILABLE"
 
 
 def test_manual_exchange_cancellation_reconciliation_marks_orders_terminal(tmp_path):
@@ -1745,14 +1875,23 @@ def _truth_run(grid_type="neutral", quantity="5", status="open"):
 
 
 class _TruthClient:
-    def __init__(self, open_orders=None, order_pages=None, fill_pages=None, position="0"):
+    def __init__(self, open_orders=None, order_pages=None, fill_pages=None, position="0", direct_orders=None):
         self._open_orders = open_orders or []
         self._order_pages = order_pages if order_pages is not None else [[]]
         self._fill_pages = fill_pages if fill_pages is not None else [[]]
         self._position = position
+        self._direct_orders = direct_orders or {}
 
     def open_orders(self, product_id=None):
         return {"success": True, "result": self._open_orders}
+
+    def get_order(self, order_id):
+        order = self._direct_orders.get(str(order_id))
+        if order is None:
+            exc = RuntimeError("404 not found")
+            exc.response = type("Response", (), {"status_code": 404})()
+            raise exc
+        return {"success": True, "result": order}
 
     def order_history(self, product_id=None, start_time=None, end_time=None, after=None, page_size=50):
         index = int(after or 0)
@@ -1798,17 +1937,76 @@ def _open_exchange_order(unfilled="5", state="open"):
     }
 
 
-def _fill(fill_id="fill-1", size="5", side="buy", price="2400", order_id="ex-1"):
-    return {
+def _fill(fill_id="fill-1", size="5", side="buy", price="2400", order_id="ex-1", client_order_id="DGB01-truth-L001-B-1"):
+    payload = {
         "id": fill_id,
         "order_id": order_id,
-        "client_order_id": "DGB01-truth-L001-B-1",
         "side": side,
         "price": price,
         "size": size,
         "created_at": "1800000000000000",
         "commission": "0",
     }
+    if client_order_id is not None:
+        payload["client_order_id"] = client_order_id
+    return payload
+
+
+def test_unresolved_order_recovers_to_filled_from_history_and_fill():
+    run = _truth_run(status="unresolved")
+    history = [{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "closed", "size": "5", "unfilled_size": "0"}]
+    result = reconcile_exchange_truth(run, _TruthClient(order_pages=[history], fill_pages=[[_fill(client_order_id=None)]], position="5"))
+
+    assert result["unresolved_orders"] == 0
+    assert result["filled_orders"] == 1
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "filled"
+    assert run["orders"]["DGB01-truth-L001-B-1"]["filled_quantity"] == "5"
+
+
+def test_unresolved_order_recovers_to_rejected_from_history():
+    run = _truth_run(status="unresolved")
+    history = [{"id": "ex-1", "client_order_id": "DGB01-truth-L001-B-1", "state": "rejected", "size": "5", "unfilled_size": "0"}]
+    result = reconcile_exchange_truth(run, _TruthClient(order_pages=[history], position="0"))
+
+    assert result["unresolved_orders"] == 0
+    assert run["orders"]["DGB01-truth-L001-B-1"]["status"] == "rejected"
+
+
+def test_order_missing_from_lists_recovers_from_direct_exchange_lookup():
+    run = _truth_run(status="open")
+    direct_order = {
+        **_open_exchange_order(unfilled="5", state="open"),
+        "id": "ex-1",
+        "client_order_id": "DGB01-truth-L001-B-1",
+    }
+    result = reconcile_exchange_truth(run, _TruthClient(direct_orders={"ex-1": direct_order}, position="0"))
+
+    order = run["orders"]["DGB01-truth-L001-B-1"]
+    assert result["unresolved_orders"] == 0
+    assert result["exchange_open_orders"] == 1
+    assert result["orders_resolved"] == 1
+    assert order["status"] == "open"
+    assert order["exchange_order_id"] == "ex-1"
+
+
+def test_no_exchange_id_without_delta_evidence_is_never_submitted():
+    run = _truth_run(status="created")
+    order = run["orders"]["DGB01-truth-L001-B-1"]
+    order["exchange_order_id"] = ""
+    result = reconcile_exchange_truth(run, _TruthClient(position="0"))
+
+    assert result["unresolved_orders"] == 0
+    assert order["status"] == "never_submitted"
+
+
+def test_ambiguous_submission_without_delta_evidence_remains_unresolved():
+    run = _truth_run(status="ambiguous_submission")
+    order = run["orders"]["DGB01-truth-L001-B-1"]
+    order["exchange_order_id"] = ""
+    result = reconcile_exchange_truth(run, _TruthClient(position="0"))
+
+    assert result["unresolved_orders"] == 1
+    assert order["status"] == "ambiguous_submission"
 
 
 def _replacement_run(grid_type="neutral", source_level="L002", source_side="buy", fill_id="fill-1", fill_size="1"):

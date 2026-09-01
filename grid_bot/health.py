@@ -60,6 +60,7 @@ ACTIVE_STATES = {
     GridStatus.STOP_REQUIRES_ATTENTION.value,
 }
 STUCK_STATES = {
+    GridStatus.STARTING.value,
     GridStatus.PAUSING.value,
     GridStatus.RESUMING.value,
     GridStatus.EDITING.value,
@@ -274,8 +275,10 @@ def evaluate_gridbot_health(
     if status == GridStatus.STOP_REQUIRES_ATTENTION.value:
         issues.append(_issue("STOP_REQUIRES_ATTENTION", HealthSeverity.CRITICAL, "Stop and close requires operator attention.", run_for_issue, diagnostics=run.get("stop_diagnostics")))
     if status in STUCK_STATES:
-        status_age = _age_seconds(run.get("status_updated_at") or run.get("updated_at"), now)
-        if status_age is not None and status_age > 120:
+        progress_timestamp = (run.get("startup") or {}).get("last_startup_progress_at") if status == GridStatus.STARTING.value else None
+        status_age = _age_seconds(progress_timestamp or run.get("status_updated_at") or run.get("updated_at"), now)
+        threshold = 600 if status == GridStatus.STARTING.value else 120
+        if status_age is not None and status_age > threshold:
             issues.append(_issue("LIFECYCLE_STUCK", HealthSeverity.CRITICAL, f"{status} lifecycle state appears stuck.", run_for_issue, lifecycle_state=status, age_seconds=status_age))
 
     missing_replacements = _replacement_missing(run)

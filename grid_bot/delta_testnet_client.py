@@ -171,6 +171,9 @@ class DeltaTestnetClient:
         params = {"product_id": product_id} if product_id else None
         return self.private_get("/orders", params=params)
 
+    def get_order(self, order_id: str | int) -> dict:
+        return self.private_get(f"/orders/{order_id}")
+
     def order_history(
         self,
         product_id: int | None = None,
