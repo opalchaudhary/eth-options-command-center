@@ -229,15 +229,16 @@ def human_order_status(status: str) -> str:
 
 def pnl_values(live: dict | None) -> dict:
     accounting = (live or {}).get("accounting") or {}
-    status = str(accounting.get("accounting_status") or "COMPLETE")
+    status = str(accounting.get("accounting_status") or "UNAVAILABLE")
     incomplete = status != "COMPLETE"
     net = accounting.get("live_net_pnl")
     if net in [None, "", "N/A"]:
         net = accounting.get("net_run_pnl")
     if net in [None, "", "N/A"]:
         net = accounting.get("net_realized_pnl")
+    net_value = None if net in [None, "", "N/A"] else net
     return {
-        "net": None if incomplete else ("0" if net in [None, "", "N/A"] else net),
+        "net": None if incomplete else net_value,
         "realized": accounting.get("net_realized_pnl"),
         "unrealized": accounting.get("unrealized_pnl"),
         "fees": accounting.get("trading_fees"),

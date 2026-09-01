@@ -119,16 +119,20 @@ def test_gridbot_inventory_and_delta_position_are_not_substituted() -> None:
 def test_pnl_values_distinguish_zero_unavailable_and_partial() -> None:
     zero = pnl_values({"accounting": {"accounting_status": "COMPLETE", "live_net_pnl": "0", "net_realized_pnl": "0", "unrealized_pnl": "0", "trading_fees": "0"}})
     unavailable = pnl_values({"accounting": {"accounting_status": "COMPLETE"}})
+    explicit_unavailable = pnl_values({"accounting": {"accounting_status": "UNAVAILABLE", "net_realized_pnl": "0", "trading_fees": "0"}})
     partial = pnl_values({"accounting": {"accounting_status": "PARTIAL", "live_net_pnl": "12", "net_realized_pnl": "10", "trading_fees": "1"}})
 
     assert zero["net"] == "0"
     assert zero["realized"] == "0"
     assert zero["unrealized"] == "0"
     assert zero["fees"] == "0"
-    assert unavailable["net"] == "0"
+    assert unavailable["net"] is None
     assert unavailable["realized"] is None
     assert unavailable["unrealized"] is None
+    assert explicit_unavailable["net"] is None
     assert partial["net"] is None
+    assert partial["realized"] == "10"
+    assert partial["fees"] == "1"
     assert partial["incomplete"] is True
 
 

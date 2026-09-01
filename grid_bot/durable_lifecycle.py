@@ -996,6 +996,7 @@ class DurableGridBotLifecycle:
         external_resolution = run.get("external_position_resolution") or {}
         operational_gridbot_inventory = "0" if external_resolution.get("status") == "EXTERNALLY_RESOLVED" else str(reconciliation.get("gridbot_inventory") or "0")
         accounting_warnings = sorted(set(accounting.warnings + (["EXTERNAL_POSITION_CLOSE_UNATTRIBUTED"] if external_resolution else [])))
+        accounting_status = "PARTIAL" if external_resolution else accounting.accounting_status
         flatten_orders = self._flatten_orders(run)
         flatten_order_ids = {order.get("client_order_id") for order in flatten_orders}
         flatten_fills = []
@@ -1026,6 +1027,8 @@ class DurableGridBotLifecycle:
             "gross_grid_profit": str(accounting.gross_realized_pnl),
             "delta_fees": str(accounting.trading_fees),
             "trading_fees": str(accounting.trading_fees),
+            "realized_trading_fees": str(accounting.realized_trading_fees),
+            "open_inventory_trading_fees": str(accounting.open_inventory_trading_fees),
             "maker_fees": str(accounting.maker_fees),
             "taker_fees": str(accounting.taker_fees),
             "unknown_role_fees": str(accounting.unknown_role_fees),
@@ -1039,12 +1042,12 @@ class DurableGridBotLifecycle:
             "net_realized_pnl": str(accounting.net_realized_pnl),
             "unrealized_pnl": str(accounting.unrealized_pnl) if accounting.unrealized_pnl is not None else None,
             "live_net_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else None,
-            "net_run_pnl": str(accounting.live_net_pnl) if accounting.live_net_pnl is not None else str(accounting.net_realized_pnl),
+            "net_run_pnl": str(accounting.live_net_pnl) if accounting_status == "COMPLETE" and accounting.live_net_pnl is not None else None,
             "fee_to_gross_profit_ratio": str(accounting.fee_to_gross_ratio) if accounting.fee_to_gross_ratio is not None else None,
-            "accounting_status": "PARTIAL" if external_resolution else accounting.accounting_status,
+            "accounting_status": accounting_status,
             "accounting_warnings": accounting_warnings,
             "funding_attribution_status": accounting.funding_attribution_status,
-            "accounting_completeness": "PARTIAL" if external_resolution else accounting.accounting_status,
+            "accounting_completeness": accounting_status,
             "NET_TRADING_PNL_BEFORE_INCOME_TAX": str(accounting.net_realized_pnl),
             "final_gridbot_inventory": operational_gridbot_inventory,
             "ledger_gridbot_inventory": str(reconciliation.get("gridbot_inventory") or "0"),

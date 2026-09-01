@@ -120,6 +120,8 @@ class RunAccounting:
     cycles_completed: int
     gross_realized_pnl: Decimal
     trading_fees: Decimal
+    realized_trading_fees: Decimal
+    open_inventory_trading_fees: Decimal
     funding_paid: Decimal
     funding_received: Decimal
     funding_net: Decimal
@@ -146,6 +148,8 @@ class RunAccounting:
             "cycles_completed": self.cycles_completed,
             "gross_realized_pnl": str(self.gross_realized_pnl),
             "trading_fees": str(self.trading_fees),
+            "realized_trading_fees": str(self.realized_trading_fees),
+            "open_inventory_trading_fees": str(self.open_inventory_trading_fees),
             "funding_paid": str(self.funding_paid),
             "funding_received": str(self.funding_received),
             "funding_net": str(self.funding_net),
@@ -368,8 +372,15 @@ def normalize_cost(row: ExchangeCost | dict[str, Any]) -> ExchangeCost:
     )
 
 
+def _fill_sort_key(fill: AccountingFill) -> tuple[str, str]:
+    return (fill.timestamp or "", fill.exchange_fill_id or fill.fill_id)
+
+
 def build_cycle_ledger(run: dict[str, Any]) -> tuple[list[CycleRecord], list[AccountingFill], Decimal, Decimal]:
-    fills = [normalize_fill(run, fill_id, fill) for fill_id, fill in (run.get("fills") or {}).items()]
+    fills = sorted(
+        [normalize_fill(run, fill_id, fill) for fill_id, fill in (run.get("fills") or {}).items()],
+        key=_fill_sort_key,
+    )
     open_inventory: list[dict[str, Any]] = []
     cycles: list[CycleRecord] = []
     remaining_basis = Decimal("0")
@@ -473,6 +484,8 @@ def build_run_accounting(
     taker_fees = sum((fill.trading_fee or Decimal("0") for fill in fills if fill.maker_taker_role == "taker"), Decimal("0"))
     unknown_role_fees = sum((fill.trading_fee or Decimal("0") for fill in fills if fill.maker_taker_role == "unknown"), Decimal("0"))
     trading_fees = maker_fees + taker_fees + unknown_role_fees
+    realized_trading_fees = sum((cycle.total_trading_fees for cycle in cycles), Decimal("0"))
+    open_inventory_trading_fees = trading_fees - realized_trading_fees
     funding_received, funding_paid, other_costs, other_credits = _cost_amounts(costs)
     funding_net = funding_received - funding_paid
     warnings = sorted({warning for cycle in cycles for warning in cycle.warnings})
@@ -480,6 +493,18 @@ def build_run_accounting(
         warnings.append("FILL_FEE_PENDING")
     if any(fill.fee_status == FEE_UNAVAILABLE for fill in fills):
         warnings.append("FILL_FEE_UNAVAILABLE")
+    trading_fee_cost_keys = [
+        str(cost.exchange_transaction_id or cost.fill_id or cost.order_id or "")
+        for cost in costs
+        if cost.exchange_cost_type == "trading_fee"
+    ]
+    if len([key for key in trading_fee_cost_keys if key]) != len(set(key for key in trading_fee_cost_keys if key)):
+        warnings.append("DUPLICATE_EXCHANGE_COST")
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    external_resolution = run.get("external_position_resolution") or summary.get("external_position_resolution") or {}
+    stop_diagnostics = run.get("stop_diagnostics") or {}
+    if external_resolution or stop_diagnostics.get("reason") in {"attribution_mismatch", "unresolved_gridbot_order", "flatten_state_ambiguous"}:
+        warnings.append("EXTERNAL_POSITION_CLOSE_UNATTRIBUTED")
     attribution_clean = account_position_lots is None or account_position_lots == remaining_lots
     if not attribution_clean:
         warnings.append("FUNDING_ATTRIBUTION_AMBIGUOUS")
@@ -487,8 +512,8 @@ def build_run_accounting(
     unrealized = calculate_unrealized_pnl(remaining_lots, remaining_basis, mark_price, contract_multiplier, attribution_clean)
     if unrealized is None and remaining_lots != 0:
         warnings.append("RUN_ACCOUNTING_INCOMPLETE")
-    net_realized = gross - trading_fees + funding_net - other_costs + other_credits
-    live_net = None if unrealized is None else net_realized + unrealized
+    net_realized = gross - realized_trading_fees + funding_net - other_costs + other_credits
+    live_net = None if unrealized is None else net_realized + unrealized - open_inventory_trading_fees
     fee_ratio = None if gross <= 0 else trading_fees / gross
     status = ACCOUNTING_COMPLETE
     if warnings:
@@ -500,6 +525,8 @@ def build_run_accounting(
         cycles_completed=len(cycles),
         gross_realized_pnl=gross,
         trading_fees=trading_fees,
+        realized_trading_fees=realized_trading_fees,
+        open_inventory_trading_fees=open_inventory_trading_fees,
         funding_paid=funding_paid,
         funding_received=funding_received,
         funding_net=funding_net,
@@ -517,7 +544,7 @@ def build_run_accounting(
         maker_fees=maker_fees,
         taker_fees=taker_fees,
         unknown_role_fees=unknown_role_fees,
-        funding_attribution_status=FUNDING_ATTRIBUTED if attribution_clean else FUNDING_PARTIALLY_ATTRIBUTED,
+        funding_attribution_status=FUNDING_ATTRIBUTED if attribution_clean and not external_resolution else FUNDING_PARTIALLY_ATTRIBUTED,
     )
 
 

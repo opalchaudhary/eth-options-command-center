@@ -574,6 +574,9 @@ def render_history() -> None:
     if not runs:
         st.info("No history loaded.")
         return
+    def summary_net_pnl(report: dict) -> str | None:
+        return report.get("net_run_pnl") if str(report.get("accounting_status") or "UNAVAILABLE") == "COMPLETE" else None
+
     rows = []
     for run in runs:
         report = summary_by_run.get(run.get("run_id"), {})
@@ -583,8 +586,9 @@ def render_history() -> None:
                 "Grid Type": human_grid_type(report.get("grid_type") or run.get("grid_type")),
                 "Status": human_lifecycle(run.get("status")),
                 "Cycles": report.get("cycles_total") or report.get("cycles_completed") or "-",
-                "Net P&L": fmt_money(report.get("NET_TRADING_PNL_BEFORE_INCOME_TAX") or report.get("net_trading_pnl")),
+                "Net P&L": fmt_money(summary_net_pnl(report)),
                 "Fees": fmt_money(report.get("delta_fees") or report.get("trading_fees")),
+                "Accounting": report.get("accounting_status") or "-",
                 "Result": run.get("stop_reason") or "-",
             }
         )
@@ -596,7 +600,7 @@ def render_history() -> None:
         report = summary_by_run.get(selected, {})
         cols = st.columns(4)
         with cols[0]:
-            render_card("Net P&L", fmt_money(report.get("NET_TRADING_PNL_BEFORE_INCOME_TAX") or report.get("net_trading_pnl")))
+            render_card("Net P&L", fmt_money(summary_net_pnl(report)))
         with cols[1]:
             render_card("Fees", fmt_money(report.get("delta_fees") or report.get("trading_fees")))
         with cols[2]:

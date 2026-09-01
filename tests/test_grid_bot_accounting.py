@@ -44,6 +44,15 @@ def _run(fills, multiplier="1", status="RUNNING"):
 
 
 def _fill(fill_id, side, price, size="10", fee="0.5", role="maker", config_version=1):
+    order_hint = {
+        "entry": 1,
+        "older": 1,
+        "newer": 2,
+        "exit": 3,
+        "exit1": 4,
+        "exit2": 5,
+        "exit3": 6,
+    }.get(fill_id, len(fill_id))
     return {
         "id": fill_id,
         "order_id": f"order-{fill_id}",
@@ -54,7 +63,7 @@ def _fill(fill_id, side, price, size="10", fee="0.5", role="maker", config_versi
         "commission": fee,
         "commission_asset": "USD",
         "role": role,
-        "created_at": f"2026-08-28T00:00:0{len(fill_id)}+00:00",
+        "created_at": f"2026-08-28T00:00:{order_hint:02d}+00:00",
         "level_id": f"L{len(fill_id)}",
         "config_version": config_version,
     }
@@ -113,8 +122,40 @@ def test_partial_close_leaves_remaining_inventory_basis():
     assert accounting.cycles_completed == 1
     assert accounting.cycles[0].quantity_lots == Decimal("4")
     assert accounting.gross_realized_pnl == Decimal("40")
+    assert accounting.realized_trading_fees == Decimal("0.8")
+    assert accounting.open_inventory_trading_fees == Decimal("0.6")
+    assert accounting.net_realized_pnl == Decimal("39.2")
     assert accounting.remaining_inventory_lots == Decimal("6")
     assert accounting.unrealized_pnl == Decimal("120")
+    assert accounting.live_net_pnl == Decimal("158.6")
+
+
+def test_open_inventory_fee_is_not_reported_as_realized_loss():
+    run = _run([_fill("entry", "buy", "3000", size="2", fee="0.8")])
+    accounting = build_run_accounting(run, mark_price=Decimal("3010"), account_position_lots=Decimal("2"))
+
+    assert accounting.gross_realized_pnl == Decimal("0")
+    assert accounting.realized_trading_fees == Decimal("0")
+    assert accounting.open_inventory_trading_fees == Decimal("0.8")
+    assert accounting.net_realized_pnl == Decimal("0")
+    assert accounting.unrealized_pnl == Decimal("20")
+    assert accounting.live_net_pnl == Decimal("19.2")
+
+
+def test_fifo_uses_fill_timestamp_not_dictionary_insertion_order():
+    older = _fill("older", "buy", "3000", size="1", fee="0", config_version=1)
+    older["created_at"] = "2026-08-28T00:00:01+00:00"
+    newer = _fill("newer", "buy", "3010", size="1", fee="0", config_version=1)
+    newer["created_at"] = "2026-08-28T00:00:02+00:00"
+    exit_fill = _fill("exit", "sell", "3020", size="1", fee="0", config_version=1)
+    exit_fill["created_at"] = "2026-08-28T00:00:03+00:00"
+    run = _run([newer, older, exit_fill])
+
+    accounting = build_run_accounting(run, mark_price=Decimal("3020"), account_position_lots=Decimal("1"))
+
+    assert accounting.cycles[0].entry_fill_id == "older"
+    assert accounting.cycles[0].gross_pnl == Decimal("20")
+    assert accounting.remaining_inventory_basis == Decimal("3010")
 
 
 def test_multiple_closing_fills_do_not_double_count():
@@ -191,4 +232,43 @@ def test_funding_and_other_costs_are_signed_without_double_counting_trading_fee_
     assert accounting.other_costs == Decimal("4")
     assert accounting.other_credits == Decimal("1")
     assert accounting.trading_fees == Decimal("2")
+    assert accounting.realized_trading_fees == Decimal("2")
     assert accounting.net_realized_pnl == Decimal("96")
+
+
+def test_duplicate_mirrored_trading_fee_cost_warns_without_economic_double_count():
+    run = _run([_fill("entry", "buy", "3000", fee="1"), _fill("exit", "sell", "3010", fee="1")])
+    costs = [
+        ExchangeCost("run-accounting", None, "entry", "trading_fee", Decimal("1"), "USD", "debit", exchange_transaction_id="fill-entry"),
+        ExchangeCost("run-accounting", None, "entry", "trading_fee", Decimal("1"), "USD", "debit", exchange_transaction_id="fill-entry"),
+    ]
+
+    accounting = build_run_accounting(run, costs=costs)
+
+    assert accounting.trading_fees == Decimal("2")
+    assert accounting.net_realized_pnl == Decimal("98")
+    assert "DUPLICATE_EXCHANGE_COST" in accounting.warnings
+    assert accounting.accounting_status == "PARTIAL"
+
+
+def test_external_position_resolution_keeps_accounting_partial():
+    run = _run([_fill("entry", "buy", "3000", size="2", fee="1")], status="STOPPED")
+    run["external_position_resolution"] = {"status": "EXTERNALLY_RESOLVED"}
+
+    accounting = build_run_accounting(run, mark_price=Decimal("3010"), account_position_lots=Decimal("0"))
+
+    assert accounting.unrealized_pnl is None
+    assert accounting.live_net_pnl is None
+    assert accounting.accounting_status == "PARTIAL"
+    assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" in accounting.warnings
+
+
+def test_external_position_resolution_from_summary_keeps_historical_accounting_partial():
+    run = _run([_fill("entry", "buy", "3000", size="2", fee="1")], status="STOPPED")
+    run["summary"] = {"external_position_resolution": {"status": "EXTERNALLY_RESOLVED"}}
+
+    accounting = build_run_accounting(run, mark_price=Decimal("3010"), account_position_lots=Decimal("0"))
+
+    assert accounting.accounting_status == "PARTIAL"
+    assert accounting.funding_attribution_status == "PARTIALLY_ATTRIBUTED"
+    assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" in accounting.warnings
