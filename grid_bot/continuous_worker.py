@@ -26,6 +26,8 @@ SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
 ACCOUNT_TELEMETRY_SECONDS = float(os.getenv("GRIDBOT_V01_ACCOUNT_TELEMETRY_SECONDS", "30"))
 MATERIAL_INVENTORY_DELTA = Decimal(os.getenv("GRIDBOT_V01_SNAPSHOT_MATERIAL_INVENTORY_DELTA", "1"))
+POSITION_MISMATCH_CONFIRMATION_POLLS = int(os.getenv("GRIDBOT_V01_POSITION_MISMATCH_CONFIRMATION_POLLS", "2"))
+POSITION_MISMATCH_CONFIRMATION_SECONDS = float(os.getenv("GRIDBOT_V01_POSITION_MISMATCH_CONFIRMATION_SECONDS", "30"))
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -90,6 +92,7 @@ class ContinuousGridBotWorker:
             "replacement_count": 0,
             "deferred_replacement_count": 0,
             "position_mismatches": 0,
+            "pending_position_mismatch": None,
             "fill_ledger_mismatches": 0,
             "snapshot_writes": 0,
             "supabase_write_policy": {
@@ -192,6 +195,7 @@ class ContinuousGridBotWorker:
             replacement_count=0,
             deferred_replacement_count=0,
             position_mismatches=0,
+            pending_position_mismatch=None,
             fill_ledger_mismatches=0,
             fill_derived_inventory="0",
             delta_position="0",
@@ -365,9 +369,14 @@ class ContinuousGridBotWorker:
         telemetry_refreshed = dict(self.account_telemetry.request_counts) != before_telemetry_counts
         lifecycle = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled)
         if int(result.get("position_mismatches") or 0):
-            lifecycle._safe_pause_for_external_position_change(lifecycle._load(), run, result, reason="worker_reconcile", previous_status=run.get("status"))
-            replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "external_position_change"}], "metrics": {}}
+            if self._position_mismatch_confirmed(run, result):
+                lifecycle._safe_pause_for_external_position_change(lifecycle._load(), run, result, reason="worker_reconcile", previous_status=run.get("status"))
+                replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "external_position_change"}], "metrics": {}}
+                self._clear_pending_position_mismatch()
+            else:
+                replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "pending_position_mismatch"}], "metrics": {}}
         else:
+            self._clear_pending_position_mismatch()
             replacement_result = lifecycle.process_replacements(run, result)
         new_fill_ids = [fill_id for fill_id in (run.get("fills") or {}) if fill_id not in before_fills]
         if new_fill_ids:
@@ -409,6 +418,45 @@ class ContinuousGridBotWorker:
             self._run = run
         self._update_health(run, result)
         return result
+
+    def _position_mismatch_signature(self, run: dict, reconciliation: dict) -> dict:
+        return {
+            "run_id": run.get("run_id"),
+            "gridbot_inventory": str(reconciliation.get("gridbot_inventory")),
+            "delta_position": str(reconciliation.get("delta_position")),
+        }
+
+    def _position_mismatch_confirmed(self, run: dict, reconciliation: dict) -> bool:
+        now = time.monotonic()
+        signature = self._position_mismatch_signature(run, reconciliation)
+        seen_at = utc_now()
+        with self._lock:
+            pending = self._state.get("pending_position_mismatch")
+            if not pending or pending.get("signature") != signature:
+                self._state["pending_position_mismatch"] = {
+                    "signature": signature,
+                    "first_seen_monotonic": now,
+                    "last_seen_monotonic": now,
+                    "polls": 1,
+                    "first_seen_at": seen_at,
+                    "last_seen_at": seen_at,
+                }
+                return False
+            pending = deepcopy(pending)
+            pending["polls"] = int(pending.get("polls") or 0) + 1
+            pending["last_seen_monotonic"] = now
+            pending["last_seen_at"] = seen_at
+            self._state["pending_position_mismatch"] = pending
+
+        age_seconds = now - float(pending.get("first_seen_monotonic") or now)
+        return (
+            int(pending.get("polls") or 0) >= POSITION_MISMATCH_CONFIRMATION_POLLS
+            and age_seconds >= POSITION_MISMATCH_CONFIRMATION_SECONDS
+        )
+
+    def _clear_pending_position_mismatch(self) -> None:
+        with self._lock:
+            self._state["pending_position_mismatch"] = None
 
     def _update_health(self, run: dict | None, reconciliation: dict | None) -> None:
         with self._lock:

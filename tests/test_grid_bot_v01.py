@@ -2994,6 +2994,58 @@ def test_risk_snapshot_persists_account_margin_fields(tmp_path):
     assert margin_state["liquidation_price"] is None
 
 
+def test_worker_position_mismatch_waits_for_confirmation_before_external_pause(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+
+    client.position_size = "10"
+    first = worker._poll_once(worker._run)
+
+    assert first["position_mismatches"] == 1
+    assert worker._run["status"] == "RUNNING"
+    assert worker.state()["pending_position_mismatch"]["signature"]["delta_position"] == "10"
+    events = list(db.tables.get("grid_events", {}).values())
+    assert "GRID_RUN_EXTERNAL_POSITION_CHANGE" not in {event["event_type"] for event in events}
+    assert worker.state()["last_replacement"]["reason"] == "pending_position_mismatch"
+
+    client.position_size = "0"
+    second = worker._poll_once(worker._run)
+
+    assert second["position_mismatches"] == 0
+    assert worker._run["status"] == "RUNNING"
+    assert worker.state()["pending_position_mismatch"] is None
+    events = list(db.tables.get("grid_events", {}).values())
+    assert "GRID_RUN_EXTERNAL_POSITION_CHANGE" not in {event["event_type"] for event in events}
+
+
+def test_worker_confirmed_position_mismatch_pauses_external_change(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker._run = started["run"]
+
+    client.position_size = "10"
+    first = worker._poll_once(worker._run)
+    assert first["position_mismatches"] == 1
+    with worker._lock:
+        worker._state["pending_position_mismatch"]["first_seen_monotonic"] -= 31
+
+    second = worker._poll_once(worker._run)
+
+    assert second["position_mismatches"] == 1
+    assert worker._run["status"] == "PAUSED"
+    assert worker._run["external_position_adjustment"]["classification"] == "EXTERNAL_POSITION_INCREASE"
+    events = list(db.tables.get("grid_events", {}).values())
+    assert "GRID_RUN_EXTERNAL_POSITION_CHANGE" in {event["event_type"] for event in events}
+    assert worker.state()["pending_position_mismatch"] is None
+
+
 def test_risk_snapshot_preserves_zero_vs_unknown():
     db = _CountingSupabaseGridRepository()
     run = {
