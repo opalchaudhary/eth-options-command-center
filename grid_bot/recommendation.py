@@ -87,12 +87,19 @@ class CurrentGridSnapshot:
     upper_price: Decimal
     grid_count: int
     spacing_type: SpacingType
+    run_id: str | None = None
+    bot_id: str | None = None
+    config_version: int | None = None
     step: Decimal | None = None
     spot_price: Decimal | None = None
+    lot_size: Decimal | None = None
+    max_inventory_lots: Decimal | None = None
 
     @classmethod
     def from_grid_config(cls, config: GridConfig, spot_price: Decimal | None = None) -> "CurrentGridSnapshot":
         return cls(
+            bot_id=config.bot_id,
+            config_version=config.config_version,
             grid_type=config.grid_type,
             lower_price=config.lower_price,
             upper_price=config.upper_price,
@@ -100,6 +107,8 @@ class CurrentGridSnapshot:
             spacing_type=config.spacing_type,
             step=compute_step(config.lower_price, config.upper_price, config.grid_count, config.spacing_type),
             spot_price=spot_price,
+            lot_size=config.lot_size,
+            max_inventory_lots=config.max_inventory_lots,
         )
 
 

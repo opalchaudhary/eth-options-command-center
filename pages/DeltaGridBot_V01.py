@@ -302,7 +302,7 @@ def render_grid_recommendation() -> None:
     controls = st.columns([1, 3])
     with controls[0]:
         if st.button("Get Recommendation", use_container_width=True, key="gridbot_get_recommendation"):
-            st.session_state["gridbot_recommendation"] = safe_get("/api/grid/v01/recommendation", timeout=15)
+            st.session_state["gridbot_recommendation"] = safe_post("/api/grid/v01/recommendation", timeout=15)
             st.session_state["gridbot_recommendation_loaded_at"] = datetime.now(timezone.utc).isoformat()
     loaded_at = st.session_state.get("gridbot_recommendation_loaded_at")
     with controls[1]:

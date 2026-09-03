@@ -24,6 +24,7 @@ from .recommendation import (
     no_grid,
     recommend_grid_parameters,
 )
+from .recommendation_snapshot_repository import GridRecommendationSnapshotRepository
 from .supabase_repository import SupabaseGridRepository
 
 
@@ -127,15 +128,17 @@ class GridRecommendationService:
         *,
         prediction_repository: Any | None = None,
         grid_repository: Any | None = None,
+        snapshot_repository: Any | None = None,
         market_snapshot_fn: Any | None = None,
         now_fn: Any | None = None,
     ):
         self.prediction_repository = prediction_repository or V2ShadowPredictionRepository()
         self.grid_repository = grid_repository if grid_repository is not None else SupabaseGridRepository()
+        self.snapshot_repository = snapshot_repository
         self.market_snapshot_fn = market_snapshot_fn or eth_market_snapshot
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
-    def recommendation(self, symbol: str = SYMBOL) -> dict:
+    def recommendation(self, symbol: str = SYMBOL, *, persist: bool = False) -> dict:
         as_of = as_utc(self.now_fn())
         spot = self._current_spot()
         if spot is None:
@@ -152,7 +155,27 @@ class GridRecommendationService:
             if input_codes and recommendation.action == RecommendationAction.NO_GRID:
                 recommendation = no_grid(inputs, list(recommendation.reason_codes) + input_codes)
 
-        return self._payload(symbol, spot, source_timestamp, recommendation, current_grid, inputs)
+        payload = self._payload(symbol, spot, source_timestamp, recommendation, current_grid, inputs)
+        if persist:
+            payload["persistence"] = self._persist_snapshot(payload, requested_at=as_of)
+        return payload
+
+    def history(
+        self,
+        *,
+        limit: int = 50,
+        recommender_version: str | None = None,
+        horizon: str | None = None,
+        action: str | None = None,
+    ) -> dict:
+        repository = self._snapshot_repository()
+        rows = repository.latest(
+            limit=limit,
+            recommender_version=recommender_version,
+            horizon=horizon,
+            action=action,
+        )
+        return {"ok": True, "rows": rows}
 
     def _latest_v2_rows(self, symbol: str) -> list[dict]:
         try:
@@ -180,11 +203,16 @@ class GridRecommendationService:
             return None
         try:
             return CurrentGridSnapshot(
+                run_id=row.get("run_id"),
+                bot_id=row.get("bot_id"),
+                config_version=int(row["config_version"]) if row.get("config_version") not in [None, ""] else None,
                 grid_type=GridType(row["grid_type"]),
                 lower_price=Decimal(str(row["lower_price"])),
                 upper_price=Decimal(str(row["upper_price"])),
                 grid_count=int(row["grid_count"]),
                 spacing_type=SpacingType(row["spacing_type"]),
+                lot_size=Decimal(str(row["lot_size"])) if row.get("lot_size") not in [None, ""] else None,
+                max_inventory_lots=Decimal(str(row["max_inventory_lots"])) if row.get("max_inventory_lots") not in [None, ""] else None,
                 spot_price=spot,
             )
         except Exception:
@@ -258,7 +286,10 @@ class GridRecommendationService:
                 ood_status=next((row.get("ood_status") for row in targets.values() if row.get("ood_status")), None),
                 ood_reason=next((row.get("ood_reason") for row in targets.values() if row.get("ood_reason")), None),
                 stale=stale,
-                metadata={"v2_rows": {target: row.get("id") for target, row in targets.items()}},
+                metadata={
+                    "v2_rows": {target: row.get("id") for target, row in targets.items()},
+                    "feature_snapshots": {target: row.get("feature_snapshot_id") for target, row in targets.items()},
+                },
             )
         if malformed:
             return None, latest_ts, ["MALFORMED_V2_ROW"]
@@ -325,12 +356,51 @@ class GridRecommendationService:
                 "range_source": "probability_v2_shadow_predictions.metadata_json.range_70_lower/range_70_upper",
                 "current_spot_source": "backend.services.delta_client.eth_market_snapshot(include_orderbook=False)",
                 "current_grid_source": "grid_active_run_locks + grid_runs + grid_config_versions",
+                "source_prediction_id": self._selected_source_prediction_id(inputs, recommendation),
+                "source_v2_row_ids": self._selected_v2_row_ids(inputs, recommendation),
+                "source_feature_snapshot_ids": self._selected_feature_snapshot_ids(inputs, recommendation),
             },
         }
 
-    def _selected_probability(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation, key: str) -> float | None:
+    def _snapshot_repository(self):
+        if self.snapshot_repository is not None:
+            return self.snapshot_repository
+        return GridRecommendationSnapshotRepository()
+
+    def _persist_snapshot(self, payload: dict, *, requested_at: datetime) -> dict:
+        try:
+            repository = self._snapshot_repository()
+            if not getattr(repository, "enabled", True):
+                return {"saved": False, "recommendation_id": None, "error": "Recommendation snapshot storage is not configured."}
+            snapshot = repository.build_snapshot(payload, requested_at=requested_at)
+            recommendation_id = repository.insert(snapshot)
+            return {"saved": True, "recommendation_id": recommendation_id}
+        except Exception:
+            return {"saved": False, "recommendation_id": None, "error": "Recommendation snapshot could not be saved."}
+
+    def _selected_prediction(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation) -> HorizonProbability | None:
         horizon = (recommendation.metadata or {}).get("selected_operating_horizon")
         if not horizon:
             return None
-        prediction = inputs.predictions.get(str(horizon))
+        return inputs.predictions.get(str(horizon))
+
+    def _selected_probability(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation, key: str) -> float | None:
+        prediction = self._selected_prediction(inputs, recommendation)
         return getattr(prediction, key, None) if prediction else None
+
+    def _selected_v2_row_ids(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation) -> dict:
+        prediction = self._selected_prediction(inputs, recommendation)
+        rows = ((prediction.metadata or {}).get("v2_rows") if prediction else None) or {}
+        return {key: value for key, value in rows.items() if value}
+
+    def _selected_feature_snapshot_ids(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation) -> dict:
+        prediction = self._selected_prediction(inputs, recommendation)
+        rows = ((prediction.metadata or {}).get("feature_snapshots") if prediction else None) or {}
+        return {key: value for key, value in rows.items() if value}
+
+    def _selected_source_prediction_id(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation) -> str | None:
+        rows = self._selected_v2_row_ids(inputs, recommendation)
+        for target in ("path_inside_70", "realized_over_range_width_ge_1"):
+            if rows.get(target):
+                return rows[target]
+        return next(iter(rows.values()), None)

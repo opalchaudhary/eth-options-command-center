@@ -232,7 +232,7 @@ def test_grid_recommendation_loads_only_from_manual_action() -> None:
 
     assert "Get Recommendation" in recommendation_body
     assert "Recommendation loads only when requested." in recommendation_body
-    assert 'safe_get("/api/grid/v01/recommendation"' in recommendation_body
+    assert 'safe_post("/api/grid/v01/recommendation"' in recommendation_body
     assert "/api/grid/v01/recommendation" not in fragment_body
 
 

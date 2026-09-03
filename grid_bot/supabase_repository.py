@@ -232,6 +232,8 @@ class SupabaseGridRepository:
             "upper_price": config.get("upper_price"),
             "grid_count": config.get("grid_count"),
             "spacing_type": config.get("spacing_type"),
+            "lot_size": config.get("lot_size"),
+            "max_inventory_lots": config.get("max_inventory_lots"),
         }
 
     def _locked_run_is_active(self, run_id: str | None) -> bool:

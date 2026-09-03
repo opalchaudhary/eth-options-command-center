@@ -264,7 +264,40 @@ def grid_v01_recommendation(symbol: str = "ETHUSD"):
         raise HTTPException(status_code=500, detail="Grid recommendation unavailable.") from exc
 
 
+@router.post("/v01/recommendation")
+def grid_v01_recommendation_request(symbol: str = "ETHUSD"):
+    try:
+        return GridRecommendationService().recommendation(symbol=symbol, persist=True)
+    except GridRecommendationStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GridRecommendationUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Grid recommendation unavailable.") from exc
+
+
+@router.get("/v01/recommendations/history")
+def grid_v01_recommendation_history(
+    limit: int = 50,
+    recommender_version: str | None = None,
+    horizon: str | None = None,
+    action: str | None = None,
+):
+    try:
+        return GridRecommendationService().history(
+            limit=limit,
+            recommender_version=recommender_version,
+            horizon=horizon,
+            action=action,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 public_grid_router.add_api_route("/v01/recommendation", grid_v01_recommendation, methods=["GET"])
+public_grid_router.add_api_route("/v01/recommendation", grid_v01_recommendation_request, methods=["POST"])
+public_grid_router.add_api_route("/v01/recommendations/history", grid_v01_recommendation_history, methods=["GET"])
+
 
 
 @router.get("/v01/live/market-account")
