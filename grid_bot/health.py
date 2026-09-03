@@ -291,8 +291,19 @@ def evaluate_gridbot_health(
                 **{k: v for k, v in completeness.items() if k != "level_states"},
             )
         )
-    recovery_required = bool((run or {}).get("resume_diagnostics") or (run or {}).get("edit_diagnostics") or status in {GridStatus.STARTING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value})
-    if recovery_required and status in {GridStatus.PAUSED.value, GridStatus.STARTING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value}:
+    recovery_required = bool(
+        (run or {}).get("resume_diagnostics")
+        or (run or {}).get("edit_diagnostics")
+        or status
+        in {
+            GridStatus.STARTING.value,
+            GridStatus.PAUSING.value,
+            GridStatus.RESUMING.value,
+            GridStatus.EDITING.value,
+            GridStatus.STOPPING.value,
+        }
+    )
+    if recovery_required and status in {GridStatus.PAUSED.value, GridStatus.STARTING.value, GridStatus.PAUSING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value, GridStatus.STOPPING.value}:
         issues.append(_issue("LIFECYCLE_RECOVERY_REQUIRED", HealthSeverity.CRITICAL, "Lifecycle completion has not been proven; grid execution is frozen or in progress.", run_for_issue, lifecycle_state=status))
     if status == GridStatus.STOPPED.value and (open_orders or position != 0 or inventory != 0):
         issues.append(_issue("STOPPED_WITH_EXPOSURE", HealthSeverity.CRITICAL, "STOPPED run still has open orders or attributable inventory.", run_for_issue, open_orders=len(open_orders), delta_position=str(position), gridbot_inventory=str(inventory)))

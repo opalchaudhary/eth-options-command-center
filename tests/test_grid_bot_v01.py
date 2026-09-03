@@ -6,6 +6,7 @@ import pytest
 
 from grid_bot.accounting import ExchangeCost, build_run_accounting, gross_cycle_pnl, summarize_pnl
 from grid_bot.config import REST_URL, TestnetEndpointConfig, validate_testnet_endpoints
+import grid_bot.continuous_worker as continuous_worker_module
 from grid_bot.continuous_worker import ContinuousGridBotWorker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle, START_TERMINAL_ORDER_STATUSES
@@ -3301,6 +3302,84 @@ def test_live_state_prefers_fresh_account_open_order_count_for_board():
     assert state["account_risk_state"]["open_sell_order_count"] == 3
 
 
+def test_gridbot_live_state_refreshes_latest_persisted_transitional_progress(monkeypatch):
+    stale_run = {
+        "run_id": "run-progress",
+        "status": GridStatus.STARTING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "3", "config_version": 1},
+        "product": {"product_id": 1699, "symbol": "ETHUSD"},
+        "levels": [{"level_id": f"L00{i}", "side": "buy" if i <= 3 else "sell"} for i in range(1, 7)],
+        "orders": {},
+        "fills": {},
+        "lifecycle_progress": {"operation": "START", "stage": "STARTING", "message": "old", "expected_orders": 6, "confirmed_orders": 0},
+    }
+    latest_run = {
+        **stale_run,
+        "orders": {
+            "a": {"client_order_id": "DGB01-a", "status": "open", "remaining_quantity": "1", "side": "buy"},
+            "b": {"client_order_id": "DGB01-b", "status": "open", "remaining_quantity": "1", "side": "sell"},
+        },
+        "lifecycle_progress": {
+            "operation": "START",
+            "stage": "VERIFYING_COMPLETENESS",
+            "message": "Waiting for Delta to confirm 4 orders.",
+            "expected_orders": 6,
+            "confirmed_orders": 2,
+            "buy_confirmed_orders": 1,
+            "sell_confirmed_orders": 1,
+        },
+        "deployment_completeness": {"complete": False, "expected": 6, "confirmed_open": 2, "buy_accounted": 1, "sell_accounted": 1},
+    }
+
+    class Telemetry:
+        def as_dict(self):
+            return {
+                "telemetry_status": "HEALTHY",
+                "open_order_count": 2,
+                "open_buy_order_count": 1,
+                "open_sell_order_count": 1,
+                "position_lots": "0",
+                "mark_price": "2500",
+            }
+
+    class AccountTelemetry:
+        def get(self, _symbol):
+            return Telemetry()
+
+    class DB:
+        enabled = True
+
+        def load_run_state(self, run_id):
+            assert run_id == "run-progress"
+            return latest_run
+
+    class Worker:
+        db = DB()
+        account_telemetry = AccountTelemetry()
+
+        def state(self):
+            return {
+                "ok": True,
+                "run_id": "run-progress",
+                "status": "running",
+                "running": True,
+                "thread_alive": True,
+                "lifecycle_state": GridStatus.STARTING.value,
+                "active_run": stale_run,
+                "lifecycle_progress": stale_run["lifecycle_progress"],
+                "known_gridbot_orders": [],
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+
+    state = continuous_worker_module.gridbot_live_state()
+
+    assert state["lifecycle_progress"]["message"] == "Waiting for Delta to confirm 4 orders."
+    assert state["lifecycle_progress"]["confirmed_orders"] == 2
+    assert state["known_order_count"] == 2
+    assert state["health"]["overall_status"] != "HEALTHY"
+
+
 def test_snapshot_material_change_ignores_regular_mark_and_margin_drift():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     baseline = (
@@ -4247,6 +4326,7 @@ def test_gridbot_health_detects_orphan_missing_duplicate_and_unresolved_orders()
         (GridStatus.STOPPED.value, [], "1", "STOPPED_WITH_EXPOSURE"),
         (GridStatus.STOP_REQUIRES_ATTENTION.value, [], "0", "STOP_REQUIRES_ATTENTION"),
         (GridStatus.PAUSING.value, [], "0", "LIFECYCLE_STUCK"),
+        (GridStatus.STOPPING.value, [], "1", "LIFECYCLE_RECOVERY_REQUIRED"),
     ],
 )
 def test_gridbot_health_detects_lifecycle_contradictions(status, orders, inventory, expected_code):

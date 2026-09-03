@@ -153,6 +153,7 @@ class ContinuousGridBotWorker:
                 state.update(
                     {
                         "run_id": run.get("run_id"),
+                        "active_run": deepcopy(run),
                         "lifecycle_state": run.get("status"),
                         "config": run.get("config") or {},
                         "config_version": (run.get("config") or {}).get("config_version"),
@@ -507,6 +508,34 @@ def stop_continuous_gridbot_worker() -> dict:
 
 def gridbot_live_state() -> dict:
     state = worker.state()
+    health_run = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
+    try:
+        if state.get("run_id") and worker.db.enabled:
+            latest_run = worker.db.load_run_state(state["run_id"])
+            if latest_run:
+                health_run = latest_run
+                state.update(
+                    {
+                        "active_run": deepcopy(latest_run),
+                        "lifecycle_state": latest_run.get("status"),
+                        "config": latest_run.get("config") or {},
+                        "config_version": (latest_run.get("config") or {}).get("config_version"),
+                        "grid_nature": (latest_run.get("config") or {}).get("grid_type"),
+                        "grid_levels": latest_run.get("levels") or [],
+                        "deployment_completeness": latest_run.get("deployment_completeness") or {},
+                        "lifecycle_progress": latest_run.get("lifecycle_progress") or latest_run.get("startup") or {},
+                        "lifecycle_timing": latest_run.get("lifecycle_timing") or {},
+                        "known_gridbot_orders": list((latest_run.get("orders") or {}).values()),
+                        "known_fill_ids": list((latest_run.get("fills") or {}).keys()),
+                        "known_order_count": len(latest_run.get("orders") or {}),
+                        "known_fill_count": len(latest_run.get("fills") or {}),
+                        "replacement_count": len(latest_run.get("replacement_keys") or {}),
+                        "deferred_replacement_count": len(latest_run.get("deferred_orders") or {}),
+                        "replacement_state": latest_run.get("replacement_keys") or {},
+                    }
+                )
+    except Exception as exc:
+        state["active_run_refresh_error"] = str(exc)[:300]
     try:
         if state.get("run_id"):
             telemetry = worker.account_telemetry.get("ETHUSD")
@@ -518,5 +547,5 @@ def gridbot_live_state() -> dict:
             state["open_gridbot_orders"] = open_order_count
     except Exception as exc:
         state["account_risk_state_error"] = str(exc)[:300]
-    state["health"] = evaluate_gridbot_health(state)
+    state["health"] = evaluate_gridbot_health(state, health_run)
     return state
