@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -59,6 +60,8 @@ START_TERMINAL_ORDER_STATUSES = {
 }
 START_UNRESOLVED_ORDER_STATUSES = {"unresolved", "ambiguous_submission", "submitted", "pending", "proposed"}
 DEFERRED_ORDER_STATUSES = {"deferred", "blocked"}
+RUNNING_VALID_ORDER_STATUSES = {"open", "partially_filled", "filled", "deferred", "blocked"}
+START_ACCOUNTED_ORDER_STATUSES = RUNNING_VALID_ORDER_STATUSES | START_UNRESOLVED_ORDER_STATUSES
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
 STOP_ATTENTION_STATUS = GridStatus.STOP_REQUIRES_ATTENTION.value
@@ -331,6 +334,7 @@ class DurableGridBotLifecycle:
     def _startup_progress(self, run: dict, stage: str | None = None, last_error: str | None = None) -> dict:
         levels = run.get("levels") or []
         orders = run.get("orders") or {}
+        completeness = run.get("deployment_completeness") or {}
         expected = len(levels)
         submitted = len(orders)
         verified = len([row for row in orders.values() if row.get("exchange_order_id")])
@@ -342,6 +346,11 @@ class DurableGridBotLifecycle:
             "orders_expected": expected,
             "orders_submitted": submitted,
             "orders_verified": verified,
+            "orders_confirmed_open": completeness.get("confirmed_open", 0),
+            "orders_filled": completeness.get("filled", 0),
+            "orders_deferred": completeness.get("deferred", 0),
+            "orders_ambiguous": completeness.get("ambiguous", 0),
+            "orders_missing": completeness.get("missing", expected - submitted if submitted < expected else 0),
             "last_startup_progress_at": progress_at,
             "last_successful_delta_truth_check": run.get("last_successful_delta_truth_check"),
             "last_error": last_error if last_error is not None else run.get("last_error"),
@@ -362,6 +371,118 @@ class DurableGridBotLifecycle:
         self._event(state, run["run_id"], "GRID_RUN_START_RECOVERY_BLOCKED", {"start_stage": stage, **(payload or {})})
         self._save(state, include_children=False)
         return {"ok": False, "run": deepcopy(run), **self._startup_progress(run)}
+
+    def _deployment_completeness(self, run: dict, reconciliation: dict | None = None) -> dict:
+        reconciliation = reconciliation or {}
+        config_version = int((run.get("config") or {}).get("config_version") or 1)
+        current_orders = [
+            order
+            for order in (run.get("orders") or {}).values()
+            if int(order.get("config_version") or config_version) == config_version and order.get("order_kind") != "safety_flatten"
+        ]
+        deferred_orders = [
+            order
+            for order in (run.get("deferred_orders") or {}).values()
+            if int(order.get("config_version") or config_version) == config_version
+        ]
+        by_level: dict[str, list[dict]] = {}
+        for order in current_orders + deferred_orders:
+            by_level.setdefault(str(order.get("level_id") or ""), []).append(order)
+        counts = {
+            "expected": len(run.get("levels") or []),
+            "eligible": len(run.get("levels") or []),
+            "confirmed_open": 0,
+            "filled": 0,
+            "deferred": 0,
+            "terminal": 0,
+            "ambiguous": 0,
+            "missing": 0,
+        }
+        level_states = []
+        buy_valid = sell_valid = 0
+        reasons = []
+        for level in run.get("levels") or []:
+            level_id = str(level.get("level_id") or "")
+            side = str(level.get("side") or "")
+            orders = by_level.get(level_id) or []
+            status = "missing"
+            if orders:
+                statuses = {str(order.get("status") or "").lower() for order in orders}
+                if statuses & START_UNRESOLVED_ORDER_STATUSES:
+                    status = "ambiguous"
+                elif statuses & {"open", "partially_filled"}:
+                    status = "confirmed_open"
+                elif "filled" in statuses:
+                    status = "filled"
+                elif statuses & DEFERRED_ORDER_STATUSES:
+                    status = "deferred"
+                else:
+                    status = "terminal"
+            counts[status] += 1
+            if status in RUNNING_VALID_ORDER_STATUSES or status in {"confirmed_open"}:
+                if side == Side.BUY.value:
+                    buy_valid += 1
+                elif side == Side.SELL.value:
+                    sell_valid += 1
+            level_states.append({"level_id": level_id, "side": side, "status": status})
+        if counts["missing"]:
+            reasons.append("MISSING_INTENDED_ORDERS")
+        if counts["ambiguous"]:
+            reasons.append("AMBIGUOUS_SUBMISSIONS")
+        if counts["terminal"]:
+            reasons.append("TERMINAL_INTENDED_ORDERS")
+        if reconciliation.get("errors"):
+            reasons.append("TRUTH_UNAVAILABLE")
+        if int(reconciliation.get("unresolved_orders") or 0):
+            reasons.append("UNRESOLVED_EXCHANGE_TRUTH")
+        if int(reconciliation.get("position_mismatches") or 0) or int(reconciliation.get("fill_ledger_mismatches") or 0):
+            reasons.append("RECONCILIATION_MISMATCH")
+        expected_sides = {str(level.get("side") or "") for level in run.get("levels") or []}
+        grid_type = str((run.get("config") or {}).get("grid_type") or "")
+        if grid_type == GridType.NEUTRAL.value and {Side.BUY.value, Side.SELL.value}.issubset(expected_sides):
+            if buy_valid == 0 or sell_valid == 0:
+                reasons.append("NEUTRAL_DEPLOYMENT_ONE_SIDED")
+        complete = not reasons
+        return {
+            **counts,
+            "complete": complete,
+            "reasons": reasons,
+            "buy_accounted": buy_valid,
+            "sell_accounted": sell_valid,
+            "level_states": level_states,
+            "checked_at": utc_now(),
+        }
+
+    def _update_lifecycle_progress(self, run: dict, operation: str, stage: str, completeness: dict | None = None) -> None:
+        now = utc_now()
+        progress = run.setdefault("lifecycle_progress", {})
+        progress.update(
+            {
+                "operation": operation,
+                "stage": stage,
+                "started_at": progress.get("started_at") or now,
+                "last_progress_at": now,
+            }
+        )
+        if completeness:
+            progress.update(
+                {
+                    "expected_orders": completeness.get("expected", 0),
+                    "confirmed_orders": completeness.get("confirmed_open", 0),
+                    "filled_orders": completeness.get("filled", 0),
+                    "deferred_orders": completeness.get("deferred", 0),
+                    "ambiguous_orders": completeness.get("ambiguous", 0),
+                    "missing_orders": completeness.get("missing", 0),
+                }
+            )
+
+    def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
+        completeness = self._deployment_completeness(run, reconciliation)
+        run["deployment_completeness"] = completeness
+        self._update_lifecycle_progress(run, operation, "VERIFYING_COMPLETENESS", completeness)
+        if not completeness["complete"]:
+            self._event(state, run["run_id"], "GRID_DEPLOYMENT_INCOMPLETE", completeness)
+        return completeness
 
     def recover_starting_run(self, run_id: str | None = None) -> dict:
         state = self._load()
@@ -400,16 +521,17 @@ class DurableGridBotLifecycle:
                     "fill_ledger_mismatches": fill_mismatches,
                 },
             )
+        completeness = self._assert_deployment_complete(state, run, reconciliation, "START")
         open_orders = int(reconciliation.get("exchange_open_orders") or 0)
-        inventory = _decimal(reconciliation.get("gridbot_inventory"))
-        position = _decimal(reconciliation.get("delta_position"))
-        if open_orders or inventory != 0 or position != 0:
+        if completeness["complete"]:
             run["status"] = GridStatus.RUNNING.value
             run["start_stage"] = "RUNNING"
             run["startup"] = self._startup_progress(run, "RUNNING")
-            self._event(state, run["run_id"], "GRID_RUN_RUNNING", {"open_orders": open_orders, "recovered_from_starting": True})
+            self._event(state, run["run_id"], "GRID_RUN_RUNNING", {"open_orders": open_orders, "recovered_from_starting": True, "deployment_completeness": completeness})
             self._save(state)
             return {"ok": True, "run": deepcopy(run), **self._startup_progress(run, "RUNNING")}
+        run["startup"] = self._startup_progress(run, "VERIFYING_EXCHANGE_TRUTH")
+        self._save(state)
         return {"ok": True, "run": deepcopy(run), **self._startup_progress(run)}
 
     def product_account_health(self, product_symbol: str = "ETHUSD") -> dict:
@@ -618,8 +740,15 @@ class DurableGridBotLifecycle:
             for level in levels:
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
                 self._place_proposal(run, spec.product_id, proposal, "initial_grid")
+            self._save(state)
+            reconciled = self.reconcile(run_id, persist_snapshot=False)
+            state = self._load()
+            run = state["runs"][run_id]
+            completeness = self._assert_deployment_complete(state, run, reconciled.get("reconciliation") or {}, "START")
+            if not completeness["complete"]:
+                return self._fail_closed_starting(state, run, "DEPLOYMENT_INCOMPLETE", ",".join(completeness.get("reasons") or []), {"deployment_completeness": completeness})
             run["status"] = GridStatus.RUNNING.value
-            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"])})
+            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"]), "deployment_completeness": completeness})
             self._save(state)
             return {"ok": True, "run": deepcopy(run), "preview": preview_payload}
         except Exception:
@@ -704,7 +833,7 @@ class DurableGridBotLifecycle:
                 existing = [
                     order
                     for order in run.get("orders", {}).values()
-                    if order.get("level_id") == level.get("level_id") and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+                    if order.get("level_id") == level.get("level_id") and str(order.get("status") or "").lower() in START_ACCOUNTED_ORDER_STATUSES
                 ]
                 if existing:
                     continue
@@ -727,16 +856,25 @@ class DurableGridBotLifecycle:
             if not run or run.get("status") != GridStatus.STARTING.value:
                 return {"ok": True, "run": deepcopy(run or {}), **self._startup_progress(run or {})}
             self._set_start_stage(state, run, "VERIFYING_ORDERS")
-            self.reconcile(run_id)
+            verified = self.reconcile(run_id, persist_snapshot=False)
             state = self._load()
             run = state["runs"][run_id]
             if run.get("status") != GridStatus.STARTING.value:
                 return {"ok": True, "run": deepcopy(run), **self._startup_progress(run)}
+            completeness = self._assert_deployment_complete(state, run, verified.get("reconciliation") or {}, "START")
+            if not completeness["complete"]:
+                return self._fail_closed_starting(
+                    state,
+                    run,
+                    "DEPLOYMENT_INCOMPLETE",
+                    ",".join(completeness.get("reasons") or []),
+                    {"deployment_completeness": completeness},
+                )
             self._set_start_stage(state, run, "RECONCILING")
             run["status"] = GridStatus.RUNNING.value
             run["start_stage"] = "RUNNING"
             run["startup"] = self._startup_progress(run, "RUNNING")
-            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"])})
+            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"]), "deployment_completeness": completeness})
             self._save(state)
             return {"ok": True, "run": deepcopy(run), **self._startup_progress(run, "RUNNING")}
         except Exception as exc:
@@ -1361,8 +1499,15 @@ class DurableGridBotLifecycle:
             for level in levels:
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
                 self._place_proposal(run, spec.product_id, proposal, "initial_grid")
+            self._save(state)
+            reconciled = self.reconcile(run_id, persist_snapshot=False)
+            state = self._load()
+            run = state["runs"][run_id]
+            completeness = self._assert_deployment_complete(state, run, reconciled.get("reconciliation") or {}, "START")
+            if not completeness["complete"]:
+                return self._fail_closed_starting(state, run, "DEPLOYMENT_INCOMPLETE", ",".join(completeness.get("reasons") or []), {"deployment_completeness": completeness})
             run["status"] = GridStatus.RUNNING.value
-            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"])})
+            self._event(state, run_id, "GRID_RUN_RUNNING", {"open_orders": len(run["orders"]), "deployment_completeness": completeness})
             self._save(state)
             return {"ok": True, "run": deepcopy(run)}
         except Exception:
@@ -1951,6 +2096,9 @@ class DurableGridBotLifecycle:
                 "verification_failed",
                 {"errors": errors, "unresolved_orders": unresolved, "position_mismatches": mismatches, "reconciliation": verified["reconciliation"]},
             )
+        completeness = self._assert_deployment_complete(state, run, verified["reconciliation"], "RESUME")
+        if not completeness["complete"]:
+            return self._resume_blocked(state, run, "deployment_incomplete", {"deployment_completeness": completeness, "reconciliation": verified["reconciliation"]})
         now = utc_now()
         run["status"] = GridStatus.RUNNING.value
         run["status_updated_at"] = now
@@ -1963,6 +2111,7 @@ class DurableGridBotLifecycle:
                 "open_gridbot_orders": verified["open_gridbot_orders"],
                 "gridbot_inventory": verified["reconciliation"].get("gridbot_inventory"),
                 "delta_position": verified["position"],
+                "deployment_completeness": completeness,
             },
         )
         self._save(state)
@@ -2148,10 +2297,13 @@ class DurableGridBotLifecycle:
 
         if run.get("status") != GridStatus.EDITING.value:
             now = utc_now()
+            edit_digest = hashlib.sha256(json.dumps(_config_fingerprint(new_config), separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+            edit_operation_id = f"edit-{run['run_id']}-{old_config.get('config_version')}-{new_config.get('config_version')}-{edit_digest}"
             run["status"] = GridStatus.EDITING.value
             run["status_updated_at"] = now
             run["updated_at"] = now
             run["edit_state"] = {
+                "operation_id": edit_operation_id,
                 "previous_status": previous_status,
                 "from_config_version": int(old_config.get("config_version") or 1),
                 "to_config_version": int(new_config.get("config_version") or 1),
@@ -2159,14 +2311,32 @@ class DurableGridBotLifecycle:
                 "stage": "FREEZE_PLACEMENT",
                 "reason": reason,
                 "started_at": utc_now(),
+                "source_config": old_config,
                 "target_config": new_config,
+                "config_persisted": False,
             }
-            self._event(state, run["run_id"], "GRID_RUN_EDITING", {"previous_status": previous_status, "to_config_version": new_config["config_version"], "reason": reason})
+            self._event(
+                state,
+                run["run_id"],
+                "GRID_RUN_EDITING",
+                {
+                    "operation_id": edit_operation_id,
+                    "previous_status": previous_status,
+                    "from_config_version": int(old_config.get("config_version") or 1),
+                    "to_config_version": new_config["config_version"],
+                    "reason": reason,
+                    "source_config": old_config,
+                    "target_config": new_config,
+                },
+            )
             self._save(state)
             state = self._load()
             run = state["runs"][run["run_id"]]
         else:
-            new_config = (run.get("edit_state") or {}).get("target_config") or new_config
+            edit_state = run.get("edit_state") or {}
+            previous_status = edit_state.get("previous_status") or previous_status
+            old_config = deepcopy(edit_state.get("source_config") or old_config)
+            new_config = edit_state.get("target_config") or new_config
 
         reconciliation_result = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=False, log_reconcile_event=False)
         state = self._load()
@@ -2202,65 +2372,71 @@ class DurableGridBotLifecycle:
         if latest and latest.get("status") == GridStatus.STOPPING.value:
             return self.stop(run["run_id"], reason="stop_preempted_edit")
         run = latest or run
-        old_config = deepcopy(run.get("config") or old_config)
-        new_config["effective_from"] = utc_now()
-        new_config_obj = GridConfig(
-            bot_id=new_config["bot_id"],
-            config_version=int(new_config["config_version"]),
-            bot_name=new_config["bot_name"],
-            product_symbol=new_config["product_symbol"],
-            grid_type=GridType(new_config["grid_type"]),
-            lower_price=_decimal(new_config["lower_price"]),
-            upper_price=_decimal(new_config["upper_price"]),
-            grid_count=int(new_config["grid_count"]),
-            spacing_type=SpacingType(new_config["spacing_type"]),
-            lot_size=_decimal(new_config["lot_size"]),
-            max_inventory_lots=_decimal(new_config["max_inventory_lots"]),
-            allocated_capital=_decimal(new_config["allocated_capital"]),
-            risk_capital=_decimal(new_config["risk_capital"]),
-            risk_thresholds=new_config.get("risk_thresholds") or DEFAULT_RISK_THRESHOLDS,
-        )
-        run["config_history"] = run.get("config_history", []) + [old_config]
-        run["config"] = {**to_record_dict(new_config_obj), "effective_from": new_config["effective_from"]}
-        run["levels"] = to_record_dict(build_grid_levels(new_config_obj, reference, spec.tick_size))
-        run["reference_price"] = str(reference)
-        if self._db_enabled():
-            self.db.retire_config(run["run_id"], int(old_config["config_version"]))
-            self.db.persist_config(run, reason="edit_grid")
-            self.db.persist_levels(run)
-            decision_context = _edit_decision_context(
-                run=run,
-                old_config=old_config,
-                new_config=run["config"],
-                reason=reason,
-                reference=reference,
-                reconciliation=reconciliation,
-                account_risk_state=account_risk_state,
-                cancelled_orders=cancelled,
-                deferred_superseded=deferred_superseded,
-                expected_create=len(run["levels"]) if previous_status == GridStatus.RUNNING.value else 0,
-                previous_status=previous_status,
+        edit_state = run.get("edit_state") or {}
+        old_config = deepcopy(edit_state.get("source_config") or old_config)
+        config_already_persisted = bool(edit_state.get("config_persisted")) and int((run.get("config") or {}).get("config_version") or 0) == int(new_config["config_version"])
+        if not config_already_persisted:
+            new_config["effective_from"] = utc_now()
+            new_config_obj = GridConfig(
+                bot_id=new_config["bot_id"],
+                config_version=int(new_config["config_version"]),
+                bot_name=new_config["bot_name"],
+                product_symbol=new_config["product_symbol"],
+                grid_type=GridType(new_config["grid_type"]),
+                lower_price=_decimal(new_config["lower_price"]),
+                upper_price=_decimal(new_config["upper_price"]),
+                grid_count=int(new_config["grid_count"]),
+                spacing_type=SpacingType(new_config["spacing_type"]),
+                lot_size=_decimal(new_config["lot_size"]),
+                max_inventory_lots=_decimal(new_config["max_inventory_lots"]),
+                allocated_capital=_decimal(new_config["allocated_capital"]),
+                risk_capital=_decimal(new_config["risk_capital"]),
+                risk_thresholds=new_config.get("risk_thresholds") or DEFAULT_RISK_THRESHOLDS,
             )
-            self.db.insert_once(
-                "grid_parameter_changes",
-                {
-                    "change_id": new_id("chg"),
-                    "run_id": run["run_id"],
-                    "bot_id": run["bot_id"],
-                    "from_config_version": int(old_config["config_version"]),
-                    "to_config_version": int(run["config"]["config_version"]),
-                    "reason": reason,
-                    "payload": {
-                        "old_config": old_config,
-                        "new_config": run["config"],
-                        "cancelled_orders": cancelled,
-                        "deferred_superseded": deferred_superseded,
-                        "decision_context": decision_context,
+            if not any(int(item.get("config_version") or 0) == int(old_config["config_version"]) for item in run.get("config_history", [])):
+                run["config_history"] = run.get("config_history", []) + [old_config]
+            run["config"] = {**to_record_dict(new_config_obj), "effective_from": new_config["effective_from"]}
+            run["levels"] = to_record_dict(build_grid_levels(new_config_obj, reference, spec.tick_size))
+            run["reference_price"] = str(reference)
+            run["edit_state"] = {**edit_state, "config_persisted": True, "stage": "CONFIG_PERSISTED", "persisted_at": utc_now()}
+            if self._db_enabled():
+                self.db.retire_config(run["run_id"], int(old_config["config_version"]))
+                self.db.persist_config(run, reason="edit_grid")
+                self.db.persist_levels(run)
+                decision_context = _edit_decision_context(
+                    run=run,
+                    old_config=old_config,
+                    new_config=run["config"],
+                    reason=reason,
+                    reference=reference,
+                    reconciliation=reconciliation,
+                    account_risk_state=account_risk_state,
+                    cancelled_orders=cancelled,
+                    deferred_superseded=deferred_superseded,
+                    expected_create=len(run["levels"]) if previous_status == GridStatus.RUNNING.value else 0,
+                    previous_status=previous_status,
+                )
+                self.db.insert_once(
+                    "grid_parameter_changes",
+                    {
+                        "change_id": new_id("chg"),
+                        "run_id": run["run_id"],
+                        "bot_id": run["bot_id"],
+                        "from_config_version": int(old_config["config_version"]),
+                        "to_config_version": int(run["config"]["config_version"]),
+                        "reason": reason,
+                        "payload": {
+                            "operation_id": run["edit_state"].get("operation_id"),
+                            "old_config": old_config,
+                            "new_config": run["config"],
+                            "cancelled_orders": cancelled,
+                            "deferred_superseded": deferred_superseded,
+                            "decision_context": decision_context,
+                        },
+                        "created_at": utc_now(),
                     },
-                    "created_at": utc_now(),
-                },
-                on_conflict="change_id",
-            )
+                    on_conflict="change_id",
+                )
 
         created = deferred = 0
         inventory = _decimal(reconciliation.get("gridbot_inventory"))
@@ -2304,6 +2480,9 @@ class DurableGridBotLifecycle:
             return self._safe_pause_for_external_position_change(state, run, verified["reconciliation"], reason="edit_verification", previous_status=previous_status)
         if verified["reconciliation"].get("errors") or int(verified["reconciliation"].get("unresolved_orders") or 0) or int(verified["reconciliation"].get("fill_ledger_mismatches") or 0):
             return self._editing_blocked(state, run, "verification_failed", {"reconciliation": verified["reconciliation"]})
+        completeness = self._assert_deployment_complete(state, run, verified["reconciliation"], "EDIT") if previous_status == GridStatus.RUNNING.value else None
+        if completeness and not completeness["complete"]:
+            return self._editing_blocked(state, run, "deployment_incomplete", {"deployment_completeness": completeness, "reconciliation": verified["reconciliation"]})
         now = utc_now()
         run["status"] = GridStatus.RUNNING.value if previous_status == GridStatus.RUNNING.value else GridStatus.PAUSED.value
         run["status_updated_at"] = now
@@ -2330,6 +2509,7 @@ class DurableGridBotLifecycle:
                 "deferred_orders": deferred,
                 "cancelled_orders": cancelled,
                 "gridbot_inventory": verified["reconciliation"].get("gridbot_inventory"),
+                "deployment_completeness": completeness,
             },
         )
         self._save(state)

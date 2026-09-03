@@ -14,7 +14,7 @@ from grid_bot.execution import make_client_order_id
 from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
 from grid_bot.health import HealthIssueTracker, evaluate_gridbot_health
 from grid_bot.grid_builder import build_grid_levels, generate_prices, nearest_valid_neutral_range, neutral_grid_balance
-from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType
+from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType, utc_now
 from grid_bot.reconciliation import reconcile_orders
 from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
@@ -1906,7 +1906,7 @@ def test_operator_background_start_returns_starting_then_reaches_running(tmp_pat
     assert status["startup"]["orders_submitted"] == 4
 
 
-def test_starting_restart_recovery_promotes_existing_exchange_exposure(tmp_path):
+def test_starting_restart_recovery_completes_existing_exchange_exposure_before_running(tmp_path):
     client = _FakeLifecycleClient()
     path = tmp_path / "grid_state.json"
     lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
@@ -1949,7 +1949,9 @@ def test_starting_restart_recovery_promotes_existing_exchange_exposure(tmp_path)
     assert recovered["run"]["status"] == GridStatus.RUNNING.value
     assert recovered["run"]["fills"]
     assert recovered["run"]["orders"][proposal.client_order_id]["status"] == "filled"
-    assert len(client.orders) == 1
+    assert recovered["run"]["deployment_completeness"]["complete"] is True
+    assert len(client.orders) == 4
+    assert len({order["client_order_id"] for order in client.orders}) == len(client.orders)
 
 
 def test_starting_delta_auth_failure_retains_active_run_and_lock(tmp_path):
@@ -2032,8 +2034,84 @@ def test_ambiguous_submission_is_adopted_without_duplicate_order(tmp_path):
     recovered = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
 
     assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert recovered["run"]["deployment_completeness"]["complete"] is True
     assert len({order["client_order_id"] for order in client.orders}) == len(client.orders)
-    assert len(client.orders) == 1
+    assert len(client.orders) == 4
+
+
+def test_one_sided_neutral_partial_start_cannot_become_running_or_healthy(tmp_path):
+    class SellSideUnavailableClient(_FakeLifecycleClient):
+        def place_order(self, payload):
+            if payload["side"] == "sell":
+                raise RuntimeError("400 Client Error: Bad Request for url: https://testnet/orders")
+            return super().place_order(payload)
+
+    client = SellSideUnavailableClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+
+    result = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+    run = result["run"]
+    health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"exchange_open_orders": len(client.open_orders(1699)["result"])})
+
+    assert result["ok"] is False
+    assert run["status"] == GridStatus.STARTING.value
+    assert run["startup"]["start_stage"] == "TRUTH_UNAVAILABLE"
+    assert {order["side"] for order in client.orders if order["state"] == "open"} == {"buy"}
+    assert health["overall_status"] != "HEALTHY"
+    assert "LIFECYCLE_RECOVERY_REQUIRED" in {issue["code"] for issue in health["active_issues"]}
+
+
+def test_running_incomplete_deployment_is_not_healthy(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    state = lifecycle._load()
+    run = state["runs"][begun["run"]["run_id"]]
+    run["status"] = GridStatus.RUNNING.value
+    run["deployment_completeness"] = {
+        "complete": False,
+        "expected": 4,
+        "confirmed_open": 1,
+        "filled": 0,
+        "deferred": 0,
+        "ambiguous": 0,
+        "missing": 3,
+        "reasons": ["MISSING_INTENDED_ORDERS", "NEUTRAL_DEPLOYMENT_ONE_SIDED"],
+    }
+
+    health = evaluate_gridbot_health(
+        {"running": True, "thread_alive": True, "last_successful_poll_at": utc_now(), "last_successful_reconcile": utc_now()},
+        run,
+        {"exchange_open_orders": 1, "gridbot_inventory": "0", "delta_position": "0"},
+    )
+
+    assert health["overall_status"] != "HEALTHY"
+    assert "GRID_DEPLOYMENT_INCOMPLETE" in {issue["code"] for issue in health["active_issues"]}
 
 
 def test_operator_grid_start_does_not_resurrect_run_when_stop_races_placement(tmp_path):
@@ -3062,6 +3140,39 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
         raise AssertionError(method)
 
 
+def test_edit_retry_after_config_persist_does_not_create_duplicate_parameter_change(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="repeat_edit")
+    changes_before = list(db.tables.get("grid_parameter_changes", {}).values())
+    assert len(changes_before) == 1
+
+    state = lifecycle._load()
+    stored = state["runs"][run["run_id"]]
+    stored["status"] = GridStatus.EDITING.value
+    stored["edit_state"] = {
+        **(stored.get("edit_state") or {}),
+        "previous_status": GridStatus.RUNNING.value,
+        "source_config": changes_before[0]["payload"]["old_config"],
+        "target_config": stored["config"],
+        "from_config_version": 1,
+        "to_config_version": 2,
+        "config_persisted": True,
+        "stage": "CONFIG_PERSISTED",
+    }
+    lifecycle._save(state)
+
+    retried = DurableGridBotLifecycle(client, lifecycle.state_path, db=db, use_supabase=True).edit_grid(run["run_id"], {"grid_count": 6}, reason="repeat_edit")
+    changes_after = list(db.tables.get("grid_parameter_changes", {}).values())
+
+    assert retried["run"]["status"] in {GridStatus.RUNNING.value, GridStatus.PAUSED.value}
+    assert len(changes_after) == 1
+    assert not [row for row in changes_after if row["from_config_version"] == 2 and row["to_config_version"] == 2]
+    assert int(retried["run"]["config"]["config_version"]) == 2
+
+
 def test_continuous_worker_no_change_polls_do_not_write_per_loop(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
@@ -3623,6 +3734,13 @@ def test_supabase_recovery_without_json_preserves_run_and_orders(tmp_path):
     assert all("projected_inventory_if_filled" in order for order in recovered["orders"].values())
     assert all("reserved_long_after" in order for order in recovered["orders"].values())
     assert all("reserved_short_after" in order for order in recovered["orders"].values())
+    completeness = recovered["deployment_completeness"]
+    assert completeness["complete"] is True
+    assert completeness["expected"] == len(recovered["levels"])
+    assert completeness["confirmed_open"] == len(order_ids)
+    assert completeness["missing"] == 0
+    assert completeness["source"] == "supabase_reconstruction"
+    assert recovered["lifecycle_progress"]["confirmed_orders"] == len(order_ids)
     assert len(client.open_orders()["result"]) == len(order_ids)
 
 

@@ -41,6 +41,8 @@ HEALTH_MESSAGES = {
     "GRID_ORDER_ORPHAN": "An exchange order appears to belong to the bot but is not in bot records.",
     "GRID_ORDER_MISSING_UNEXPECTEDLY": "A bot order expected on Delta is missing.",
     "GRID_ORDER_UNRESOLVED": "A bot order cannot be verified on Delta.",
+    "GRID_DEPLOYMENT_INCOMPLETE": "The deployed grid is incomplete.",
+    "LIFECYCLE_RECOVERY_REQUIRED": "The bot needs lifecycle recovery before normal trading can continue.",
     "DUPLICATE_ORDER": "Duplicate bot order identity detected.",
     "DUPLICATE_FILL_IGNORED": "A duplicate fill was safely ignored.",
     "MISSING_REPLACEMENT": "A filled order has not been replaced yet.",

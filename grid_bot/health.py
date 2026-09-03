@@ -33,7 +33,9 @@ ATTENTION_CODES = {
     "GRID_ORDER_ORPHAN",
     "GRID_ORDER_MISSING_UNEXPECTEDLY",
     "GRID_ORDER_UNRESOLVED",
+    "GRID_DEPLOYMENT_INCOMPLETE",
     "LIFECYCLE_STUCK",
+    "LIFECYCLE_RECOVERY_REQUIRED",
     "MISSING_REPLACEMENT",
     "POSITION_MISMATCH",
     "RESERVATION_MISMATCH",
@@ -278,6 +280,20 @@ def evaluate_gridbot_health(
         issues.append(_issue("SUBMITTED_ORDER_UNRESOLVED", HealthSeverity.CRITICAL, "Submitted GridBot orders have no exchange order id yet.", run_for_issue, orders=unresolved_submissions[:10]))
     if status == GridStatus.PAUSED.value and open_orders:
         issues.append(_issue("PAUSED_WITH_RESTING_ORDERS", HealthSeverity.CRITICAL, "PAUSED run still has GridBot resting orders.", run_for_issue, open_orders=len(open_orders)))
+    completeness = (run or {}).get("deployment_completeness") or state.get("deployment_completeness") or {}
+    if status == GridStatus.RUNNING.value and completeness and completeness.get("complete") is False:
+        issues.append(
+            _issue(
+                "GRID_DEPLOYMENT_INCOMPLETE",
+                HealthSeverity.CRITICAL,
+                "RUNNING deployment is incomplete or not fully accounted for.",
+                run_for_issue,
+                **{k: v for k, v in completeness.items() if k != "level_states"},
+            )
+        )
+    recovery_required = bool((run or {}).get("resume_diagnostics") or (run or {}).get("edit_diagnostics") or status in {GridStatus.STARTING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value})
+    if recovery_required and status in {GridStatus.PAUSED.value, GridStatus.STARTING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value}:
+        issues.append(_issue("LIFECYCLE_RECOVERY_REQUIRED", HealthSeverity.CRITICAL, "Lifecycle completion has not been proven; grid execution is frozen or in progress.", run_for_issue, lifecycle_state=status))
     if status == GridStatus.STOPPED.value and (open_orders or position != 0 or inventory != 0):
         issues.append(_issue("STOPPED_WITH_EXPOSURE", HealthSeverity.CRITICAL, "STOPPED run still has open orders or attributable inventory.", run_for_issue, open_orders=len(open_orders), delta_position=str(position), gridbot_inventory=str(inventory)))
     if status == GridStatus.STOP_REQUIRES_ATTENTION.value:

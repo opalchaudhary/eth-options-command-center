@@ -13,6 +13,10 @@ from .models import new_id, utc_now
 
 ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "EDITING", "REGRID_PENDING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
 SNAPSHOT_DEDUPE_SECONDS = int(os.getenv("GRIDBOT_V01_SNAPSHOT_DEDUPE_SECONDS", "60"))
+DEPLOYMENT_OPEN_STATUSES = {"open", "partially_filled"}
+DEPLOYMENT_VALID_STATUSES = {"confirmed_open", "filled", "deferred"}
+DEPLOYMENT_UNRESOLVED_STATUSES = {"submit_pending", "cancel_pending", "unknown", "unresolved", "ambiguous", "replace_pending"}
+DEPLOYMENT_DEFERRED_STATUSES = {"deferred", "blocked"}
 
 
 class SupabasePersistenceError(RuntimeError):
@@ -68,6 +72,75 @@ def _snapshot_dedupe_signature(row: dict | None) -> tuple:
         str((row or {}).get("open_orders") if (row or {}).get("open_orders") is not None else metrics.get("open_gridbot_orders")),
         ((row or {}).get("payload") or {}).get("run", {}).get("status") if isinstance((row or {}).get("payload"), dict) else None,
     )
+
+
+def _reconstructed_deployment_completeness(config: dict, levels: list[dict], orders: list[dict]) -> dict:
+    config_version = int(config.get("config_version") or 1)
+    current_orders = [
+        order
+        for order in orders
+        if int(order.get("config_version") or config_version) == config_version and order.get("order_kind") != "safety_flatten"
+    ]
+    by_level: dict[str, list[dict]] = {}
+    for order in current_orders:
+        by_level.setdefault(str(order.get("level_id") or ""), []).append(order)
+    counts = {
+        "expected": len(levels),
+        "eligible": len(levels),
+        "confirmed_open": 0,
+        "filled": 0,
+        "deferred": 0,
+        "terminal": 0,
+        "ambiguous": 0,
+        "missing": 0,
+    }
+    level_states = []
+    buy_valid = sell_valid = 0
+    reasons = []
+    for level in levels:
+        level_id = str(level.get("level_id") or "")
+        side = str(level.get("side") or "")
+        level_orders = by_level.get(level_id) or []
+        status = "missing"
+        if level_orders:
+            statuses = {str(order.get("status") or "").lower() for order in level_orders}
+            if statuses & DEPLOYMENT_UNRESOLVED_STATUSES:
+                status = "ambiguous"
+            elif statuses & DEPLOYMENT_OPEN_STATUSES:
+                status = "confirmed_open"
+            elif "filled" in statuses:
+                status = "filled"
+            elif statuses & DEPLOYMENT_DEFERRED_STATUSES:
+                status = "deferred"
+            else:
+                status = "terminal"
+        counts[status] += 1
+        if status in DEPLOYMENT_VALID_STATUSES:
+            if side == "buy":
+                buy_valid += 1
+            elif side == "sell":
+                sell_valid += 1
+        level_states.append({"level_id": level_id, "side": side, "status": status})
+    if counts["missing"]:
+        reasons.append("MISSING_INTENDED_ORDERS")
+    if counts["ambiguous"]:
+        reasons.append("AMBIGUOUS_SUBMISSIONS")
+    if counts["terminal"]:
+        reasons.append("TERMINAL_INTENDED_ORDERS")
+    expected_sides = {str(level.get("side") or "") for level in levels}
+    if config.get("grid_type") == "neutral" and {"buy", "sell"}.issubset(expected_sides):
+        if buy_valid == 0 or sell_valid == 0:
+            reasons.append("NEUTRAL_DEPLOYMENT_ONE_SIDED")
+    return {
+        **counts,
+        "complete": not reasons,
+        "reasons": reasons,
+        "buy_accounted": buy_valid,
+        "sell_accounted": sell_valid,
+        "level_states": level_states,
+        "checked_at": utc_now(),
+        "source": "supabase_reconstruction",
+    }
 
 
 class SupabaseGridRepository:
@@ -978,6 +1051,14 @@ class SupabaseGridRepository:
             ),
             None,
         )
+        latest_editing = next(
+            (
+                row
+                for row in event_rows
+                if row.get("event_type") == "GRID_RUN_EDITING"
+            ),
+            None,
+        )
         product_id = bot.get("product_id") or 1699
         startup_stage = latest_stage or ("RUNNING" if run_row.get("status") == "RUNNING" else run_row.get("status"))
         startup = {
@@ -1058,6 +1139,20 @@ class SupabaseGridRepository:
             "start_stage": startup_stage,
             "startup": startup,
         }
+        deployment_completeness = _reconstructed_deployment_completeness(config, run_state["levels"], orders)
+        run_state["deployment_completeness"] = deployment_completeness
+        run_state["lifecycle_progress"] = {
+            "operation": run_row.get("status"),
+            "stage": "RECONSTRUCTED_FROM_PERSISTED_STATE",
+            "started_at": run_row.get("started_at"),
+            "last_progress_at": run_row.get("updated_at"),
+            "expected_orders": deployment_completeness.get("expected", 0),
+            "confirmed_orders": deployment_completeness.get("confirmed_open", 0),
+            "filled_orders": deployment_completeness.get("filled", 0),
+            "deferred_orders": deployment_completeness.get("deferred", 0),
+            "ambiguous_orders": deployment_completeness.get("ambiguous", 0),
+            "missing_orders": deployment_completeness.get("missing", 0),
+        }
         if latest_external_adjustment:
             run_state["external_position_adjustment"] = latest_external_adjustment
             run_state["external_position_resolution"] = {
@@ -1071,6 +1166,40 @@ class SupabaseGridRepository:
                 "accounting_status": "PARTIAL",
                 "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
             }
+        if run_row.get("status") == "EDITING":
+            change_rows = self.select(
+                "grid_parameter_changes",
+                {"select": "*", "run_id": f"eq.{run_id}", "to_config_version": f"eq.{config.get('config_version')}", "order": "created_at.desc", "limit": 1},
+            )
+            if change_rows:
+                change = change_rows[0]
+                payload = change.get("payload") or {}
+                run_state["edit_state"] = {
+                    "operation_id": payload.get("operation_id"),
+                    "previous_status": "RUNNING",
+                    "from_config_version": change.get("from_config_version"),
+                    "to_config_version": change.get("to_config_version"),
+                    "source_config": payload.get("old_config") or {},
+                    "target_config": payload.get("new_config") or config,
+                    "stage": "CONFIG_PERSISTED",
+                    "reason": change.get("reason"),
+                    "started_at": change.get("created_at"),
+                    "config_persisted": True,
+                }
+            elif latest_editing:
+                payload = latest_editing.get("payload") or {}
+                run_state["edit_state"] = {
+                    "operation_id": payload.get("operation_id"),
+                    "previous_status": payload.get("previous_status") or "RUNNING",
+                    "from_config_version": payload.get("from_config_version"),
+                    "to_config_version": payload.get("to_config_version"),
+                    "source_config": payload.get("source_config") or {},
+                    "target_config": payload.get("target_config") or config,
+                    "stage": "FREEZE_PLACEMENT",
+                    "reason": payload.get("reason"),
+                    "started_at": latest_editing.get("created_at"),
+                    "config_persisted": False,
+                }
         return run_state
 
     def status_payload(self) -> dict:
