@@ -6,6 +6,7 @@ import threading
 import time
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ ACTIVE_STATUSES = {
     GridStatus.STOP_REQUIRES_ATTENTION.value,
 }
 GRIDBOT_ORDER_PREFIX = "DGB01-"
+LIFECYCLE_RETRY_ATTEMPTS = int(os.getenv("GRIDBOT_V01_LIFECYCLE_RETRY_ATTEMPTS", "3"))
+LIFECYCLE_RETRY_BACKOFF_SECONDS = float(os.getenv("GRIDBOT_V01_LIFECYCLE_RETRY_BACKOFF_SECONDS", "1"))
 DEFAULT_STATE_PATH = Path(os.getenv("GRIDBOT_V01_STATE_PATH", "grid_bot_state_v01.json"))
 START_TERMINAL_ORDER_STATUSES = {
     "cancelled",
@@ -360,6 +363,7 @@ class DurableGridBotLifecycle:
         run["start_stage"] = stage
         run["last_startup_progress_at"] = utc_now()
         run["startup"] = self._startup_progress(run, stage)
+        self._update_lifecycle_progress(run, "START", stage, message=f"Starting Grid: {stage.replace('_', ' ').title()}")
         self._event(state, run["run_id"], "GRID_RUN_START_STAGE", {"start_stage": stage, **(payload or {})})
         self._save(state)
 
@@ -368,6 +372,14 @@ class DurableGridBotLifecycle:
         run["start_stage"] = stage
         run["last_error"] = error or run.get("last_error")
         run["startup"] = self._startup_progress(run, stage, run.get("last_error"))
+        self._update_lifecycle_progress(
+            run,
+            "START",
+            stage,
+            payload.get("deployment_completeness") if payload else None,
+            message="Waiting for Delta verification" if stage in {"TRUTH_UNAVAILABLE", "DEPLOYMENT_INCOMPLETE"} else f"Starting Grid: {stage.replace('_', ' ').title()}",
+            stall_message=error,
+        )
         self._event(state, run["run_id"], "GRID_RUN_START_RECOVERY_BLOCKED", {"start_stage": stage, **(payload or {})})
         self._save(state, include_children=False)
         return {"ok": False, "run": deepcopy(run), **self._startup_progress(run)}
@@ -453,15 +465,25 @@ class DurableGridBotLifecycle:
             "checked_at": utc_now(),
         }
 
-    def _update_lifecycle_progress(self, run: dict, operation: str, stage: str, completeness: dict | None = None) -> None:
+    def _update_lifecycle_progress(self, run: dict, operation: str, stage: str, completeness: dict | None = None, **metrics) -> None:
         now = utc_now()
         progress = run.setdefault("lifecycle_progress", {})
+        started_at = progress.get("started_at") if progress.get("operation") == operation else None
+        started_at = started_at or now
+        try:
+            elapsed = (
+                datetime.fromisoformat(now).astimezone(timezone.utc)
+                - datetime.fromisoformat(str(started_at).replace("Z", "+00:00")).astimezone(timezone.utc)
+            ).total_seconds()
+        except Exception:
+            elapsed = None
         progress.update(
             {
                 "operation": operation,
                 "stage": stage,
-                "started_at": progress.get("started_at") or now,
+                "started_at": started_at,
                 "last_progress_at": now,
+                "elapsed_seconds": elapsed,
             }
         )
         if completeness:
@@ -475,6 +497,37 @@ class DurableGridBotLifecycle:
                     "missing_orders": completeness.get("missing", 0),
                 }
             )
+        if metrics:
+            progress.update({key: value for key, value in metrics.items() if value is not None})
+
+    def _retry_stats(self, run: dict) -> dict:
+        stats = run.setdefault(
+            "lifecycle_retry",
+            {"attempts": 0, "backoff_seconds": 0.0, "last_reason": None, "last_progress_at": None},
+        )
+        stats["attempts"] = int(stats.get("attempts") or 0)
+        stats["backoff_seconds"] = float(stats.get("backoff_seconds") or 0.0)
+        return stats
+
+    def _record_lifecycle_retry(self, run: dict, reason: str, wait_seconds: float) -> None:
+        stats = self._retry_stats(run)
+        stats["attempts"] += 1
+        stats["backoff_seconds"] = round(stats["backoff_seconds"] + wait_seconds, 3)
+        stats["last_reason"] = reason[:300]
+        stats["last_progress_at"] = utc_now()
+        progress = run.setdefault("lifecycle_progress", {})
+        progress["retry_attempts"] = stats["attempts"]
+        progress["retry_wait_seconds"] = stats["backoff_seconds"]
+        progress["stall_message"] = "Retrying temporary exchange error"
+
+    def _is_temporary_exchange_error(self, exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+        text = str(exc).lower()
+        temporary_markers = ("timeout", "timed out", "429", "too many", "temporar", "connection", "network", "502", "503", "504")
+        return any(marker in text for marker in temporary_markers)
 
     def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
         completeness = self._deployment_completeness(run, reconciliation)
@@ -739,7 +792,7 @@ class DurableGridBotLifecycle:
         try:
             for level in levels:
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
-                self._place_proposal(run, spec.product_id, proposal, "initial_grid")
+                self._place_proposal(run, spec.product_id, proposal, "initial_grid", current_inventory=Decimal("0"), product_spec=spec, verify_existing_before_submit=False)
             self._save(state)
             reconciled = self.reconcile(run_id, persist_snapshot=False)
             state = self._load()
@@ -823,8 +876,10 @@ class DurableGridBotLifecycle:
             return recovered
         state = self._load()
         run = state.get("runs", {}).get(run_id)
+        spec = self.client.product_spec((run.get("product") or {}).get("symbol") or (run.get("config") or {}).get("product_symbol") or "ETHUSD")
         self._set_start_stage(state, run, "PLACING_ORDERS")
         try:
+            placed = 0
             for level in run.get("levels") or []:
                 state = self._load()
                 run = state.get("runs", {}).get(run_id)
@@ -838,7 +893,8 @@ class DurableGridBotLifecycle:
                 if existing:
                     continue
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
-                created = self._place_proposal(run, product_id, proposal, "initial_grid")
+                created = self._place_proposal(run, product_id, proposal, "initial_grid", current_inventory=Decimal("0"), product_spec=spec, verify_existing_before_submit=False)
+                placed += 1
                 latest_state = self._load()
                 latest_run = latest_state.get("runs", {}).get(run_id)
                 if not latest_run or latest_run.get("status") != GridStatus.STARTING.value:
@@ -850,6 +906,17 @@ class DurableGridBotLifecycle:
                         self._save(latest_state)
                     return {"ok": True, "run": deepcopy(latest_run or {}), **self._startup_progress(latest_run or {})}
                 run["startup"] = self._startup_progress(run, "PLACING_ORDERS")
+                self._update_lifecycle_progress(
+                    run,
+                    "START",
+                    "PLACING_ORDERS",
+                    message=f"Starting Grid: {run['startup']['orders_verified']} / {run['startup']['orders_expected']} orders submitted",
+                    placed_orders=placed,
+                    expected_orders=run["startup"]["orders_expected"],
+                    confirmed_orders=run["startup"]["orders_verified"],
+                    retry_attempts=(run.get("lifecycle_retry") or {}).get("attempts", 0),
+                    retry_wait_seconds=(run.get("lifecycle_retry") or {}).get("backoff_seconds", 0),
+                )
                 self._save(state)
             state = self._load()
             run = state.get("runs", {}).get(run_id)
@@ -998,6 +1065,23 @@ class DurableGridBotLifecycle:
         run["status"] = status.value
         run["status_updated_at"] = now
         run["updated_at"] = now
+        operation = {
+            GridStatus.PAUSING: "PAUSE",
+            GridStatus.RESUMING: "RESUME",
+            GridStatus.EDITING: "EDIT",
+            GridStatus.STOPPING: "STOP",
+            GridStatus.RUNNING: "RUNNING",
+            GridStatus.PAUSED: "PAUSE",
+        }.get(status, status.value)
+        message = {
+            GridStatus.PAUSING: "Pausing Grid: cancelling resting orders",
+            GridStatus.RESUMING: "Resuming Grid: reconciling exchange truth",
+            GridStatus.EDITING: "Editing Grid: reconciling exchange truth",
+            GridStatus.STOPPING: "Stopping Grid: cancelling resting orders",
+            GridStatus.RUNNING: "Grid running",
+            GridStatus.PAUSED: "Grid paused",
+        }.get(status, status.value)
+        self._update_lifecycle_progress(run, operation, status.value, message=message)
         self._event(state, run["run_id"], event_type, payload or {})
         self._save(state)
 
@@ -1032,6 +1116,14 @@ class DurableGridBotLifecycle:
             "updated_at": now,
             **diagnostics,
         }
+        self._update_lifecycle_progress(
+            run,
+            "STOP",
+            "REQUIRES_ATTENTION",
+            message="Stopping Grid: operator attention required",
+            stall_message=diagnostics.get("reason") or reason,
+            waiting_orders=diagnostics.get("open_gridbot_orders") or diagnostics.get("unresolved_orders"),
+        )
         self._event(state, run["run_id"], "GRID_RUN_STOP_REQUIRES_ATTENTION", run["stop_diagnostics"])
         self._save(state)
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["stop_diagnostics"])}
@@ -1345,6 +1437,14 @@ class DurableGridBotLifecycle:
         run["status_updated_at"] = now
         run["updated_at"] = now
         run["resume_diagnostics"] = {"reason": reason, "updated_at": now, **diagnostics}
+        self._update_lifecycle_progress(
+            run,
+            "RESUME",
+            "REQUIRES_ATTENTION",
+            diagnostics.get("deployment_completeness") if diagnostics else None,
+            message="Resuming Grid: operator attention required",
+            stall_message=reason,
+        )
         self._event(state, run["run_id"], "GRID_RUN_RESUME_BLOCKED", run["resume_diagnostics"])
         self._save(state)
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["resume_diagnostics"])}
@@ -1358,8 +1458,10 @@ class DurableGridBotLifecycle:
         *,
         current_inventory: Decimal | None = None,
         source_fill_id: str | None = None,
+        product_spec=None,
+        verify_existing_before_submit: bool = True,
     ) -> dict:
-        spec = self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
+        spec = product_spec or self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
         position = current_inventory if current_inventory is not None else _position_size(self.client, product_id)
         normalized_price = round_price_for_side(proposal.price, spec.tick_size, proposal.side)
         semantic = evaluate_order_semantics(
@@ -1393,11 +1495,27 @@ class DurableGridBotLifecycle:
             )
         if self._db_enabled():
             self.db.persist_order_proposal(run, proposal, order_kind, source_fill_id)
-        exchange_order = _find_exchange_order_by_client_id(self.client, product_id, proposal.client_order_id)
-        if not exchange_order:
+        response = {}
+        exchange_order = None
+        last_error = None
+        for attempt in range(1, max(1, LIFECYCLE_RETRY_ATTEMPTS) + 1):
+            if verify_existing_before_submit or attempt > 1:
+                exchange_order = _find_exchange_order_by_client_id(self.client, product_id, proposal.client_order_id)
+                if exchange_order:
+                    break
             try:
                 response = self.client.place_order(order_payload(product_id, proposal))
-            except Exception:
+                exchange_order = response.get("result") or {}
+                break
+            except Exception as exc:
+                last_error = exc
+                if not self._is_temporary_exchange_error(exc) or attempt >= max(1, LIFECYCLE_RETRY_ATTEMPTS):
+                    break
+                wait_seconds = min(LIFECYCLE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), 8.0)
+                self._record_lifecycle_retry(run, str(exc), wait_seconds)
+                time.sleep(wait_seconds)
+        if not exchange_order:
+            if last_error:
                 record = {
                     "order_key": proposal.client_order_id,
                     "run_id": run["run_id"],
@@ -1424,7 +1542,7 @@ class DurableGridBotLifecycle:
                 run.setdefault("orders", {})[proposal.client_order_id] = record
                 if self._db_enabled():
                     self.db.persist_order(run, record)
-                raise
+                raise last_error
             exchange_order = response.get("result") or {}
         record = {
             "order_key": proposal.client_order_id,
@@ -1498,7 +1616,7 @@ class DurableGridBotLifecycle:
         try:
             for level in levels:
                 proposal = self._proposal_for_level(run_id, level, int(run["sequence"]))
-                self._place_proposal(run, spec.product_id, proposal, "initial_grid")
+                self._place_proposal(run, spec.product_id, proposal, "initial_grid", current_inventory=Decimal("0"), product_spec=spec, verify_existing_before_submit=False)
             self._save(state)
             reconciled = self.reconcile(run_id, persist_snapshot=False)
             state = self._load()
@@ -1994,13 +2112,31 @@ class DurableGridBotLifecycle:
 
         cancelled_attempts = self._cancel_known_gridbot_resting_orders(run, product_id)
         deferred_terminalized = self._terminalize_deferred_for_pause(run)
+        self._update_lifecycle_progress(
+            run,
+            "PAUSE",
+            "CANCELLING_ORDERS",
+            message=f"Pausing Grid: {cancelled_attempts} cancel attempts sent",
+            cancelled_orders=cancelled_attempts,
+            deferred_orders=deferred_terminalized,
+        )
         self._save(state)
 
+        self._update_lifecycle_progress(run, "PAUSE", "VERIFYING_PAUSE", message="Pausing Grid: waiting for Delta verification", cancelled_orders=cancelled_attempts)
+        self._save(state, include_children=False)
         reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
         if reconciled["reconciliation"].get("exchange_open_orders"):
             state = self._load()
             run = state["runs"][run["run_id"]]
             cancelled_attempts += self._cancel_known_gridbot_resting_orders(run, product_id)
+            self._update_lifecycle_progress(
+                run,
+                "PAUSE",
+                "RETRYING_CANCELS",
+                message=f"Pausing Grid: retrying cancels for {reconciled['reconciliation'].get('exchange_open_orders')} open orders",
+                cancelled_orders=cancelled_attempts,
+                waiting_orders=reconciled["reconciliation"].get("exchange_open_orders"),
+            )
             self._save(state)
             reconciled = self.reconcile(run["run_id"], process_replacements=False)
 
@@ -2022,6 +2158,7 @@ class DurableGridBotLifecycle:
         run["status"] = GridStatus.PAUSED.value
         run["status_updated_at"] = now
         run["updated_at"] = now
+        self._update_lifecycle_progress(run, "PAUSE", "PAUSED", message="Grid paused", cancelled_orders=cancelled_attempts, waiting_orders=0)
         self._event(
             state,
             run["run_id"],
@@ -2056,6 +2193,7 @@ class DurableGridBotLifecycle:
             run = state["runs"][run["run_id"]]
 
         product_id = int(run["product"]["product_id"])
+        spec = self.client.product_spec((run.get("product") or {}).get("symbol") or (run.get("config") or {}).get("product_symbol") or "ETHUSD")
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
@@ -2076,11 +2214,23 @@ class DurableGridBotLifecycle:
                 ]
                 if not existing_open:
                     proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                    self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory)
+                    self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
+                    self._update_lifecycle_progress(
+                        run,
+                        "RESUME",
+                        "PLACING_ORDERS",
+                        message="Resuming Grid: placing orders",
+                        expected_orders=len(run.get("levels") or []),
+                        confirmed_orders=len([order for order in run.get("orders", {}).values() if str(order.get("status") or "").lower() in {"open", "partially_filled", "filled"}]),
+                        retry_attempts=(run.get("lifecycle_retry") or {}).get("attempts", 0),
+                        retry_wait_seconds=(run.get("lifecycle_retry") or {}).get("backoff_seconds", 0),
+                    )
         except Exception as exc:
             return self._resume_blocked(state, run, "placement_failed", {"error": str(exc)[:500]})
         self._save(state)
 
+        self._update_lifecycle_progress(run, "RESUME", "VERIFYING_ORDERS", message="Resuming Grid: waiting for Delta verification")
+        self._save(state, include_children=False)
         verified = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
@@ -2269,6 +2419,14 @@ class DurableGridBotLifecycle:
         run["status_updated_at"] = now
         run["updated_at"] = now
         run["edit_diagnostics"] = {"reason": reason, "updated_at": utc_now(), **diagnostics}
+        self._update_lifecycle_progress(
+            run,
+            "EDIT",
+            "REQUIRES_ATTENTION",
+            diagnostics.get("deployment_completeness") if diagnostics else None,
+            message="Editing Grid: operator attention required",
+            stall_message=reason,
+        )
         self._event(state, run["run_id"], "GRID_RUN_EDIT_BLOCKED", run["edit_diagnostics"])
         self._save(state)
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"])}
@@ -2358,12 +2516,20 @@ class DurableGridBotLifecycle:
 
         product_id = int(run["product"]["product_id"])
         cancelled = 0
+        self._update_lifecycle_progress(
+            run,
+            "EDIT",
+            "CANCELLING_OBSOLETE_ORDERS",
+            message="Editing Grid: cancelling obsolete orders",
+            expected_orders=len([order for order in (run.get("orders") or {}).values() if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"]),
+        )
         for order in list((run.get("orders") or {}).values()):
             if order.get("status") in START_TERMINAL_ORDER_STATUSES or order.get("order_kind") == "safety_flatten":
                 continue
             self._cancel_order_safely(product_id, order)
             order["superseded_by_config_version"] = new_config["config_version"]
             cancelled += 1
+            self._update_lifecycle_progress(run, "EDIT", "CANCELLING_OBSOLETE_ORDERS", message=f"Editing Grid: {cancelled} obsolete orders cancelled", cancelled_orders=cancelled)
         deferred_superseded = self._terminalize_never_submitted_orders(run, status="superseded", reason="edit_grid_new_config")
         self._save(state)
 
@@ -2376,6 +2542,7 @@ class DurableGridBotLifecycle:
         old_config = deepcopy(edit_state.get("source_config") or old_config)
         config_already_persisted = bool(edit_state.get("config_persisted")) and int((run.get("config") or {}).get("config_version") or 0) == int(new_config["config_version"])
         if not config_already_persisted:
+            self._update_lifecycle_progress(run, "EDIT", "PERSISTING_CONFIG", message="Editing Grid: persisting new configuration", cancelled_orders=cancelled)
             new_config["effective_from"] = utc_now()
             new_config_obj = GridConfig(
                 bot_id=new_config["bot_id"],
@@ -2442,13 +2609,26 @@ class DurableGridBotLifecycle:
         inventory = _decimal(reconciliation.get("gridbot_inventory"))
         if previous_status == GridStatus.RUNNING.value:
             try:
+                self._update_lifecycle_progress(run, "EDIT", "PLACING_ORDERS", message="Editing Grid: placing new orders", expected_orders=len(run.get("levels") or []), cancelled_orders=cancelled)
                 for level in run["levels"]:
                     proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                    order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory)
+                    order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
                     if order.get("status") == "deferred":
                         deferred += 1
                     else:
                         created += 1
+                    self._update_lifecycle_progress(
+                        run,
+                        "EDIT",
+                        "PLACING_ORDERS",
+                        message=f"Editing Grid: {created} / {len(run.get('levels') or [])} new orders submitted",
+                        expected_orders=len(run.get("levels") or []),
+                        confirmed_orders=created,
+                        deferred_orders=deferred,
+                        cancelled_orders=cancelled,
+                        retry_attempts=(run.get("lifecycle_retry") or {}).get("attempts", 0),
+                        retry_wait_seconds=(run.get("lifecycle_retry") or {}).get("backoff_seconds", 0),
+                    )
             except Exception as exc:
                 for order in list((run.get("orders") or {}).values()):
                     if order.get("order_kind") == "edit_grid" and order.get("status") not in START_TERMINAL_ORDER_STATUSES:
@@ -2473,6 +2653,8 @@ class DurableGridBotLifecycle:
                 return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run["edit_state"])}
         self._save(state)
 
+        self._update_lifecycle_progress(run, "EDIT", "VERIFYING_ORDERS", message="Editing Grid: waiting for Delta verification", expected_orders=len(run.get("levels") or []), confirmed_orders=created, cancelled_orders=cancelled)
+        self._save(state, include_children=False)
         verified = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)
         state = self._load()
         run = state["runs"][run["run_id"]]
@@ -2648,8 +2830,18 @@ class DurableGridBotLifecycle:
                     pass
         cancelled_attempts += self._cancel_known_gridbot_resting_orders(run, product_id)
         self._terminalize_never_submitted_orders(run)
+        self._update_lifecycle_progress(
+            run,
+            "STOP",
+            "CANCELLING_ORDERS",
+            message=f"Stopping Grid: {cancelled_attempts} cancel attempts sent",
+            cancelled_orders=cancelled_attempts,
+            waiting_orders=len(exchange_open_gridbot_orders),
+        )
         self._save(state, include_children=False)
 
+        self._update_lifecycle_progress(run, "STOP", "VERIFYING_CANCELS", message="Stopping Grid: waiting for Delta verification", cancelled_orders=cancelled_attempts)
+        self._save(state, include_children=False)
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
@@ -2676,6 +2868,14 @@ class DurableGridBotLifecycle:
                     },
                 )
             if open_gridbot_orders:
+                self._update_lifecycle_progress(
+                    run,
+                    "STOP",
+                    "RETRYING_CANCELS",
+                    message=f"Stopping Grid: {open_gridbot_orders} orders still unresolved",
+                    cancelled_orders=cancelled_attempts,
+                    waiting_orders=open_gridbot_orders,
+                )
                 for exchange_order in _gridbot_orders(_result_rows(self.client.open_orders(product_id))):
                     cid = str(exchange_order.get("client_order_id") or "")
                     local = run.setdefault("orders", {}).get(cid)
@@ -2805,6 +3005,14 @@ class DurableGridBotLifecycle:
             if gridbot_inventory == 0:
                 break
             try:
+                self._update_lifecycle_progress(
+                    run,
+                    "STOP",
+                    "FLATTENING_POSITION",
+                    message=f"Stopping Grid: flattening remaining {gridbot_inventory} lots",
+                    cancelled_orders=cancelled_attempts,
+                    waiting_orders=0,
+                )
                 self._recover_or_place_flatten_order(run, product_id, gridbot_inventory)
                 self._event(
                     state,
@@ -2852,6 +3060,7 @@ class DurableGridBotLifecycle:
         run["updated_at"] = now
         run["stopped_at"] = summary["stopped_at"]
         run["stop_reason"] = reason
+        self._update_lifecycle_progress(run, "STOP", "STOPPED", message="Grid stopped", cancelled_orders=cancelled_attempts, waiting_orders=0)
         if state.get("active_run_id") == run["run_id"]:
             state["active_run_id"] = None
         self._event(state, run["run_id"], "GRID_RUN_SUMMARY_GENERATED", {"summary_id": summary["summary_id"]})

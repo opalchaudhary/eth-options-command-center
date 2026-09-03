@@ -39,6 +39,13 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def _fresh_open_order_count(telemetry: dict) -> int | None:
+    if telemetry.get("open_order_count") in [None, ""] and telemetry.get("open_buy_order_count") in [None, ""] and telemetry.get("open_sell_order_count") in [None, ""]:
+        return None
+    side_total = int(telemetry.get("open_buy_order_count") or 0) + int(telemetry.get("open_sell_order_count") or 0)
+    return max(int(telemetry.get("open_order_count") or 0), side_total)
+
+
 class ContinuousGridBotWorker:
     def __init__(
         self,
@@ -164,6 +171,9 @@ class ContinuousGridBotWorker:
             cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
             if cached:
                 state["account_risk_state"] = cached
+                open_order_count = _fresh_open_order_count(cached)
+                if open_order_count is not None:
+                    state["open_gridbot_orders"] = open_order_count
             if run:
                 fill_inventory = inventory_from_fills([fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill for fill in (run.get("fills") or {}).values()])
                 state["fill_derived_inventory"] = str(fill_inventory)
@@ -502,6 +512,9 @@ def gridbot_live_state() -> dict:
         else:
             telemetry = account_telemetry_cache.get("ETHUSD")
         state["account_risk_state"] = telemetry.as_dict()
+        open_order_count = _fresh_open_order_count(state["account_risk_state"])
+        if open_order_count is not None:
+            state["open_gridbot_orders"] = open_order_count
     except Exception as exc:
         state["account_risk_state_error"] = str(exc)[:300]
     state["health"] = evaluate_gridbot_health(state)

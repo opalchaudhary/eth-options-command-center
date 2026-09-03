@@ -1141,17 +1141,50 @@ class SupabaseGridRepository:
         }
         deployment_completeness = _reconstructed_deployment_completeness(config, run_state["levels"], orders)
         run_state["deployment_completeness"] = deployment_completeness
+        status = str(run_row.get("status") or "")
+        operation = {
+            "STARTING": "START",
+            "PAUSING": "PAUSE",
+            "PAUSED": "PAUSE",
+            "RESUMING": "RESUME",
+            "EDITING": "EDIT",
+            "STOPPING": "STOP",
+            "STOP_REQUIRES_ATTENTION": "STOP",
+            "RUNNING": "RUNNING",
+        }.get(status, status)
+        stage = latest_stage if status == "STARTING" and latest_stage else status
+        message = {
+            "STARTING": "Starting Grid: waiting for Delta verification" if not deployment_completeness.get("complete") else "Starting Grid: finalizing",
+            "PAUSING": "Pausing Grid: cancelling resting orders",
+            "PAUSED": "Grid paused",
+            "RESUMING": "Resuming Grid: waiting for Delta verification",
+            "EDITING": "Editing Grid: applying new grid",
+            "STOPPING": "Stopping Grid: cancelling and flattening",
+            "STOP_REQUIRES_ATTENTION": "Stopping Grid: operator attention required",
+            "RUNNING": "Grid running",
+        }.get(status)
+        started_at = run_row.get("started_at")
+        updated_at = latest_stage_at or run_row.get("updated_at")
+        elapsed = None
+        try:
+            if started_at and updated_at:
+                elapsed = (_parse_ts(updated_at) - _parse_ts(started_at)).total_seconds()
+        except Exception:
+            elapsed = None
         run_state["lifecycle_progress"] = {
-            "operation": run_row.get("status"),
-            "stage": "RECONSTRUCTED_FROM_PERSISTED_STATE",
-            "started_at": run_row.get("started_at"),
-            "last_progress_at": run_row.get("updated_at"),
+            "operation": operation,
+            "stage": stage,
+            "started_at": started_at,
+            "last_progress_at": updated_at,
+            "elapsed_seconds": elapsed,
+            "message": message,
             "expected_orders": deployment_completeness.get("expected", 0),
             "confirmed_orders": deployment_completeness.get("confirmed_open", 0),
             "filled_orders": deployment_completeness.get("filled", 0),
             "deferred_orders": deployment_completeness.get("deferred", 0),
             "ambiguous_orders": deployment_completeness.get("ambiguous", 0),
             "missing_orders": deployment_completeness.get("missing", 0),
+            "waiting_orders": deployment_completeness.get("missing", 0) + deployment_completeness.get("ambiguous", 0),
         }
         if latest_external_adjustment:
             run_state["external_position_adjustment"] = latest_external_adjustment

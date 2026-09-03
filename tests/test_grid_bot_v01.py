@@ -2028,15 +2028,52 @@ def test_ambiguous_submission_is_adopted_without_duplicate_order(tmp_path):
             "max_inventory_lots": "2",
         }
     )
-    blocked = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
-    assert blocked["run"]["status"] == GridStatus.STARTING.value
-
     recovered = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
 
     assert recovered["run"]["status"] == GridStatus.RUNNING.value
     assert recovered["run"]["deployment_completeness"]["complete"] is True
+    assert recovered["run"]["lifecycle_retry"]["attempts"] == 1
+    assert recovered["run"]["lifecycle_retry"]["backoff_seconds"] == 1
     assert len({order["client_order_id"] for order in client.orders}) == len(client.orders)
     assert len(client.orders) == 4
+
+
+def test_operator_start_skips_per_order_existing_lookup_after_preflight(tmp_path):
+    class CountingClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.open_order_calls = 0
+
+        def open_orders(self, product_id=None):
+            self.open_order_calls += 1
+            return super().open_orders(product_id)
+
+    client = CountingClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    begun = lifecycle.begin_operator_grid_start(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+
+    result = lifecycle.complete_operator_grid_start(begun["run"]["run_id"])
+
+    assert result["run"]["status"] == GridStatus.RUNNING.value
+    assert result["run"]["deployment_completeness"]["complete"] is True
+    assert client.open_order_calls <= 4
+    progress = result["run"]["lifecycle_progress"]
+    assert progress["operation"] == "START"
+    assert progress["expected_orders"] == 4
+    assert progress["confirmed_orders"] == 4
+    assert progress["elapsed_seconds"] >= 0
 
 
 def test_one_sided_neutral_partial_start_cannot_become_running_or_healthy(tmp_path):
@@ -3207,6 +3244,29 @@ def test_continuous_worker_repeated_unresolved_events_do_not_snapshot_storm(tmp_
     assert len(db.tables.get("grid_risk_snapshots", {})) == 1
 
 
+def test_live_state_prefers_fresh_account_open_order_count_for_board():
+    class CachedTelemetry:
+        def snapshot(self):
+            return {
+                "telemetry_status": "HEALTHY",
+                "open_order_count": 0,
+                "open_buy_order_count": 3,
+                "open_sell_order_count": 3,
+                "position_lots": "0",
+                "mark_price": "2500",
+            }
+
+    worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
+    worker._state["open_gridbot_orders"] = 0
+    worker.account_telemetry = CachedTelemetry()
+
+    state = worker.state()
+
+    assert state["open_gridbot_orders"] == 6
+    assert state["account_risk_state"]["open_buy_order_count"] == 3
+    assert state["account_risk_state"]["open_sell_order_count"] == 3
+
+
 def test_snapshot_material_change_ignores_regular_mark_and_margin_drift():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     baseline = (
@@ -3741,6 +3801,8 @@ def test_supabase_recovery_without_json_preserves_run_and_orders(tmp_path):
     assert completeness["missing"] == 0
     assert completeness["source"] == "supabase_reconstruction"
     assert recovered["lifecycle_progress"]["confirmed_orders"] == len(order_ids)
+    assert recovered["lifecycle_progress"]["operation"] == "RUNNING"
+    assert recovered["lifecycle_progress"]["message"] == "Grid running"
     assert len(client.open_orders()["result"]) == len(order_ids)
 
 
