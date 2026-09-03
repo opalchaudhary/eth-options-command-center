@@ -4226,6 +4226,35 @@ def test_gridbot_health_treats_aggregated_replacement_entitlement_as_protected()
     assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
 
 
+def test_gridbot_health_treats_persisted_replacement_key_as_protected_after_restart():
+    run = {
+        "run_id": "run-aggregate-key-health",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "10"},
+        "orders": {
+            "source": {"client_order_id": "source", "exchange_order_id": "ex-source", "status": "filled", "remaining_quantity": "0", "order_kind": "initial_grid"},
+            "existing-target": {
+                "client_order_id": "existing-target",
+                "exchange_order_id": "ex-target",
+                "status": "open",
+                "remaining_quantity": "1",
+                "requested_quantity": "1",
+                "order_kind": "resume_grid",
+            },
+        },
+        "fills": {
+            "fill-1": {"id": "fill-1", "client_order_id": "source", "size": "1", "side": "sell"},
+        },
+        "replacement_keys": {
+            "fill-1:replacement": {"replacement_group_key": "source:L003:buy", "state": "aggregated"},
+        },
+    }
+
+    health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "-1", "delta_position": "-1", "exchange_open_orders": 1})
+
+    assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
+
+
 def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_gate():
     run = {
         "run_id": "run-risk",

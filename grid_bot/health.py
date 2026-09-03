@@ -137,9 +137,11 @@ def _replacement_missing(run: dict | None) -> list[str]:
     }
     for entitlement in ((run or {}).get("replacement_entitlements") or {}).values():
         replaced.update(str(fill_id) for fill_id in entitlement.get("source_fill_ids") or [])
-    for replacement in ((run or {}).get("replacement_keys") or {}).values():
+    for key, replacement in ((run or {}).get("replacement_keys") or {}).items():
         if replacement.get("state") == "aggregated":
             replaced.add(str(replacement.get("source_fill_id") or ""))
+            if str(key).endswith(":replacement"):
+                replaced.add(str(key).rsplit(":replacement", 1)[0])
     deferred = set(((run or {}).get("deferred_orders") or {}).keys())
     return sorted(fill_id for fill_id in fills if fill_id and fill_id not in replaced and fill_id not in deferred)
 
