@@ -223,3 +223,34 @@ def test_history_loads_only_from_manual_action() -> None:
     assert "Refresh History" in text
     assert "History loads only when requested." in text
     assert "refresh_history()" not in fragment_body
+
+
+def test_grid_recommendation_loads_only_from_manual_action() -> None:
+    text = PAGE.read_text()
+    recommendation_body = text.split("def render_grid_recommendation()", maxsplit=1)[1].split("def render_orders", maxsplit=1)[0]
+    fragment_body = text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1].split("def render_idle", maxsplit=1)[0]
+
+    assert "Get Recommendation" in recommendation_body
+    assert "Recommendation loads only when requested." in recommendation_body
+    assert 'safe_get("/api/grid/v01/recommendation"' in recommendation_body
+    assert "/api/grid/v01/recommendation" not in fragment_body
+
+
+def test_grid_recommendation_persists_in_session_state() -> None:
+    text = PAGE.read_text()
+    recommendation_body = text.split("def render_grid_recommendation()", maxsplit=1)[1].split("def render_orders", maxsplit=1)[0]
+
+    assert 'st.session_state["gridbot_recommendation"]' in recommendation_body
+    assert 'payload = st.session_state.get("gridbot_recommendation")' in recommendation_body
+    assert "render_grid_recommendation_payload(payload)" in recommendation_body
+
+
+def test_grid_recommendation_is_below_current_grid_and_above_health() -> None:
+    text = PAGE.read_text()
+    dashboard_body = text.split("def render_live_dashboard", maxsplit=1)[1].split("def render_actions", maxsplit=1)[0]
+
+    current_grid_index = dashboard_body.index("Current Grid")
+    recommendation_index = dashboard_body.index("render_grid_recommendation()")
+    health_index = dashboard_body.index("Health")
+
+    assert current_grid_index < recommendation_index < health_index

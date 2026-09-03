@@ -228,6 +228,91 @@ def render_health(health: dict) -> None:
     )
 
 
+def grid_recommendation_action_label(action: str | None) -> str:
+    labels = {
+        "KEEP_CURRENT": "Keep Current",
+        "CONSIDER_EDIT": "Consider Edit",
+        "REGRID": "Rebuild Grid",
+        "NO_GRID": "No Grid",
+    }
+    return labels.get(str(action or ""), str(action or "-").replace("_", " ").title())
+
+
+def render_grid_recommendation_payload(payload: dict) -> None:
+    recommendation = payload.get("recommendation") or {}
+    inputs = recommendation.get("inputs_summary") or {}
+    if not payload.get("ok", True):
+        st.warning(payload.get("error") or "Recommendation unavailable.")
+        return
+
+    stale = "Yes" if recommendation.get("stale") else "No"
+    v2_status = []
+    if recommendation.get("v2_abstained"):
+        v2_status.append("Abstained")
+    if recommendation.get("v2_ood"):
+        v2_status.append("OOD")
+    if recommendation.get("stale"):
+        v2_status.append("Stale")
+    if not v2_status:
+        v2_status.append("Usable")
+
+    top = st.columns(4)
+    with top[0]:
+        render_card("Action", grid_recommendation_action_label(recommendation.get("action")))
+    with top[1]:
+        render_card("Type", human_grid_type(recommendation.get("grid_type")))
+    with top[2]:
+        render_card("Confidence", f"{float(recommendation.get('confidence') or 0):.2f}", recommendation.get("confidence_type") or "Recommender")
+    with top[3]:
+        render_card("Horizon", recommendation.get("operating_horizon") or "-", f"Stale: {stale}")
+
+    params = st.columns(4)
+    with params[0]:
+        render_card("Range", f"{fmt_money(recommendation.get('lower_price'))} - {fmt_money(recommendation.get('upper_price'))}")
+    with params[1]:
+        render_card("Levels", recommendation.get("grid_count") or "-")
+    with params[2]:
+        render_card("Spacing", human_spacing(recommendation.get("spacing_type")))
+    with params[3]:
+        render_card("Step", fmt_money(recommendation.get("grid_step")), ", ".join(v2_status))
+
+    signals = st.columns(4)
+    with signals[0]:
+        render_card("Path Inside 70", fmt_pct(inputs.get("path_inside_70")))
+    with signals[1]:
+        render_card("Expansion", fmt_pct(inputs.get("range_expansion")))
+    with signals[2]:
+        render_card("Upside", fmt_pct(inputs.get("upside_probability")))
+    with signals[3]:
+        render_card("Downside", fmt_pct(inputs.get("downside_probability")))
+
+    reasons = recommendation.get("reasons") or []
+    if reasons:
+        st.caption(" | ".join(str(reason) for reason in reasons[:3]))
+    st.caption(
+        "Prediction "
+        + str(payload.get("prediction_timestamp") or "-")
+        + " | Spot "
+        + fmt_money(payload.get("spot_price"))
+    )
+
+
+def render_grid_recommendation() -> None:
+    st.markdown("<div class='section-label'>Grid Recommendation</div>", unsafe_allow_html=True)
+    controls = st.columns([1, 3])
+    with controls[0]:
+        if st.button("Get Recommendation", use_container_width=True, key="gridbot_get_recommendation"):
+            st.session_state["gridbot_recommendation"] = safe_get("/api/grid/v01/recommendation", timeout=15)
+            st.session_state["gridbot_recommendation_loaded_at"] = datetime.now(timezone.utc).isoformat()
+    loaded_at = st.session_state.get("gridbot_recommendation_loaded_at")
+    with controls[1]:
+        st.caption(f"Loaded {loaded_at}" if loaded_at else "Recommendation loads only when requested.")
+
+    payload = st.session_state.get("gridbot_recommendation")
+    if payload:
+        render_grid_recommendation_payload(payload)
+
+
 def render_orders(live: dict) -> None:
     buys, sells = split_pending_orders(live)
     left, right = st.columns(2)
@@ -298,6 +383,8 @@ def render_live_dashboard(live: dict) -> None:
         render_card("Order Size", fmt_lots(cfg.get("lot_size")))
     with grid_cols[5]:
         render_card("Maximum", fmt_lots(cfg.get("max_inventory_lots")))
+
+    render_grid_recommendation()
 
     st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
     render_health(health)

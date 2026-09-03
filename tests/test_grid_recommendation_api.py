@@ -253,6 +253,16 @@ def test_endpoint_maps_storage_failure_to_503(monkeypatch):
     assert excinfo.value.status_code == 503
 
 
+def test_public_grid_recommendation_alias_is_registered():
+    routes = {
+        route.path
+        for route in grid_router.public_grid_router.routes
+        if "GET" in getattr(route, "methods", set())
+    }
+
+    assert "/grid/v01/recommendation" in routes
+
+
 def test_endpoint_performs_no_exchange_or_order_mutation(monkeypatch):
     def fail(*_args, **_kwargs):
         raise AssertionError("mutation attempted")

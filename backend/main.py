@@ -47,6 +47,7 @@ app.include_router(mobile.router)
 app.include_router(strategy.router)
 app.include_router(system.router)
 app.include_router(grid.router)
+app.include_router(grid.public_grid_router)
 app.include_router(probability_router.router)
 app.include_router(probability_router.public_shadow_router)
 

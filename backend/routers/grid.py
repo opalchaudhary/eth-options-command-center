@@ -16,6 +16,7 @@ from grid_bot.supabase_repository import SupabaseGridRepository
 
 
 router = APIRouter(prefix="/api/grid", tags=["gridbot"])
+public_grid_router = APIRouter(prefix="/grid", tags=["gridbot"])
 
 
 class GridCreateRequest(BaseModel):
@@ -261,6 +262,9 @@ def grid_v01_recommendation(symbol: str = "ETHUSD"):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Grid recommendation unavailable.") from exc
+
+
+public_grid_router.add_api_route("/v01/recommendation", grid_v01_recommendation, methods=["GET"])
 
 
 @router.get("/v01/live/market-account")
