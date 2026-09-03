@@ -9,6 +9,7 @@ from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
 from grid_bot.engine import engine
 from grid_bot.models import GridConfig, GridType, SpacingType, new_id, to_record_dict
+from grid_bot.recommendation_service import GridRecommendationService, GridRecommendationStorageError, GridRecommendationUnavailable
 from grid_bot.repository import repository
 from grid_bot.rest_fallback import RestFallbackPoller
 from grid_bot.supabase_repository import SupabaseGridRepository
@@ -248,6 +249,18 @@ def durable_live_status():
         return DurableGridBotLifecycle().status()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/v01/recommendation")
+def grid_v01_recommendation(symbol: str = "ETHUSD"):
+    try:
+        return GridRecommendationService().recommendation(symbol=symbol)
+    except GridRecommendationStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GridRecommendationUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Grid recommendation unavailable.") from exc
 
 
 @router.get("/v01/live/market-account")

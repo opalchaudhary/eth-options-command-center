@@ -204,6 +204,36 @@ class SupabaseGridRepository:
         )
         return rows[0] if rows else None
 
+    def active_config_snapshot(self) -> dict | None:
+        active = self.active_run()
+        if not active:
+            return None
+        config_version = active.get("active_config_version") or active.get("config_version") or 1
+        config_rows = self.select(
+            "grid_config_versions",
+            {
+                "select": "*",
+                "run_id": f"eq.{active['run_id']}",
+                "config_version": f"eq.{config_version}",
+                "limit": 1,
+            },
+        )
+        config = (config_rows[0].get("config") if config_rows else None) or (config_rows[0] if config_rows else {})
+        if not config:
+            return None
+        return {
+            "run_id": active["run_id"],
+            "bot_id": active.get("bot_id") or config.get("bot_id"),
+            "status": active.get("status"),
+            "config_version": int(config.get("config_version") or config_version),
+            "product_symbol": config.get("product_symbol") or "ETHUSD",
+            "grid_type": config.get("grid_type"),
+            "lower_price": config.get("lower_price"),
+            "upper_price": config.get("upper_price"),
+            "grid_count": config.get("grid_count"),
+            "spacing_type": config.get("spacing_type"),
+        }
+
     def _locked_run_is_active(self, run_id: str | None) -> bool:
         if not run_id:
             return False
