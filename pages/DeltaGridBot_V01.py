@@ -162,11 +162,50 @@ def safe_post(path: str, payload: dict | None = None, timeout: int = 15) -> dict
             detail = exc.response.json().get("detail") or detail
         except Exception:
             pass
+        if isinstance(detail, dict):
+            message = detail.get("message") or detail.get("error") or str(detail)
+            st.error(message)
+            return {"ok": False, "error": message, "neutral_range": detail}
         st.error(detail)
         return {"ok": False, "error": detail}
     except Exception as exc:
         st.error(str(exc))
         return {"ok": False, "error": str(exc)}
+
+
+def neutral_range_payload(response: dict | None) -> dict:
+    response = response or {}
+    return response.get("neutral_range") or {}
+
+
+def render_neutral_range_suggestion(response: dict | None, *, lower_key: str, upper_key: str, button_key: str) -> None:
+    suggestion = neutral_range_payload(response)
+    if not suggestion:
+        return
+    st.warning("Selected range is not balanced for a Neutral grid at the current ETH price.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        render_card("Current ETH", fmt_money(suggestion.get("current_reference_price")))
+    with c2:
+        render_card("Your Grid", f"{suggestion.get('entered_buy_count', 0)} BUY / {suggestion.get('entered_sell_count', 0)} SELL")
+    with c3:
+        render_card("Suggested Grid", f"{suggestion.get('suggested_buy_count', 0)} BUY / {suggestion.get('suggested_sell_count', 0)} SELL")
+    lower = suggestion.get("suggested_lower")
+    upper = suggestion.get("suggested_upper")
+    if lower in [None, ""] or upper in [None, ""]:
+        return
+    st.info(f"Nearest valid Neutral range: {fmt_money(lower)} - {fmt_money(upper)}")
+    if st.button("Use Suggested Range", key=button_key, use_container_width=True):
+        st.session_state[f"{button_key}_pending"] = {"lower_key": lower_key, "upper_key": upper_key, "lower": float(lower), "upper": float(upper)}
+        st.rerun()
+
+
+def apply_pending_suggested_range(button_key: str) -> None:
+    pending = st.session_state.pop(f"{button_key}_pending", None)
+    if not pending:
+        return
+    st.session_state[pending["lower_key"]] = pending["lower"]
+    st.session_state[pending["upper_key"]] = pending["upper"]
 
 
 def fetch_live_state() -> dict:
@@ -453,6 +492,7 @@ def render_pending_operator_forms(live: dict) -> None:
 
 
 def render_edit_grid(live: dict) -> None:
+    apply_pending_suggested_range("edit_use_suggested_range")
     cfg = live_config(live)
     grid_types = ["neutral", "long_bias", "short_bias"]
     current_type = str(cfg.get("grid_type") or "neutral")
@@ -488,8 +528,10 @@ def render_edit_grid(live: dict) -> None:
         }
         preview = st.session_state.get("gridbot_edit_preview")
         if preview:
-            for line in preview_edit_summary(preview):
-                st.write(line)
+            render_neutral_range_suggestion(preview, lower_key="edit_lower", upper_key="edit_upper", button_key="edit_use_suggested_range")
+            if not neutral_range_payload(preview):
+                for line in preview_edit_summary(preview):
+                    st.write(line)
             validation = preview.get("validation") or {}
             for warning in validation.get("warnings") or []:
                 st.warning(warning)
@@ -551,6 +593,7 @@ def render_idle(live: dict) -> None:
 
 
 def render_create_grid(live: dict) -> None:
+    apply_pending_suggested_range("create_use_suggested_range")
     telemetry = live.get("account_risk_state") or {}
     reference = float(telemetry.get("mark_price") or 2450)
     st.markdown("<div class='section-label'>Create Grid</div>", unsafe_allow_html=True)
@@ -607,6 +650,9 @@ def render_create_grid(live: dict) -> None:
 
 
 def render_create_preview(preview: dict) -> None:
+    if not preview.get("ok", True):
+        render_neutral_range_suggestion(preview, lower_key="create_lower", upper_key="create_upper", button_key="create_use_suggested_range")
+        return
     data = preview.get("preview") or {}
     risk = preview.get("risk") or {}
     levels = data.get("levels") or []

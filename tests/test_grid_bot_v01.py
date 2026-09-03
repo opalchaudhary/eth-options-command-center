@@ -13,7 +13,7 @@ from grid_bot.engine import DeltaGridBotEngine
 from grid_bot.execution import make_client_order_id
 from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
 from grid_bot.health import HealthIssueTracker, evaluate_gridbot_health
-from grid_bot.grid_builder import build_grid_levels, generate_prices
+from grid_bot.grid_builder import build_grid_levels, generate_prices, nearest_valid_neutral_range, neutral_grid_balance
 from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType
 from grid_bot.reconciliation import reconcile_orders
 from grid_bot.repository import InMemoryGridRepository
@@ -1620,10 +1620,185 @@ def test_neutral_grid_rejects_unsuitable_range_without_replacing_operator_range(
     }
     before = dict(payload)
 
-    with pytest.raises(ValueError, match="Selected range is not suitable"):
-        lifecycle.preview_operator_grid(payload)
+    preview = lifecycle.preview_operator_grid(payload)
 
+    assert preview["ok"] is False
+    assert preview["neutral_range"]["message"].startswith("Selected range is not suitable")
     assert payload == before
+
+
+def test_valid_neutral_range_produces_no_unnecessary_suggestion(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Valid Neutral Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 5,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "3",
+    }
+
+    preview = lifecycle.preview_operator_grid(payload)
+
+    assert preview["ok"] is True
+    assert "neutral_range" not in preview
+
+
+def test_invalid_arithmetic_neutral_preview_returns_nearest_width_preserved_suggestion(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    payload = {
+        "bot_name": "Invalid Neutral Grid",
+        "product_symbol": "ETHUSD",
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2490",
+        "grid_count": 6,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "6",
+    }
+    before = dict(payload)
+
+    preview = lifecycle.preview_operator_grid(payload)
+    suggestion = preview["neutral_range"]
+
+    assert preview["ok"] is False
+    assert payload == before
+    assert suggestion["entered_lower"] == "2400"
+    assert suggestion["entered_upper"] == "2490"
+    assert suggestion["width_preserved"] is True
+    assert Decimal(suggestion["suggested_upper"]) - Decimal(suggestion["suggested_lower"]) == Decimal("90")
+    assert suggestion["suggested_buy_count"] == 3
+    assert suggestion["suggested_sell_count"] == 3
+
+
+def test_invalid_geometric_neutral_suggestion_uses_generated_geometric_levels():
+    config = GridConfig(
+        bot_id="bot_geo",
+        config_version=1,
+        bot_name="Geo",
+        product_symbol="ETHUSD",
+        grid_type=GridType.NEUTRAL,
+        lower_price=Decimal("2300"),
+        upper_price=Decimal("2475"),
+        grid_count=5,
+        spacing_type=SpacingType.GEOMETRIC,
+        lot_size=Decimal("1"),
+        max_inventory_lots=Decimal("5"),
+        allocated_capital=Decimal("1000"),
+        risk_capital=Decimal("1000"),
+    )
+
+    suggestion = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
+    suggested = GridConfig(
+        **{
+            **config.__dict__,
+            "lower_price": suggestion["suggested_lower"],
+            "upper_price": suggestion["suggested_upper"],
+        }
+    )
+    balance = neutral_grid_balance(suggested, Decimal("2500"), Decimal("0.05"))
+
+    assert suggestion["width_preserved"] is True
+    assert balance["valid"] is True
+    assert balance["prices"] == suggestion["suggested_levels"]
+
+
+def test_nearest_neutral_suggestion_preserves_tick_rounding_and_odd_balance():
+    config = GridConfig(
+        bot_id="bot_tick",
+        config_version=1,
+        bot_name="Tick",
+        product_symbol="ETHUSD",
+        grid_type=GridType.NEUTRAL,
+        lower_price=Decimal("2480.05"),
+        upper_price=Decimal("2490.10"),
+        grid_count=5,
+        spacing_type=SpacingType.ARITHMETIC,
+        lot_size=Decimal("1"),
+        max_inventory_lots=Decimal("5"),
+        allocated_capital=Decimal("1000"),
+        risk_capital=Decimal("1000"),
+    )
+
+    suggestion = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
+    suggested = GridConfig(
+        **{
+            **config.__dict__,
+            "lower_price": suggestion["suggested_lower"],
+            "upper_price": suggestion["suggested_upper"],
+        }
+    )
+    balance = neutral_grid_balance(suggested, Decimal("2500"), Decimal("0.05"))
+
+    assert suggestion["suggested_lower"] % Decimal("0.05") == 0
+    assert suggestion["suggested_upper"] % Decimal("0.05") == 0
+    assert balance["valid"] is True
+    assert abs(suggestion["suggested_buy_count"] - suggestion["suggested_sell_count"]) <= 1
+
+
+def test_neutral_suggestion_changes_when_reference_price_changes():
+    config = GridConfig(
+        bot_id="bot_move",
+        config_version=1,
+        bot_name="Move",
+        product_symbol="ETHUSD",
+        grid_type=GridType.NEUTRAL,
+        lower_price=Decimal("2400"),
+        upper_price=Decimal("2490"),
+        grid_count=6,
+        spacing_type=SpacingType.ARITHMETIC,
+        lot_size=Decimal("1"),
+        max_inventory_lots=Decimal("6"),
+        allocated_capital=Decimal("1000"),
+        risk_capital=Decimal("1000"),
+    )
+
+    first = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
+    second = nearest_valid_neutral_range(config, Decimal("2520"), Decimal("0.05"))
+
+    assert (first["suggested_lower"], first["suggested_upper"]) != (second["suggested_lower"], second["suggested_upper"])
+
+
+def test_edit_neutral_suggestion_does_not_modify_active_run_config(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(
+        {
+            "bot_name": "Running Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 5,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "5",
+        }
+    )["run"]
+    before_config = dict(run["config"])
+
+    preview = lifecycle.preview_edit_grid(
+        run["run_id"],
+        {
+            "lower_price": "2400",
+            "upper_price": "2490",
+            "grid_count": 6,
+            "spacing_type": "arithmetic",
+        },
+    )
+    after = lifecycle.status()["active_run"]
+
+    assert preview["ok"] is False
+    assert preview["neutral_range"]["entered_lower"] == "2400"
+    assert preview["neutral_range"]["entered_upper"] == "2490"
+    assert after["config"] == before_config
+    assert after["status"] == GridStatus.RUNNING.value
 
 
 def test_bias_initial_ladder_uses_nature_specific_opening_orders(tmp_path):

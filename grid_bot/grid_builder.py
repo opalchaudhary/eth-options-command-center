@@ -1,9 +1,22 @@
+from dataclasses import replace
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP, getcontext
 
 from .models import GridConfig, GridLevel, GridType, Side, SpacingType
 from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 
 getcontext().prec = 28
+
+
+NEUTRAL_RANGE_ERROR_MESSAGE = (
+    "Selected range is not suitable for a Neutral grid at the current ETH price. "
+    "Adjust the range or choose Long/Short."
+)
+
+
+class NeutralGridRangeValidationError(ValueError):
+    def __init__(self, details: dict):
+        super().__init__(NEUTRAL_RANGE_ERROR_MESSAGE)
+        self.details = details
 
 
 def quantize_price(price: Decimal, tick_size: Decimal) -> Decimal:
@@ -46,10 +59,114 @@ def validate_neutral_grid_suitability(config: GridConfig, reference_price: Decim
     buy_count = len([price for price in prices if price < reference_price])
     sell_count = len(prices) - buy_count
     if buy_count == 0 or sell_count == 0 or abs(buy_count - sell_count) > 1:
-        raise ValueError(
-            "Selected range is not suitable for a Neutral grid at the current ETH price. "
-            "Adjust the range or choose Long/Short."
-        )
+        raise ValueError(NEUTRAL_RANGE_ERROR_MESSAGE)
+
+
+def neutral_grid_balance(config: GridConfig, reference_price: Decimal, tick_size: Decimal) -> dict:
+    prices = generate_prices(config, tick_size)
+    buy_count = len([price for price in prices if price < reference_price])
+    sell_count = len(prices) - buy_count
+    return {
+        "prices": prices,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "valid": buy_count > 0 and sell_count > 0 and abs(buy_count - sell_count) <= 1,
+    }
+
+
+def _candidate_neutral_range(config: GridConfig, lower_price: Decimal, upper_price: Decimal, reference_price: Decimal, tick_size: Decimal) -> dict | None:
+    if lower_price <= 0 or lower_price >= upper_price:
+        return None
+    try:
+        candidate = replace(config, lower_price=lower_price, upper_price=upper_price)
+        balance = neutral_grid_balance(candidate, reference_price, tick_size)
+    except ValueError:
+        return None
+    if not balance["valid"]:
+        return None
+    return {
+        "suggested_lower": lower_price,
+        "suggested_upper": upper_price,
+        "suggested_buy_count": balance["buy_count"],
+        "suggested_sell_count": balance["sell_count"],
+        "suggested_levels": balance["prices"],
+    }
+
+
+def nearest_valid_neutral_range(config: GridConfig, reference_price: Decimal, tick_size: Decimal) -> dict | None:
+    if config.grid_type != GridType.NEUTRAL:
+        return None
+    entered_lower = config.lower_price
+    entered_upper = config.upper_price
+    entered_width = entered_upper - entered_lower
+    if entered_width <= 0:
+        return None
+
+    width_ticks = max(Decimal("1"), (entered_width / tick_size).to_integral_value(rounding=ROUND_HALF_UP))
+    entered_width = width_ticks * tick_size
+    midpoint_distance_ticks = abs(((entered_lower + entered_upper) / Decimal("2")) - reference_price) / tick_size
+    search_ticks = int(max(Decimal("1000"), width_ticks * Decimal("4"), midpoint_distance_ticks * Decimal("4"), Decimal(config.grid_count * 20)))
+
+    def offset_order(limit: int):
+        yield 0
+        for step in range(1, limit + 1):
+            yield -step
+            yield step
+
+    for offset in offset_order(search_ticks):
+        lower = quantize_price(entered_lower + Decimal(offset) * tick_size, tick_size)
+        upper = lower + entered_width
+        candidate = _candidate_neutral_range(config, lower, upper, reference_price, tick_size)
+        if candidate:
+            candidate["width_preserved"] = True
+            return candidate
+
+    max_width_delta = int(max(Decimal("1000"), width_ticks * Decimal("2"), Decimal(config.grid_count * 20)))
+    candidates: list[tuple[Decimal, Decimal, Decimal, Decimal, dict]] = []
+    for width_delta in range(1, max_width_delta + 1):
+        for sign in (-1, 1):
+            candidate_width_ticks = width_ticks + Decimal(sign * width_delta)
+            if candidate_width_ticks <= 0:
+                continue
+            candidate_width = candidate_width_ticks * tick_size
+            for offset in offset_order(search_ticks):
+                lower = quantize_price(entered_lower + Decimal(offset) * tick_size, tick_size)
+                upper = lower + candidate_width
+                candidate = _candidate_neutral_range(config, lower, upper, reference_price, tick_size)
+                if candidate:
+                    cost = abs(lower - entered_lower) + abs(upper - entered_upper)
+                    width_cost = abs(candidate_width - entered_width)
+                    candidates.append((width_cost, cost, abs(lower - entered_lower), lower, candidate))
+                    break
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            result = candidates[0][4]
+            result["width_preserved"] = False
+            return result
+    return None
+
+
+def neutral_range_invalid_details(config: GridConfig, reference_price: Decimal, tick_size: Decimal, reason: str = "NEUTRAL_BUY_SELL_IMBALANCE") -> dict:
+    try:
+        entered = neutral_grid_balance(config, reference_price, tick_size)
+    except ValueError as exc:
+        entered = {"prices": [], "buy_count": 0, "sell_count": 0, "valid": False}
+        reason = str(exc)
+    suggestion = nearest_valid_neutral_range(config, reference_price, tick_size)
+    return {
+        "code": "NEUTRAL_RANGE_INVALID",
+        "message": NEUTRAL_RANGE_ERROR_MESSAGE,
+        "reason": reason,
+        "current_reference_price": reference_price,
+        "entered_lower": config.lower_price,
+        "entered_upper": config.upper_price,
+        "entered_grid_count": config.grid_count,
+        "entered_spacing_type": config.spacing_type.value,
+        "entered_buy_count": entered["buy_count"],
+        "entered_sell_count": entered["sell_count"],
+        "entered_levels": entered["prices"],
+        **(suggestion or {}),
+    }
 
 
 def generate_prices(config: GridConfig, tick_size: Decimal) -> list[Decimal]:

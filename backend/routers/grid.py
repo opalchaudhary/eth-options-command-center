@@ -7,6 +7,7 @@ from grid_bot.config import DEFAULT_RISK_THRESHOLDS
 from grid_bot.continuous_worker import gridbot_live_state, start_continuous_gridbot_worker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
+from grid_bot.grid_builder import NeutralGridRangeValidationError
 from grid_bot.engine import engine
 from grid_bot.models import GridConfig, GridType, SpacingType, new_id, to_record_dict
 from grid_bot.recommendation_service import GridRecommendationService, GridRecommendationStorageError, GridRecommendationUnavailable
@@ -312,6 +313,8 @@ def durable_market_account(product_symbol: str = "ETHUSD"):
 def durable_preview_operator_grid(payload: OperatorGridRequest):
     try:
         return DurableGridBotLifecycle().preview_operator_grid(_model_payload(payload))
+    except NeutralGridRangeValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.details) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -322,6 +325,8 @@ def durable_start_operator_grid(payload: OperatorGridRequest):
         result = DurableGridBotLifecycle().start_operator_grid_background(_model_payload(payload))
         start_continuous_gridbot_worker()
         return result
+    except NeutralGridRangeValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.details) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -388,6 +393,8 @@ def durable_edit_preview(payload: EditGridRequest):
         data = _model_payload(payload)
         data.pop("reason", None)
         return DurableGridBotLifecycle().preview_edit_grid(payload=data)
+    except NeutralGridRangeValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.details) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -401,6 +408,8 @@ def durable_edit(payload: EditGridRequest):
         if (result.get("run") or {}).get("status") == "RUNNING":
             start_continuous_gridbot_worker()
         return result
+    except NeutralGridRangeValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.details) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

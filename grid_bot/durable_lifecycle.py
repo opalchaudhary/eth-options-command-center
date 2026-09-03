@@ -15,7 +15,16 @@ from .account_telemetry import AccountTelemetryCache, risk_increasing_action_all
 from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .exchange_truth import reconcile_exchange_truth
-from .grid_builder import build_grid_levels, preview_grid, quantize_price, validate_grid_config, validate_neutral_grid_suitability
+from .grid_builder import (
+    NEUTRAL_RANGE_ERROR_MESSAGE,
+    NeutralGridRangeValidationError,
+    build_grid_levels,
+    neutral_range_invalid_details,
+    preview_grid,
+    quantize_price,
+    validate_grid_config,
+    validate_neutral_grid_suitability,
+)
 from .models import GridConfig, GridStatus, GridType, OrderProposal, Side, SpacingType, new_id, to_record_dict, utc_now
 from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 from .supabase_repository import SupabaseGridRepository, SupabasePersistenceError
@@ -479,7 +488,12 @@ class DurableGridBotLifecycle:
             risk_thresholds=DEFAULT_RISK_THRESHOLDS,
         )
         validate_grid_config(config, spec.min_quantity)
-        validate_neutral_grid_suitability(config, reference, spec.tick_size)
+        try:
+            validate_neutral_grid_suitability(config, reference, spec.tick_size)
+        except ValueError as exc:
+            if str(exc) == NEUTRAL_RANGE_ERROR_MESSAGE:
+                raise NeutralGridRangeValidationError(neutral_range_invalid_details(config, reference, spec.tick_size)) from exc
+            raise
         return config
 
     def preview_operator_grid(self, payload: dict) -> dict:
@@ -488,7 +502,17 @@ class DurableGridBotLifecycle:
         spec_dict = health["product"]
         spec = self.client.product_spec(product_symbol)
         reference = _decimal(health["market"]["reference_price"])
-        config = self._config_from_operator_payload(payload, spec, reference, health)
+        try:
+            config = self._config_from_operator_payload(payload, spec, reference, health)
+        except NeutralGridRangeValidationError as exc:
+            return {
+                "ok": False,
+                "error": exc.details["message"],
+                "product": spec_dict,
+                "market": health["market"],
+                "account": health["account"],
+                "neutral_range": to_record_dict(exc.details),
+            }
         position = _position_size(self.client, spec.product_id)
         preview = preview_grid(config, reference, spec.tick_size, spec.best_bid, spec.best_ask, position)
         reserved_inventory = _decimal(preview.get("reserved_long_exposure")) + _decimal(preview.get("reserved_short_exposure"))
@@ -556,6 +580,8 @@ class DurableGridBotLifecycle:
         if self._active_run(state):
             raise RuntimeError("Another durable DeltaGridBot V0.1 run is already active.")
         preview_payload = self.preview_operator_grid(payload)
+        if not preview_payload.get("ok", True):
+            raise NeutralGridRangeValidationError(preview_payload.get("neutral_range") or {})
         product = preview_payload["product"]
         spec = self.client.product_spec(product["symbol"])
         self._assert_clean_start(spec.product_id)
@@ -614,6 +640,8 @@ class DurableGridBotLifecycle:
             return {"ok": True, "run": deepcopy(active), "attached": True, **self._startup_progress(active)}
         self._event(state, None, "GRID_RUN_START_STAGE", {"start_stage": "VALIDATING", "source": "operator_grid"})
         preview_payload = self.preview_operator_grid(payload)
+        if not preview_payload.get("ok", True):
+            raise NeutralGridRangeValidationError(preview_payload.get("neutral_range") or {})
         product = preview_payload["product"]
         spec = self.client.product_spec(product["symbol"])
         self._assert_clean_start(spec.product_id)
@@ -2026,7 +2054,17 @@ class DurableGridBotLifecycle:
         spec = self.client.product_spec(product_symbol)
         reference = _decimal(health["market"]["reference_price"] or run.get("reference_price"))
         current_config = deepcopy(run.get("config") or {})
-        proposed = self._edit_config_from_payload(run, payload or {}, spec, reference, health)
+        try:
+            proposed = self._edit_config_from_payload(run, payload or {}, spec, reference, health)
+        except NeutralGridRangeValidationError as exc:
+            return {
+                "ok": False,
+                "run_id": run["run_id"],
+                "current_config_version": int(current_config.get("config_version") or 1),
+                "current_config": current_config,
+                "neutral_range": to_record_dict(exc.details),
+                "validation": {"warnings": [], "errors": [exc.details["message"]]},
+            }
         proposed_dict = to_record_dict(proposed)
         proposed_levels = to_record_dict(build_grid_levels(proposed, reference, spec.tick_size))
         try:
