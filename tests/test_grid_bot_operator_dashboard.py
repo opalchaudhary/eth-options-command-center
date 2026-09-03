@@ -1,6 +1,18 @@
 from pathlib import Path
 
-from grid_bot.operator_dashboard import health_issue_text, health_plain_text, inventory_summary, live_config, pnl_values, preview_edit_summary, split_pending_orders, time_label
+from grid_bot.operator_dashboard import (
+    health_issue_text,
+    health_plain_text,
+    human_operator_reason,
+    inventory_summary,
+    lifecycle_progress_summary,
+    live_config,
+    orders_are_updating,
+    pnl_values,
+    preview_edit_summary,
+    split_pending_orders,
+    time_label,
+)
 
 
 PAGE = Path("pages/DeltaGridBot_V01.py")
@@ -63,6 +75,17 @@ def test_pending_orders_exclude_terminal_rows() -> None:
 
     assert buys == [{"Price": "$2,400.00", "Lots": "1", "Status": "Open"}]
     assert sells == [{"Price": "$2,500.00", "Lots": "1", "Status": "Waiting"}]
+
+
+def test_transitional_order_board_reports_updating_instead_of_false_zero() -> None:
+    live = {
+        "lifecycle_state": "STARTING",
+        "lifecycle_progress": {"expected_orders": 4, "confirmed_orders": 0},
+        "known_gridbot_orders": [],
+    }
+
+    assert orders_are_updating(live) is True
+    assert orders_are_updating({"lifecycle_state": "RUNNING", "lifecycle_progress": {"expected_orders": 4, "confirmed_orders": 0}}) is False
 
 
 def test_current_grid_labels_populate_from_worker_config_and_fallback_levels() -> None:
@@ -151,6 +174,37 @@ def test_health_text_is_plain_language_and_source_labelled() -> None:
     assert health_plain_text({"active_issues": [{"code": "ACCOUNTING_INCOMPLETE"}]}) == ("Profit information is incomplete.", [])
     assert "changed outside the GridBot" in health_issue_text({"code": "EXTERNAL_POSITION_CHANGE"})
     assert "forcibly reduced" in health_issue_text({"code": "FORCED_LIQUIDATION"})
+
+
+def test_lifecycle_progress_summary_shows_configured_vs_deployed_plainly() -> None:
+    lines = lifecycle_progress_summary(
+        {
+            "lifecycle_state": "STARTING",
+            "lifecycle_progress": {
+                "operation": "START",
+                "stage": "VERIFYING_COMPLETENESS",
+                "message": "Waiting for Delta to confirm 2 orders.",
+                "expected_orders": 6,
+                "confirmed_orders": 4,
+                "buy_confirmed_orders": 2,
+                "sell_confirmed_orders": 2,
+                "missing_orders": 2,
+                "retry_attempts": 1,
+                "retry_wait_seconds": 1.0,
+                "stall_message": "AMBIGUOUS_SUBMISSION",
+                "elapsed_seconds": 12.6,
+            },
+        }
+    )
+
+    assert "Configured: 6 levels" in lines
+    assert "Deployed: 4 confirmed (2 BUY / 2 SELL), 2 waiting" in lines
+    assert "Order submission is being verified with Delta." in lines
+    assert all("AMBIGUOUS_SUBMISSION" not in line for line in lines)
+
+
+def test_operator_reason_messages_hide_internal_codes() -> None:
+    assert human_operator_reason("CURRENT_INVENTORY_PRESERVED") == "Current position was preserved."
 
 
 def test_edit_preview_summary_is_plain_language() -> None:

@@ -160,6 +160,7 @@ class ContinuousGridBotWorker:
                         "grid_levels": run.get("levels") or [],
                         "deployment_completeness": run.get("deployment_completeness") or {},
                         "lifecycle_progress": run.get("lifecycle_progress") or run.get("startup") or {},
+                        "lifecycle_timing": run.get("lifecycle_timing") or {},
                         "known_gridbot_orders": list((run.get("orders") or {}).values()),
                         "known_fill_ids": list((run.get("fills") or {}).keys()),
                         "replacement_state": run.get("replacement_keys") or {},

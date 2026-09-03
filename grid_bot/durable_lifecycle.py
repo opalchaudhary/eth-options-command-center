@@ -491,6 +491,8 @@ class DurableGridBotLifecycle:
                 {
                     "expected_orders": completeness.get("expected", 0),
                     "confirmed_orders": completeness.get("confirmed_open", 0),
+                    "buy_confirmed_orders": completeness.get("buy_accounted", 0),
+                    "sell_confirmed_orders": completeness.get("sell_accounted", 0),
                     "filled_orders": completeness.get("filled", 0),
                     "deferred_orders": completeness.get("deferred", 0),
                     "ambiguous_orders": completeness.get("ambiguous", 0),
@@ -518,7 +520,18 @@ class DurableGridBotLifecycle:
         progress = run.setdefault("lifecycle_progress", {})
         progress["retry_attempts"] = stats["attempts"]
         progress["retry_wait_seconds"] = stats["backoff_seconds"]
-        progress["stall_message"] = "Retrying temporary exchange error"
+        progress["stall_message"] = "Temporary Delta API error. Retrying safely."
+
+    def _record_lifecycle_timing(self, run: dict, operation: str, label: str, elapsed_seconds: float, **details) -> None:
+        timing = run.setdefault("lifecycle_timing", {})
+        op = timing.setdefault(operation, {"total_seconds": 0.0, "calls": 0, "items": []})
+        elapsed = round(float(elapsed_seconds), 4)
+        op["total_seconds"] = round(float(op.get("total_seconds") or 0.0) + elapsed, 4)
+        op["calls"] = int(op.get("calls") or 0) + 1
+        item = {"label": label, "elapsed_seconds": elapsed, "at": utc_now()}
+        item.update({key: value for key, value in details.items() if value is not None})
+        op.setdefault("items", []).append(item)
+        op["items"] = op["items"][-120:]
 
     def _is_temporary_exchange_error(self, exc: Exception) -> bool:
         response = getattr(exc, "response", None)
@@ -532,7 +545,11 @@ class DurableGridBotLifecycle:
     def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
         completeness = self._deployment_completeness(run, reconciliation)
         run["deployment_completeness"] = completeness
-        self._update_lifecycle_progress(run, operation, "VERIFYING_COMPLETENESS", completeness)
+        confirmed = int(completeness.get("confirmed_open") or 0) + int(completeness.get("filled") or 0)
+        expected = int(completeness.get("expected") or 0)
+        remaining = max(0, expected - confirmed - int(completeness.get("deferred") or 0))
+        message = "Grid running" if completeness["complete"] else f"Waiting for Delta to confirm {remaining} orders."
+        self._update_lifecycle_progress(run, operation, "VERIFYING_COMPLETENESS", completeness, message=message, waiting_orders=remaining)
         if not completeness["complete"]:
             self._event(state, run["run_id"], "GRID_DEPLOYMENT_INCOMPLETE", completeness)
         return completeness
@@ -1500,14 +1517,44 @@ class DurableGridBotLifecycle:
         last_error = None
         for attempt in range(1, max(1, LIFECYCLE_RETRY_ATTEMPTS) + 1):
             if verify_existing_before_submit or attempt > 1:
+                lookup_started = time.perf_counter()
                 exchange_order = _find_exchange_order_by_client_id(self.client, product_id, proposal.client_order_id)
+                self._record_lifecycle_timing(
+                    run,
+                    str(run.get("lifecycle_progress", {}).get("operation") or order_kind).upper(),
+                    "existing_order_lookup",
+                    time.perf_counter() - lookup_started,
+                    client_order_id=proposal.client_order_id,
+                    found=bool(exchange_order),
+                )
                 if exchange_order:
                     break
             try:
+                post_started = time.perf_counter()
                 response = self.client.place_order(order_payload(product_id, proposal))
+                post_elapsed = time.perf_counter() - post_started
                 exchange_order = response.get("result") or {}
+                self._record_lifecycle_timing(
+                    run,
+                    str(run.get("lifecycle_progress", {}).get("operation") or order_kind).upper(),
+                    "post_order",
+                    post_elapsed,
+                    client_order_id=proposal.client_order_id,
+                    exchange_order_id=_order_id(exchange_order),
+                    attempt=attempt,
+                )
                 break
             except Exception as exc:
+                post_elapsed = time.perf_counter() - post_started if "post_started" in locals() else 0.0
+                self._record_lifecycle_timing(
+                    run,
+                    str(run.get("lifecycle_progress", {}).get("operation") or order_kind).upper(),
+                    "post_order_error",
+                    post_elapsed,
+                    client_order_id=proposal.client_order_id,
+                    attempt=attempt,
+                    temporary=self._is_temporary_exchange_error(exc),
+                )
                 last_error = exc
                 if not self._is_temporary_exchange_error(exc) or attempt >= max(1, LIFECYCLE_RETRY_ATTEMPTS):
                     break
@@ -3034,9 +3081,12 @@ class DurableGridBotLifecycle:
 
         position = _decimal(reconciliation.get("delta_position"))
         final_inventory = _decimal(reconciliation.get("gridbot_inventory"))
-        open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
+        open_count = int(reconciliation.get("exchange_open_orders") or 0)
+        open_orders = []
+        if open_count:
+            open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
         external_resolution = (run.get("external_position_resolution") or {}).get("status") == "EXTERNALLY_RESOLVED"
-        if (final_inventory != 0 and not external_resolution) or open_orders or position != 0:
+        if (final_inventory != 0 and not external_resolution) or open_count or position != 0:
             return self._stop_attention(
                 state,
                 run,
@@ -3045,7 +3095,7 @@ class DurableGridBotLifecycle:
                     "reason": "final_stop_gate_failed",
                     "gridbot_inventory": str(final_inventory),
                     "delta_position": str(position),
-                    "open_gridbot_orders": len(open_orders),
+                    "open_gridbot_orders": open_count,
                     "external_position_resolution": run.get("external_position_resolution"),
                 },
             )

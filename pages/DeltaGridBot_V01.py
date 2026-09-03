@@ -15,11 +15,14 @@ from grid_bot.operator_dashboard import (
     fmt_money,
     fmt_pct,
     health_plain_text,
+    human_operator_reason,
     human_grid_type,
     human_lifecycle,
     human_spacing,
     inventory_summary,
+    lifecycle_progress_summary,
     live_config,
+    orders_are_updating,
     pnl_values,
     preview_edit_summary,
     recent_activity,
@@ -354,13 +357,25 @@ def render_grid_recommendation() -> None:
 
 def render_orders(live: dict) -> None:
     buys, sells = split_pending_orders(live)
+    updating = orders_are_updating(live)
     left, right = st.columns(2)
     with left:
         st.caption(f"{len(buys)} Buy Orders")
-        st.dataframe(pd.DataFrame(buys or [{"Price": "-", "Lots": "-", "Status": "-"}]), use_container_width=True, hide_index=True)
+        placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
+        st.dataframe(pd.DataFrame(buys or placeholder), use_container_width=True, hide_index=True)
     with right:
         st.caption(f"{len(sells)} Sell Orders")
-        st.dataframe(pd.DataFrame(sells or [{"Price": "-", "Lots": "-", "Status": "-"}]), use_container_width=True, hide_index=True)
+        placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
+        st.dataframe(pd.DataFrame(sells or placeholder), use_container_width=True, hide_index=True)
+
+
+def render_lifecycle_progress(live: dict) -> None:
+    lines = lifecycle_progress_summary(live)
+    if not lines:
+        return
+    st.markdown("<div class='section-label'>Lifecycle Progress</div>", unsafe_allow_html=True)
+    for line in lines:
+        st.write(line)
 
 
 def render_live_dashboard(live: dict) -> None:
@@ -422,6 +437,8 @@ def render_live_dashboard(live: dict) -> None:
         render_card("Order Size", fmt_lots(cfg.get("lot_size")))
     with grid_cols[5]:
         render_card("Maximum", fmt_lots(cfg.get("max_inventory_lots")))
+
+    render_lifecycle_progress(live)
 
     render_grid_recommendation()
 
@@ -534,9 +551,9 @@ def render_edit_grid(live: dict) -> None:
                     st.write(line)
             validation = preview.get("validation") or {}
             for warning in validation.get("warnings") or []:
-                st.warning(warning)
+                st.warning(human_operator_reason(warning))
             for error in validation.get("errors") or []:
-                st.error(error)
+                st.error(human_operator_reason(error))
 
         b1, b2, b3 = st.columns([1, 1, 1])
         if b1.button("Cancel", use_container_width=True):

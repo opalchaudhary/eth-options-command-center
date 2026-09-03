@@ -56,6 +56,22 @@ HEALTH_MESSAGES = {
     "SUPABASE_FAILURE": "Trading records are temporarily unavailable.",
 }
 
+OPERATOR_REASON_MESSAGES = {
+    "AMBIGUOUS_SUBMISSION": "Order submission is being verified with Delta.",
+    "AMBIGUOUS_SUBMISSIONS": "Order submissions are being verified with Delta.",
+    "CURRENT_INVENTORY_PRESERVED": "Current position was preserved.",
+    "CURRENT_INVENTORY_ABOVE_PROPOSED_MAX": "Current position is above the proposed maximum inventory.",
+    "DEPLOYMENT_INCOMPLETE": "The deployed grid is incomplete.",
+    "EXCHANGE_TRUTH_UNAVAILABLE": "Delta verification is temporarily unavailable.",
+    "MISSING_INTENDED_ORDERS": "Some intended grid orders are still waiting.",
+    "NEUTRAL_DEPLOYMENT_ONE_SIDED": "Neutral grid deployment is not balanced yet.",
+    "TERMINAL_INTENDED_ORDERS": "Some intended orders reached a terminal state before the grid completed.",
+    "TRUTH_UNAVAILABLE": "Delta verification is temporarily unavailable.",
+    "UNRESOLVED_EXCHANGE_TRUTH": "Some Delta orders could not be verified yet.",
+}
+
+TRANSITIONAL_LIFECYCLE_STATES = {"STARTING", "PAUSING", "RESUMING", "EDITING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
+
 IST = ZoneInfo("Asia/Kolkata") if ZoneInfo else timezone(timedelta(hours=5, minutes=30))
 
 
@@ -229,6 +245,64 @@ def human_order_status(status: str) -> str:
     if status in {"submitted", "pending", "proposed"}:
         return "Pending"
     return status.replace("_", " ").title() or "-"
+
+
+def human_operator_reason(value: Any) -> str:
+    text = str(value or "")
+    return OPERATOR_REASON_MESSAGES.get(text.upper(), text.replace("_", " ").title() if text else "")
+
+
+def lifecycle_progress_summary(live: dict | None) -> list[str]:
+    live = live or {}
+    progress = live.get("lifecycle_progress") or {}
+    completeness = live.get("deployment_completeness") or {}
+    if not progress and not completeness:
+        return []
+    operation = str(progress.get("operation") or live.get("lifecycle_state") or "").replace("_", " ").title()
+    stage = str(progress.get("stage") or "").replace("_", " ").title()
+    message = progress.get("message") or "Grid operation in progress."
+    lines = [str(message)]
+    expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
+    confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
+    filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
+    buy_confirmed = int(progress.get("buy_confirmed_orders") or completeness.get("buy_accounted") or 0)
+    sell_confirmed = int(progress.get("sell_confirmed_orders") or completeness.get("sell_accounted") or 0)
+    ambiguous = int(progress.get("ambiguous_orders") or completeness.get("ambiguous") or 0)
+    missing = int(progress.get("missing_orders") or completeness.get("missing") or 0)
+    waiting = int(progress.get("waiting_orders") or 0)
+    remaining = max(0, expected - confirmed - filled - int(progress.get("deferred_orders") or completeness.get("deferred") or 0))
+    if operation or stage:
+        lines.append(" | ".join(part for part in [operation, stage] if part))
+    if expected:
+        lines.append(f"Configured: {expected} levels")
+        lines.append(f"Deployed: {confirmed + filled} confirmed ({buy_confirmed} BUY / {sell_confirmed} SELL), {remaining} waiting")
+    elif waiting:
+        lines.append(f"{waiting} orders waiting for Delta.")
+    if ambiguous:
+        lines.append(f"{ambiguous} order submissions are being verified with Delta.")
+    if missing:
+        lines.append(f"{missing} intended orders are not confirmed yet.")
+    retry_attempts = int(progress.get("retry_attempts") or 0)
+    if retry_attempts:
+        lines.append(f"Delta retries: {retry_attempts} attempts, {float(progress.get('retry_wait_seconds') or 0):.1f}s waiting")
+    stall = progress.get("stall_message")
+    if stall:
+        lines.append(human_operator_reason(stall))
+    elapsed = progress.get("elapsed_seconds")
+    if elapsed not in [None, ""]:
+        lines.append(f"Elapsed: {int(float(elapsed))}s")
+    return lines
+
+
+def orders_are_updating(live: dict | None) -> bool:
+    live = live or {}
+    lifecycle = str(live.get("lifecycle_state") or "").upper()
+    if lifecycle not in TRANSITIONAL_LIFECYCLE_STATES:
+        return False
+    progress = live.get("lifecycle_progress") or {}
+    expected = int(progress.get("expected_orders") or (live.get("deployment_completeness") or {}).get("expected") or 0)
+    confirmed = int(progress.get("confirmed_orders") or (live.get("deployment_completeness") or {}).get("confirmed_open") or 0)
+    return expected > 0 and confirmed < expected and not active_orders(live)
 
 
 def pnl_values(live: dict | None) -> dict:

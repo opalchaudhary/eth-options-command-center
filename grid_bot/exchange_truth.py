@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import time
 from typing import Any, Callable
 
 from .models import GridType, Side, utc_now
@@ -44,6 +45,7 @@ class ExchangeTruthResult:
     request_count: int = 0
     errors: list[str] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
+    timings: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -62,6 +64,7 @@ class ExchangeTruthResult:
             "gridbot_inventory": str(self.gridbot_inventory),
             "delta_position": str(self.delta_position),
             "request_count": self.request_count,
+            "timings": self.timings,
             "errors": self.errors,
             "events": self.events,
             "last_successful_reconcile": utc_now() if not self.errors else None,
@@ -100,14 +103,32 @@ def next_cursor(payload: dict | None) -> str | None:
     return next((str(item) for item in candidates if item not in [None, ""]), None)
 
 
-def fetch_paginated(fetch_page: Callable[..., dict], result: ExchangeTruthResult, page_size: int = 50, max_pages: int = 10) -> list[dict]:
+def _record_timing(result: ExchangeTruthResult, label: str, started: float, *, count: int | None = None) -> None:
+    elapsed = round(time.perf_counter() - started, 4)
+    calls = result.timings.setdefault("calls", [])
+    item = {"label": label, "elapsed_seconds": elapsed}
+    if count is not None:
+        item["rows"] = count
+    calls.append(item)
+    totals = result.timings.setdefault("totals", {})
+    bucket = totals.setdefault(label, {"calls": 0, "elapsed_seconds": 0.0, "rows": 0})
+    bucket["calls"] += 1
+    bucket["elapsed_seconds"] = round(float(bucket.get("elapsed_seconds") or 0.0) + elapsed, 4)
+    if count is not None:
+        bucket["rows"] = int(bucket.get("rows") or 0) + count
+
+
+def fetch_paginated(fetch_page: Callable[..., dict], result: ExchangeTruthResult, label: str, page_size: int = 50, max_pages: int = 10) -> list[dict]:
     rows: list[dict] = []
     after = None
     seen: set[str] = set()
     for _ in range(max_pages):
+        started = time.perf_counter()
         payload = fetch_page(after=after, page_size=page_size)
         result.request_count += 1
-        rows.extend(result_rows(payload))
+        page_rows = result_rows(payload)
+        rows.extend(page_rows)
+        _record_timing(result, label, started, count=len(page_rows))
         after = next_cursor(payload)
         if not after or after in seen:
             break
@@ -221,12 +242,16 @@ def reconcile_exchange_truth(
     product_symbol = product.get("symbol") or config.get("product_symbol") or "ETHUSD"
 
     try:
+        started = time.perf_counter()
         open_rows = result_rows(client.open_orders(product_id))
         result.request_count += 1
+        _record_timing(result, "open_orders", started, count=len(open_rows))
+        started = time.perf_counter()
         positions = client.positions("ETH")
         result.request_count += 1
-        order_history = fetch_paginated(lambda after=None, page_size=50: client.order_history(product_id, after=after, page_size=page_size), result)
-        fill_history = fetch_paginated(lambda after=None, page_size=50: client.fills(product_id, after=after, page_size=page_size), result)
+        _record_timing(result, "positions", started, count=len(result_rows(positions)))
+        order_history = fetch_paginated(lambda after=None, page_size=50: client.order_history(product_id, after=after, page_size=page_size), result, "order_history")
+        fill_history = fetch_paginated(lambda after=None, page_size=50: client.fills(product_id, after=after, page_size=page_size), result, "fills")
     except Exception as exc:
         result.errors.append(str(exc))
         return result.as_dict()
@@ -279,8 +304,10 @@ def reconcile_exchange_truth(
             try:
                 direct_order = direct_by_exchange.get(local_exchange_id)
                 if direct_order is None:
+                    started = time.perf_counter()
                     direct_rows = result_rows(client.get_order(local_exchange_id))
                     result.request_count += 1
+                    _record_timing(result, "direct_order_lookup", started, count=len(direct_rows))
                     direct_order = direct_rows[0] if direct_rows else {}
                     direct_by_exchange[local_exchange_id] = direct_order
                 if direct_order:

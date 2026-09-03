@@ -2076,6 +2076,40 @@ def test_operator_start_skips_per_order_existing_lookup_after_preflight(tmp_path
     assert progress["elapsed_seconds"] >= 0
 
 
+def test_stop_reuses_final_reconciliation_when_open_count_is_zero(tmp_path):
+    class CountingClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.open_order_calls = 0
+
+        def open_orders(self, product_id=None):
+            self.open_order_calls += 1
+            return super().open_orders(product_id)
+
+    client = CountingClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    started = lifecycle.start_operator_grid(
+        {
+            "bot_name": "Operator Grid",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        }
+    )
+    client.open_order_calls = 0
+
+    stopped = lifecycle.stop(started["run"]["run_id"], "unit_stop")
+
+    assert stopped["ok"] is True
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert client.open_order_calls <= 2
+
+
 def test_one_sided_neutral_partial_start_cannot_become_running_or_healthy(tmp_path):
     class SellSideUnavailableClient(_FakeLifecycleClient):
         def place_order(self, payload):
