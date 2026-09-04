@@ -176,10 +176,12 @@ def test_non_persistent_recommendation_inserts_zero_rows():
 def test_ordinary_page_load_and_rerender_do_not_request_recommendation():
     text = PAGE.read_text()
     fragment_body = text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1].split("def render_idle", maxsplit=1)[0]
-    dashboard_body = text.split("def render_live_dashboard", maxsplit=1)[1].split("def render_actions", maxsplit=1)[0]
+    live_dashboard_body = text.split("def render_live_dashboard", maxsplit=1)[1].split("def render_actions", maxsplit=1)[0]
+    operator_panel_body = text.split("def render_operator_panel", maxsplit=1)[1].split("def render_edit_grid", maxsplit=1)[0]
 
     assert "/api/grid/v01/recommendation" not in fragment_body
-    assert "render_grid_recommendation()" in dashboard_body
+    assert "render_grid_recommendation()" not in live_dashboard_body
+    assert "render_grid_recommendation()" in operator_panel_body
     assert "safe_post(\"/api/grid/v01/recommendation\"" in text
 
 

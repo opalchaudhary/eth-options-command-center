@@ -440,8 +440,6 @@ def render_live_dashboard(live: dict) -> None:
 
     render_lifecycle_progress(live)
 
-    render_grid_recommendation()
-
     st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
     render_health(health)
 
@@ -460,9 +458,6 @@ def render_live_dashboard(live: dict) -> None:
         render_card("Recent Activity Time", "Asia/Kolkata")
     for line in recent_activity(live):
         st.markdown(f"<div class='activity-line'>{line}</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='section-label'>Actions</div>", unsafe_allow_html=True)
-    render_actions(live)
 
 
 def render_actions(live: dict) -> None:
@@ -506,6 +501,16 @@ def render_pending_operator_forms(live: dict) -> None:
 
     if st.session_state.get("gridbot_edit_open"):
         render_edit_grid(live)
+
+
+def render_operator_panel(live: dict) -> None:
+    if live.get("run_id") or live.get("lifecycle_state"):
+        render_grid_recommendation()
+        st.markdown("<div class='section-label'>Actions</div>", unsafe_allow_html=True)
+        render_actions(live)
+        render_pending_operator_forms(live)
+    else:
+        render_create_grid(live)
 
 
 def render_edit_grid(live: dict) -> None:
@@ -766,8 +771,5 @@ with st.sidebar:
 
 live_fragment()
 last_live = st.session_state.get("gridbot_last_live_state") or {}
-if last_live.get("run_id") or last_live.get("lifecycle_state"):
-    render_pending_operator_forms(last_live)
-else:
-    render_create_grid(last_live)
+render_operator_panel(last_live)
 render_history()
