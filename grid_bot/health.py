@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from .accounting import build_run_accounting
+from .exchange_truth import directional_open_order_violations
 from .models import GridStatus, GridType, utc_now
 
 
@@ -118,6 +119,16 @@ def _age_seconds(timestamp: str | None, now: datetime | None = None) -> float | 
 
 def _issue(code: str, severity: HealthSeverity, message: str, run: dict | None = None, **context: Any) -> HealthIssue:
     return HealthIssue(code=code, severity=severity.value, message=message, run_id=(run or {}).get("run_id"), context={k: v for k, v in context.items() if v not in [None, ""]})
+
+
+def _max_inventory_exceeded(grid_type: str, inventory: Decimal, max_inventory: Decimal) -> bool:
+    if not max_inventory:
+        return False
+    if grid_type == GridType.LONG_BIAS.value:
+        return inventory > max_inventory
+    if grid_type == GridType.SHORT_BIAS.value:
+        return -inventory > max_inventory
+    return abs(inventory) > max_inventory
 
 
 def _open_orders(run: dict | None) -> list[dict]:
@@ -248,14 +259,20 @@ def evaluate_gridbot_health(
         elif event_type == "FILL_LEDGER_MISMATCH":
             issues.append(_issue("FILL_LEDGER_MISMATCH", HealthSeverity.CRITICAL, "Fill ledger exceeds requested order quantity.", run_for_issue, **payload))
 
-    max_inventory = abs(_decimal((run.get("config") or {}).get("max_inventory_lots")))
-    if max_inventory and abs(operational_inventory) > max_inventory:
-        issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(operational_inventory), max_inventory=str(max_inventory)))
     grid_type = str((run.get("config") or {}).get("grid_type") or "")
-    if grid_type == GridType.LONG_BIAS.value and operational_inventory < 0:
-        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Long grid is unexpectedly net short.", run_for_issue, inventory=str(operational_inventory)))
-    if grid_type == GridType.SHORT_BIAS.value and operational_inventory > 0:
-        issues.append(_issue("GRID_NATURE_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "Short grid is unexpectedly net long.", run_for_issue, inventory=str(operational_inventory)))
+    max_inventory = abs(_decimal((run.get("config") or {}).get("max_inventory_lots")))
+    if _max_inventory_exceeded(grid_type, operational_inventory, max_inventory):
+        issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(operational_inventory), max_inventory=str(max_inventory)))
+    for violation in directional_open_order_violations(run, operational_inventory):
+        issues.append(
+            _issue(
+                "GRID_NATURE_INVENTORY_VIOLATION",
+                HealthSeverity.CRITICAL,
+                "Open GridBot order would increase exposure against directional grid semantics.",
+                run_for_issue,
+                **violation,
+            )
+        )
     if not external_adjustment and abs(position - inventory) > 0 and not transient_fill_position_catchup:
         issues.append(_issue("POSITION_ATTRIBUTION_UNSAFE", HealthSeverity.CRITICAL, "Account exposure cannot be safely attributed to this GridBot.", run_for_issue, delta_position=str(position), gridbot_inventory=str(inventory)))
 

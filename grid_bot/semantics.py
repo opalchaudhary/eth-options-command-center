@@ -105,14 +105,14 @@ def evaluate_order_semantics(
         if side == Side.SELL and opening > 0 and short_after > max_inventory:
             reasons.append("SHORT_OPENING_RESERVATION_EXCEEDED")
     elif grid_type == GridType.LONG_BIAS:
-        if projected < 0:
+        if projected < min(current_inventory, Decimal("0")):
             reasons.append("LONG_BIAS_CANNOT_OPEN_NET_SHORT")
         if not reduces and projected > max_inventory:
             reasons.append("MAX_LONG_INVENTORY_EXCEEDED")
         if side == Side.BUY and opening > 0 and long_after > max_inventory:
             reasons.append("LONG_OPENING_RESERVATION_EXCEEDED")
     elif grid_type == GridType.SHORT_BIAS:
-        if projected > 0:
+        if projected > max(current_inventory, Decimal("0")):
             reasons.append("SHORT_BIAS_CANNOT_OPEN_NET_LONG")
         if not reduces and projected < -max_inventory:
             reasons.append("MAX_SHORT_INVENTORY_EXCEEDED")

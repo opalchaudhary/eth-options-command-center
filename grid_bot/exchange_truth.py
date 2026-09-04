@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable
 
 from .models import GridType, Side, utc_now
+from .semantics import evaluate_order_semantics
 
 
 GRIDBOT_ORDER_PREFIX = "DGB01-"
@@ -214,6 +215,57 @@ def inventory_from_fills(fills: list[dict]) -> Decimal:
     return inventory
 
 
+def directional_open_order_violations(run: dict, current_inventory: Decimal) -> list[dict]:
+    config = run.get("config") or {}
+    try:
+        grid_type = GridType(config.get("grid_type") or GridType.NEUTRAL.value)
+    except ValueError:
+        return []
+    if grid_type not in {GridType.LONG_BIAS, GridType.SHORT_BIAS}:
+        return []
+    max_inventory = decimal_value(config.get("max_inventory_lots"))
+    simulated_open: list[dict[str, Any]] = []
+    violations: list[dict] = []
+    for order in (run.get("orders") or {}).values():
+        if str(order.get("status") or "").lower() not in {"open", "partially_filled", "pending", "submitted"}:
+            continue
+        try:
+            side = Side(str(order.get("side")).lower())
+        except ValueError:
+            continue
+        remaining = decimal_value(order.get("remaining_quantity") or order.get("requested_quantity"))
+        if remaining <= 0:
+            continue
+        decision = evaluate_order_semantics(grid_type, current_inventory, max_inventory, side, remaining, simulated_open)
+        nature_reasons = [
+            reason
+            for reason in decision.reason_codes
+            if reason in {"LONG_BIAS_CANNOT_OPEN_NET_SHORT", "SHORT_BIAS_CANNOT_OPEN_NET_LONG"}
+        ]
+        if nature_reasons:
+            violations.append(
+                {
+                    "grid_type": grid_type.value,
+                    "inventory": str(current_inventory),
+                    "client_order_id": order.get("client_order_id"),
+                    "side": side.value,
+                    "remaining_quantity": str(remaining),
+                    "reason_codes": nature_reasons,
+                }
+            )
+            continue
+        simulated_open.append(
+            {
+                "side": side.value,
+                "remaining_quantity": str(remaining),
+                "requested_quantity": str(order.get("requested_quantity") or remaining),
+                "status": "open",
+                "opens_inventory": decision.opens_inventory,
+            }
+        )
+    return violations
+
+
 def position_size(positions_response: dict, product_id: int, product_symbol: str) -> Decimal:
     rows = result_rows(positions_response)
     for row in rows:
@@ -392,11 +444,8 @@ def reconcile_exchange_truth(
             },
         )
 
-    grid_type = GridType(config.get("grid_type") or GridType.NEUTRAL.value)
-    if grid_type == GridType.LONG_BIAS and result.gridbot_inventory < 0:
-        _event(result, "GRID_NATURE_INVENTORY_VIOLATION", {"grid_type": grid_type.value, "inventory": str(result.gridbot_inventory)})
-    if grid_type == GridType.SHORT_BIAS and result.gridbot_inventory > 0:
-        _event(result, "GRID_NATURE_INVENTORY_VIOLATION", {"grid_type": grid_type.value, "inventory": str(result.gridbot_inventory)})
+    for violation in directional_open_order_violations(run, result.gridbot_inventory):
+        _event(result, "GRID_NATURE_INVENTORY_VIOLATION", violation)
 
     run["last_reconciled_at"] = utc_now()
     return result.as_dict()

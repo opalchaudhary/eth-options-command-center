@@ -147,6 +147,8 @@ def test_grid_nature_does_not_change_arithmetic_or_geometric_prices():
         (GridType.NEUTRAL, "-50", Side.SELL, "5", False),
         (GridType.NEUTRAL, "-50", Side.BUY, "5", True),
         (GridType.NEUTRAL, "45", Side.BUY, "10", False),
+        (GridType.LONG_BIAS, "-200", Side.BUY, "10", True),
+        (GridType.LONG_BIAS, "-200", Side.SELL, "10", False),
         (GridType.LONG_BIAS, "0", Side.BUY, "5", True),
         (GridType.LONG_BIAS, "0", Side.SELL, "5", False),
         (GridType.LONG_BIAS, "5", Side.SELL, "5", True),
@@ -155,6 +157,8 @@ def test_grid_nature_does_not_change_arithmetic_or_geometric_prices():
         (GridType.LONG_BIAS, "45", Side.BUY, "10", False),
         (GridType.LONG_BIAS, "50", Side.BUY, "5", False),
         (GridType.LONG_BIAS, "50", Side.SELL, "5", True),
+        (GridType.SHORT_BIAS, "200", Side.SELL, "10", True),
+        (GridType.SHORT_BIAS, "200", Side.BUY, "10", False),
         (GridType.SHORT_BIAS, "0", Side.SELL, "5", True),
         (GridType.SHORT_BIAS, "0", Side.BUY, "5", False),
         (GridType.SHORT_BIAS, "-5", Side.BUY, "5", True),
@@ -676,6 +680,44 @@ def test_edit_grid_preserves_inventory_and_blocks_unsafe_nature_transition(tmp_p
     assert edited["reconciliation"]["delta_position"] == "1"
     assert edited["run"]["config"]["grid_type"] == "short_bias"
     assert deferred
+    assert any("SHORT_BIAS_CANNOT_OPEN_NET_LONG" in (order.get("rejection_reason") or "") for order in deferred)
+
+
+def test_edit_grid_neutral_to_long_preserves_inherited_short_inventory(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    _seed_gridbot_inventory(client, run, side="sell", size="1")
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_type": "long_bias"}, reason="neutral_to_long_with_short")
+    created = [order for order in edited["run"]["orders"].values() if order.get("config_version") == 2 and order.get("order_kind") == "edit_grid"]
+    deferred = [order for order in edited["run"].get("deferred_orders", {}).values() if order.get("config_version") == 2]
+
+    assert edited["ok"] is True
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert edited["reconciliation"]["gridbot_inventory"] == "-1"
+    assert edited["reconciliation"]["delta_position"] == "-1"
+    assert edited["run"]["config"]["grid_type"] == "long_bias"
+    assert any(order["side"] == "buy" for order in created)
+    assert any("LONG_BIAS_CANNOT_OPEN_NET_SHORT" in (order.get("rejection_reason") or "") for order in deferred)
+
+
+def test_edit_grid_neutral_to_short_preserves_inherited_long_inventory(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    _seed_gridbot_inventory(client, run, side="buy", size="1")
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_type": "short_bias"}, reason="neutral_to_short_with_long")
+    created = [order for order in edited["run"]["orders"].values() if order.get("config_version") == 2 and order.get("order_kind") == "edit_grid"]
+    deferred = [order for order in edited["run"].get("deferred_orders", {}).values() if order.get("config_version") == 2]
+
+    assert edited["ok"] is True
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert edited["reconciliation"]["gridbot_inventory"] == "1"
+    assert edited["reconciliation"]["delta_position"] == "1"
+    assert edited["run"]["config"]["grid_type"] == "short_bias"
+    assert any(order["side"] == "sell" for order in created)
     assert any("SHORT_BIAS_CANNOT_OPEN_NET_LONG" in (order.get("rejection_reason") or "") for order in deferred)
 
 
@@ -2608,13 +2650,29 @@ def test_exchange_truth_position_and_fill_ledger_mismatches():
     assert any(event["event_type"] == "FILL_LEDGER_MISMATCH" for event in bad["events"])
 
 
-def test_exchange_truth_grid_nature_sign_violations():
+def test_exchange_truth_allows_inherited_opposite_inventory_sign():
     long_run = _truth_run(grid_type="long_bias")
     long_result = reconcile_exchange_truth(long_run, _TruthClient(fill_pages=[[_fill(side="sell")]], position="-5"))
-    assert any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in long_result["events"])
+    assert not any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in long_result["events"])
 
     short_run = _truth_run(grid_type="short_bias")
     short_result = reconcile_exchange_truth(short_run, _TruthClient(fill_pages=[[_fill(side="buy")]], position="5"))
+    assert not any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in short_result["events"])
+
+
+def test_exchange_truth_flags_directional_risk_increasing_open_orders():
+    long_run = _truth_run(grid_type="long_bias", status="open")
+    long_run["orders"]["DGB01-truth-L001-B-1"]["side"] = "sell"
+    long_open = _open_exchange_order()
+    long_open["side"] = "sell"
+    long_result = reconcile_exchange_truth(long_run, _TruthClient(open_orders=[long_open], position="-5"))
+    assert any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in long_result["events"])
+
+    short_run = _truth_run(grid_type="short_bias", status="open")
+    short_run["orders"]["DGB01-truth-L001-B-1"]["side"] = "buy"
+    short_open = _open_exchange_order()
+    short_open["side"] = "buy"
+    short_result = reconcile_exchange_truth(short_run, _TruthClient(open_orders=[short_open], position="5"))
     assert any(event["event_type"] == "GRID_NATURE_INVENTORY_VIOLATION" for event in short_result["events"])
 
 
@@ -4210,6 +4268,64 @@ def client_health_state(**updates):
 
 
 @pytest.mark.parametrize(
+    "grid_type,inventory",
+    [
+        ("long_bias", "-200"),
+        ("short_bias", "200"),
+    ],
+)
+def test_gridbot_health_allows_inherited_opposite_inventory(grid_type, inventory):
+    run = {
+        "run_id": "run-inherited",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": grid_type, "max_inventory_lots": "50"},
+        "orders": {},
+        "fills": {},
+    }
+    state = {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": GridStatus.RUNNING.value}
+
+    health = evaluate_gridbot_health(state, run, {"gridbot_inventory": inventory, "delta_position": inventory, "exchange_open_orders": 0})
+
+    assert health["overall_status"] == "HEALTHY"
+    assert health["active_issues"] == []
+    assert health["safe_for_risk_reduce"] is True
+
+
+@pytest.mark.parametrize(
+    "grid_type,inventory,side,reason",
+    [
+        ("long_bias", "-200", "sell", "LONG_BIAS_CANNOT_OPEN_NET_SHORT"),
+        ("short_bias", "200", "buy", "SHORT_BIAS_CANNOT_OPEN_NET_LONG"),
+    ],
+)
+def test_gridbot_health_flags_risk_increasing_directional_open_order(grid_type, inventory, side, reason):
+    run = {
+        "run_id": "run-directional-order",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": grid_type, "max_inventory_lots": "50"},
+        "orders": {
+            "bad-order": {
+                "client_order_id": "DGB01-bad-order",
+                "exchange_order_id": "ex-bad",
+                "status": "open",
+                "side": side,
+                "requested_quantity": "10",
+                "remaining_quantity": "10",
+            }
+        },
+        "fills": {},
+    }
+    state = {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": GridStatus.RUNNING.value}
+
+    health = evaluate_gridbot_health(state, run, {"gridbot_inventory": inventory, "delta_position": inventory, "exchange_open_orders": 1})
+    issues = health["active_issues"]
+
+    assert "GRID_NATURE_INVENTORY_VIOLATION" in {issue["code"] for issue in issues}
+    assert any(reason in issue.get("context", {}).get("reason_codes", []) for issue in issues)
+    assert health["overall_status"] == "CRITICAL"
+
+
+@pytest.mark.parametrize(
     "error,expected_code",
     [
         ("401 unauthorized", "DELTA_AUTH_FAILURE"),
@@ -4500,7 +4616,7 @@ def test_supabase_load_run_state_reconstructs_completeness_from_normalized_repla
     assert completeness["reasons"] == []
 
 
-def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_gate():
+def test_gridbot_health_detects_position_mismatch_and_attribution_risk():
     run = {
         "run_id": "run-risk",
         "status": GridStatus.RUNNING.value,
@@ -4511,7 +4627,8 @@ def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_
     health = evaluate_gridbot_health(state, run, {"gridbot_inventory": "-3", "delta_position": "1", "position_mismatches": 1})
     codes = {issue["code"] for issue in health["active_issues"]}
 
-    assert {"POSITION_MISMATCH", "MAX_INVENTORY_VIOLATION", "GRID_NATURE_INVENTORY_VIOLATION", "POSITION_ATTRIBUTION_UNSAFE"} <= codes
+    assert {"POSITION_MISMATCH", "POSITION_ATTRIBUTION_UNSAFE"} <= codes
+    assert "GRID_NATURE_INVENTORY_VIOLATION" not in codes
     assert health["overall_status"] == "CRITICAL"
     assert health["safe_for_risk_increase"] is False
     assert health["safe_for_risk_reduce"] is False
