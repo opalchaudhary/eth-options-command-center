@@ -17,6 +17,7 @@ DEPLOYMENT_OPEN_STATUSES = {"open", "partially_filled"}
 DEPLOYMENT_VALID_STATUSES = {"confirmed_open", "filled", "deferred"}
 DEPLOYMENT_UNRESOLVED_STATUSES = {"submit_pending", "cancel_pending", "unknown", "unresolved", "ambiguous", "replace_pending"}
 DEPLOYMENT_DEFERRED_STATUSES = {"deferred", "blocked"}
+DEPLOYMENT_TERMINAL_REPLACED_STATUSES = {"cancelled", "closed", "filled", "not_open"}
 
 
 class SupabasePersistenceError(RuntimeError):
@@ -84,6 +85,12 @@ def _reconstructed_deployment_completeness(config: dict, levels: list[dict], ord
     by_level: dict[str, list[dict]] = {}
     for order in current_orders:
         by_level.setdefault(str(order.get("level_id") or ""), []).append(order)
+    source_keys_with_replacements = {
+        str(order.get("source_order_key") or "")
+        for order in current_orders
+        if order.get("source_order_key")
+        and str(order.get("status") or "").lower() in DEPLOYMENT_OPEN_STATUSES | DEPLOYMENT_DEFERRED_STATUSES
+    }
     counts = {
         "expected": len(levels),
         "eligible": len(levels),
@@ -109,6 +116,11 @@ def _reconstructed_deployment_completeness(config: dict, levels: list[dict], ord
             elif statuses & DEPLOYMENT_OPEN_STATUSES:
                 status = "confirmed_open"
             elif "filled" in statuses:
+                status = "filled"
+            elif statuses & DEPLOYMENT_TERMINAL_REPLACED_STATUSES and any(
+                str(order.get("order_key") or order.get("client_order_id") or "") in source_keys_with_replacements
+                for order in level_orders
+            ):
                 status = "filled"
             elif statuses & DEPLOYMENT_DEFERRED_STATUSES:
                 status = "deferred"
@@ -1139,7 +1151,7 @@ class SupabaseGridRepository:
             "start_stage": startup_stage,
             "startup": startup,
         }
-        deployment_completeness = _reconstructed_deployment_completeness(config, run_state["levels"], orders)
+        deployment_completeness = _reconstructed_deployment_completeness(config, run_state["levels"], list(run_state["orders"].values()))
         run_state["deployment_completeness"] = deployment_completeness
         status = str(run_row.get("status") or "")
         operation = {

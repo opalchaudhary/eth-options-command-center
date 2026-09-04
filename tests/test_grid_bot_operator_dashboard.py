@@ -247,8 +247,19 @@ def test_dashboard_uses_live_fragment_without_full_page_refresh() -> None:
 
     assert "streamlit_autorefresh" not in text
     assert "@fragment(run_every=\"5s\")" in text
+    assert "@st.cache_data(ttl=5" in text
     assert "fetch_live_state" in text
     assert "/api/grid/v01/live/state" in text
+
+
+def test_dashboard_splits_live_surface_into_small_fragments() -> None:
+    text = PAGE.read_text()
+
+    assert "def live_status_fragment()" in text
+    assert "def live_metrics_fragment()" in text
+    assert "def live_orders_fragment()" in text
+    assert "def live_activity_fragment()" in text
+    assert "render_live_dashboard(live)" not in text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1]
 
 
 def test_dashboard_hides_developer_controls_and_raw_internals() -> None:
@@ -316,11 +327,10 @@ def test_grid_recommendation_persists_in_session_state() -> None:
 
 def test_grid_recommendation_is_below_current_grid_and_above_health() -> None:
     text = PAGE.read_text()
-    dashboard_body = text.split("def render_live_dashboard", maxsplit=1)[1].split("def render_actions", maxsplit=1)[0]
+    metrics_body = text.split("def render_live_metrics", maxsplit=1)[1].split("def render_live_orders", maxsplit=1)[0]
+    status_body = text.split("def render_live_status", maxsplit=1)[1].split("def render_live_metrics", maxsplit=1)[0]
     operator_panel_body = text.split("def render_operator_panel", maxsplit=1)[1].split("def render_edit_grid", maxsplit=1)[0]
 
-    current_grid_index = dashboard_body.index("Current Grid")
-    health_index = dashboard_body.index("Health")
-
-    assert current_grid_index < health_index
+    assert "Current Grid" in metrics_body
+    assert "Health" in status_body
     assert "render_grid_recommendation()" in operator_panel_body

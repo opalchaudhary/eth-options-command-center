@@ -211,6 +211,7 @@ def apply_pending_suggested_range(button_key: str) -> None:
     st.session_state[pending["upper_key"]] = pending["upper"]
 
 
+@st.cache_data(ttl=5, show_spinner=False)
 def fetch_live_state() -> dict:
     return safe_get("/api/grid/v01/live/state", timeout=15)
 
@@ -378,17 +379,12 @@ def render_lifecycle_progress(live: dict) -> None:
         st.write(line)
 
 
-def render_live_dashboard(live: dict) -> None:
+def render_live_status(live: dict) -> None:
     health = live.get("health") or {}
     status = health.get("overall_status") or "HEALTHY"
     telemetry = live.get("account_risk_state") or {}
     cfg = live_config(live)
-    lifecycle = live.get("lifecycle_state")
     grid_name = human_grid_type(cfg.get("grid_type") or live.get("grid_nature"))
-    spacing = human_spacing(cfg.get("spacing_type"))
-    inv = inventory_summary(live)
-    pnl = pnl_values(live)
-    order_rows = active_orders(live)
 
     head_left, head_right = st.columns([3, 1])
     with head_left:
@@ -405,6 +401,20 @@ def render_live_dashboard(live: dict) -> None:
             f"<div class='operator-sub'>{health_plain_text(health)[0]}</div></div>",
             unsafe_allow_html=True,
         )
+
+    render_lifecycle_progress(live)
+
+    st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
+    render_health(health)
+
+
+def render_live_metrics(live: dict) -> None:
+    telemetry = live.get("account_risk_state") or {}
+    cfg = live_config(live)
+    grid_name = human_grid_type(cfg.get("grid_type") or live.get("grid_nature"))
+    spacing = human_spacing(cfg.get("spacing_type"))
+    inv = inventory_summary(live)
+    pnl = pnl_values(live)
 
     summary_cols = st.columns(3)
     with summary_cols[0]:
@@ -438,14 +448,15 @@ def render_live_dashboard(live: dict) -> None:
     with grid_cols[5]:
         render_card("Maximum", fmt_lots(cfg.get("max_inventory_lots")))
 
-    render_lifecycle_progress(live)
 
-    st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
-    render_health(health)
-
+def render_live_orders(live: dict) -> None:
     st.markdown("<div class='section-label'>Orders Waiting To Be Filled</div>", unsafe_allow_html=True)
     render_orders(live)
 
+
+def render_live_activity(live: dict) -> None:
+    pnl = pnl_values(live)
+    order_rows = active_orders(live)
     st.markdown("<div class='section-label'>Trading Activity</div>", unsafe_allow_html=True)
     activity_cols = st.columns(4)
     with activity_cols[0]:
@@ -458,6 +469,21 @@ def render_live_dashboard(live: dict) -> None:
         render_card("Recent Activity Time", "Asia/Kolkata")
     for line in recent_activity(live):
         st.markdown(f"<div class='activity-line'>{line}</div>", unsafe_allow_html=True)
+
+
+def remember_live_state(live: dict) -> bool:
+    st.session_state["gridbot_last_live_state"] = live
+    if not live.get("ok", True):
+        st.error(live.get("error") or "GridBot API unavailable.")
+        return False
+    return True
+
+
+def render_live_dashboard(live: dict) -> None:
+    render_live_status(live)
+    render_live_metrics(live)
+    render_live_orders(live)
+    render_live_activity(live)
 
 
 def render_actions(live: dict) -> None:
@@ -575,16 +601,41 @@ def render_edit_grid(live: dict) -> None:
 
 
 @fragment(run_every="5s")
-def live_fragment() -> None:
+def live_status_fragment() -> None:
     live = fetch_live_state()
-    st.session_state["gridbot_last_live_state"] = live
-    if not live.get("ok", True):
-        st.error(live.get("error") or "GridBot API unavailable.")
+    if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
-        render_live_dashboard(live)
+        render_live_status(live)
     else:
         render_idle(live)
+
+
+@fragment(run_every="5s")
+def live_metrics_fragment() -> None:
+    live = fetch_live_state()
+    if not remember_live_state(live):
+        return
+    if live.get("run_id") or live.get("lifecycle_state"):
+        render_live_metrics(live)
+
+
+@fragment(run_every="5s")
+def live_orders_fragment() -> None:
+    live = fetch_live_state()
+    if not remember_live_state(live):
+        return
+    if live.get("run_id") or live.get("lifecycle_state"):
+        render_live_orders(live)
+
+
+@fragment(run_every="5s")
+def live_activity_fragment() -> None:
+    live = fetch_live_state()
+    if not remember_live_state(live):
+        return
+    if live.get("run_id") or live.get("lifecycle_state"):
+        render_live_activity(live)
 
 
 def render_idle(live: dict) -> None:
@@ -769,7 +820,10 @@ with st.sidebar:
     if st.button("Refresh Live Now", use_container_width=True):
         st.rerun()
 
-live_fragment()
+live_status_fragment()
+live_metrics_fragment()
+live_orders_fragment()
+live_activity_fragment()
 last_live = st.session_state.get("gridbot_last_live_state") or {}
 render_operator_panel(last_live)
 render_history()

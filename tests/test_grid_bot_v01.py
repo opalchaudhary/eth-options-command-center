@@ -21,7 +21,7 @@ from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
 from grid_bot.risk import GridRiskController, RiskInputs, RiskState, grid_risk_ratio, inventory_utilisation
 from grid_bot.semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
-from grid_bot.supabase_repository import SupabaseGridRepository, SupabasePersistenceError
+from grid_bot.supabase_repository import SupabaseGridRepository, SupabasePersistenceError, _reconstructed_deployment_completeness
 
 
 def _config(bot_id="bot_a", grid_type=GridType.NEUTRAL, spacing=SpacingType.ARITHMETIC):
@@ -4253,6 +4253,185 @@ def test_gridbot_health_treats_persisted_replacement_key_as_protected_after_rest
     health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "-1", "delta_position": "-1", "exchange_open_orders": 1})
 
     assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
+
+
+def test_running_deployment_completeness_accounts_filled_order_with_open_replacement(tmp_path):
+    run = {
+        "run_id": "run-completeness-replacement",
+        "status": GridStatus.RUNNING.value,
+        "config": {
+            "config_version": 1,
+            "grid_type": "neutral",
+            "max_inventory_lots": "200",
+        },
+        "levels": [
+            {"level_id": "L016", "side": "sell", "price": "2499.15", "quantity": "10"},
+            {"level_id": "L017", "side": "sell", "price": "2508.8", "quantity": "10"},
+        ],
+        "orders": {
+            "source-sell": {
+                "order_key": "source-sell",
+                "client_order_id": "source-sell",
+                "exchange_order_id": "ex-source",
+                "level_id": "L017",
+                "side": "sell",
+                "status": "closed",
+                "order_kind": "initial_grid",
+                "config_version": 1,
+            },
+            "target-sell": {
+                "order_key": "target-sell",
+                "client_order_id": "target-sell",
+                "exchange_order_id": "ex-target",
+                "level_id": "L016",
+                "side": "sell",
+                "status": "open",
+                "order_kind": "initial_grid",
+                "config_version": 1,
+            },
+            "replacement-buy": {
+                "order_key": "replacement-buy",
+                "client_order_id": "replacement-buy",
+                "exchange_order_id": "ex-replacement",
+                "level_id": "L016",
+                "side": "buy",
+                "status": "open",
+                "order_kind": "replacement",
+                "config_version": 1,
+                "source_order_key": "source-sell",
+                "source_fill_id": "fill-source",
+                "replacement_group_key": "source-sell:L016:buy",
+            },
+        },
+    }
+
+    completeness = DurableGridBotLifecycle(state_path=tmp_path / "state.json", use_supabase=False)._deployment_completeness(run)
+
+    assert completeness["complete"] is True
+    assert completeness["confirmed_open"] == 1
+    assert completeness["filled"] == 1
+    assert completeness["terminal"] == 0
+    assert completeness["reasons"] == []
+    assert {item["level_id"]: item["status"] for item in completeness["level_states"]}["L017"] == "filled"
+
+
+def test_supabase_reconstructed_completeness_accounts_filled_order_with_open_replacement():
+    config = {"config_version": 1, "grid_type": "neutral"}
+    levels = [
+        {"level_id": "L016", "side": "sell"},
+        {"level_id": "L017", "side": "sell"},
+    ]
+    orders = [
+        {"order_key": "source-sell", "client_order_id": "source-sell", "exchange_order_id": "ex-source", "level_id": "L017", "side": "sell", "status": "closed", "order_kind": "initial_grid", "config_version": 1},
+        {"order_key": "target-sell", "client_order_id": "target-sell", "exchange_order_id": "ex-target", "level_id": "L016", "side": "sell", "status": "open", "order_kind": "initial_grid", "config_version": 1},
+        {
+            "order_key": "replacement-buy",
+            "client_order_id": "replacement-buy",
+            "exchange_order_id": "ex-replacement",
+            "level_id": "L016",
+            "side": "buy",
+            "status": "open",
+            "order_kind": "replacement",
+            "config_version": 1,
+            "source_order_key": "source-sell",
+            "source_fill_id": "fill-source",
+            "replacement_group_key": "source-sell:L016:buy",
+        },
+    ]
+
+    completeness = _reconstructed_deployment_completeness(config, levels, orders)
+
+    assert completeness["complete"] is True
+    assert completeness["filled"] == 1
+    assert completeness["terminal"] == 0
+    assert completeness["reasons"] == []
+
+
+def test_supabase_load_run_state_reconstructs_completeness_from_normalized_replacement_rows():
+    db = _MemorySupabaseGridRepository()
+    run = {
+        "run_id": "run-loader-replacement",
+        "bot_id": "bot-loader",
+        "status": GridStatus.RUNNING.value,
+        "config": {"config_version": 1, "grid_type": "neutral", "max_inventory_lots": "200"},
+        "levels": [
+            {"level_id": "L016", "index": 16, "side": "sell", "price": "2499.15", "quantity": "10"},
+            {"level_id": "L017", "index": 17, "side": "sell", "price": "2508.8", "quantity": "10"},
+        ],
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
+    }
+    db.upsert("grid_runs", [{"run_id": run["run_id"], "bot_id": run["bot_id"], "status": run["status"], "active_config_version": 1, "config_version": 1, "started_at": utc_now()}], on_conflict="run_id")
+    db.upsert("grid_bots", [{"bot_id": run["bot_id"], "bot_name": "Loader Grid", "product_symbol": "ETHUSD"}], on_conflict="bot_id")
+    db.upsert("grid_config_versions", [{"bot_id": run["bot_id"], "config_version": 1, "config": run["config"], "created_at": utc_now()}], on_conflict="bot_id,config_version")
+    db.upsert(
+        "grid_levels",
+        [
+            {
+                "run_id": run["run_id"],
+                "level_id": level["level_id"],
+                "level_index": level["index"],
+                "config_version": 1,
+                "side": level["side"],
+                "price": level["price"],
+                "quantity": level["quantity"],
+                "state": "active",
+            }
+            for level in run["levels"]
+        ],
+        on_conflict="run_id,level_id",
+    )
+    db.persist_order(
+        run,
+        {
+            "order_key": "source-sell",
+            "client_order_id": "source-sell",
+            "exchange_order_id": "ex-source",
+            "level_id": "L017",
+            "side": "sell",
+            "status": "cancelled",
+            "order_kind": "initial_grid",
+            "config_version": 1,
+            "raw": {"state": "closed"},
+        },
+    )
+    db.persist_order(
+        run,
+        {
+            "order_key": "target-sell",
+            "client_order_id": "target-sell",
+            "exchange_order_id": "ex-target",
+            "level_id": "L016",
+            "side": "sell",
+            "status": "open",
+            "order_kind": "initial_grid",
+            "config_version": 1,
+        },
+    )
+    db.persist_order(
+        run,
+        {
+            "order_key": "replacement-buy",
+            "client_order_id": "replacement-buy",
+            "exchange_order_id": "ex-replacement",
+            "level_id": "L016",
+            "side": "buy",
+            "status": "open",
+            "order_kind": "replacement",
+            "config_version": 1,
+            "source_order_key": "source-sell",
+            "source_fill_id": "fill-source",
+            "source_fill_ids": ["fill-source"],
+            "replacement_group_key": "source-sell:L016:buy",
+        },
+    )
+
+    recovered = db.load_run_state(run["run_id"])
+    completeness = recovered["deployment_completeness"]
+
+    assert completeness["complete"] is True
+    assert completeness["filled"] == 1
+    assert completeness["terminal"] == 0
+    assert completeness["reasons"] == []
 
 
 def test_gridbot_health_detects_position_mismatch_inventory_breach_and_reducing_gate():

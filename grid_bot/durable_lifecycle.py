@@ -64,6 +64,7 @@ START_TERMINAL_ORDER_STATUSES = {
 START_UNRESOLVED_ORDER_STATUSES = {"unresolved", "ambiguous_submission", "submitted", "pending", "proposed"}
 DEFERRED_ORDER_STATUSES = {"deferred", "blocked"}
 RUNNING_VALID_ORDER_STATUSES = {"open", "partially_filled", "filled", "deferred", "blocked"}
+RUNNING_TERMINAL_REPLACED_STATUSES = {"cancelled", "closed", "filled", "not_open"}
 START_ACCOUNTED_ORDER_STATUSES = RUNNING_VALID_ORDER_STATUSES | START_UNRESOLVED_ORDER_STATUSES
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
@@ -400,6 +401,12 @@ class DurableGridBotLifecycle:
         by_level: dict[str, list[dict]] = {}
         for order in current_orders + deferred_orders:
             by_level.setdefault(str(order.get("level_id") or ""), []).append(order)
+        source_keys_with_replacements = {
+            str(order.get("source_order_key") or "")
+            for order in current_orders + deferred_orders
+            if order.get("source_order_key")
+            and str(order.get("status") or "").lower() in RUNNING_VALID_ORDER_STATUSES
+        }
         counts = {
             "expected": len(run.get("levels") or []),
             "eligible": len(run.get("levels") or []),
@@ -425,6 +432,11 @@ class DurableGridBotLifecycle:
                 elif statuses & {"open", "partially_filled"}:
                     status = "confirmed_open"
                 elif "filled" in statuses:
+                    status = "filled"
+                elif statuses & RUNNING_TERMINAL_REPLACED_STATUSES and any(
+                    str(order.get("order_key") or order.get("client_order_id") or "") in source_keys_with_replacements
+                    for order in orders
+                ):
                     status = "filled"
                 elif statuses & DEFERRED_ORDER_STATUSES:
                     status = "deferred"
