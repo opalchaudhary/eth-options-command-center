@@ -5,6 +5,9 @@ from grid_bot.operator_dashboard import (
     health_plain_text,
     human_operator_reason,
     inventory_summary,
+    lifecycle_compact_summary,
+    lifecycle_details_should_expand,
+    lifecycle_obligation_counts,
     lifecycle_progress_summary,
     live_config,
     orders_are_updating,
@@ -197,10 +200,40 @@ def test_lifecycle_progress_summary_shows_configured_vs_deployed_plainly() -> No
         }
     )
 
-    assert "Configured: 6 levels" in lines
-    assert "Deployed: 4 confirmed (2 BUY / 2 SELL), 2 waiting" in lines
+    assert "Grid obligations: 4/6 accounted" in lines
+    assert "Current open deployment orders: 4 resting, 0 filled, 0 deferred, 2 waiting" in lines
     assert "Order submission is being verified with Delta." in lines
     assert all("AMBIGUOUS_SUBMISSION" not in line for line in lines)
+    assert all("BUY /" not in line and "SELL" not in line for line in lines)
+
+
+def test_lifecycle_compact_summary_separates_obligations_from_resting_orders() -> None:
+    live = {
+        "lifecycle_state": "RUNNING",
+        "health": {"overall_status": "HEALTHY"},
+        "deployment_completeness": {"expected": 30, "confirmed_open": 29, "filled": 1, "deferred": 0},
+        "known_gridbot_orders": [
+            *[
+                {"side": "buy", "price": str(2400 + index), "remaining_quantity": "10", "status": "open"}
+                for index in range(16)
+            ],
+            *[
+                {"side": "sell", "price": str(2500 + index), "remaining_quantity": "10", "status": "open"}
+                for index in range(13)
+            ],
+            {"side": "sell", "price": "2508.8", "remaining_quantity": "0", "status": "cancelled"},
+        ],
+    }
+
+    assert lifecycle_obligation_counts(live) == (30, 30)
+    assert lifecycle_compact_summary(live) == "Running | Healthy | 30/30 accounted | Current resting orders: 16 BUY / 13 SELL"
+    assert lifecycle_details_should_expand(live) is False
+
+
+def test_lifecycle_details_auto_expand_for_transition_or_attention() -> None:
+    assert lifecycle_details_should_expand({"lifecycle_state": "STARTING", "health": {"overall_status": "HEALTHY"}}) is True
+    assert lifecycle_details_should_expand({"lifecycle_state": "RUNNING", "health": {"overall_status": "ATTENTION_REQUIRED"}}) is True
+    assert lifecycle_details_should_expand({"lifecycle_state": "RUNNING", "health": {"overall_status": "HEALTHY"}, "deployment_completeness": {"missing": 1}}) is True
 
 
 def test_operator_reason_messages_hide_internal_codes() -> None:
@@ -260,6 +293,15 @@ def test_dashboard_splits_live_surface_into_small_fragments() -> None:
     assert "def live_orders_fragment()" in text
     assert "def live_activity_fragment()" in text
     assert "render_live_dashboard(live)" not in text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1]
+
+
+def test_dashboard_lifecycle_panel_is_compact_and_expandable() -> None:
+    text = PAGE.read_text()
+    lifecycle_body = text.split("def render_lifecycle_progress", maxsplit=1)[1].split("def render_live_status", maxsplit=1)[0]
+
+    assert "lifecycle_compact_summary(live)" in lifecycle_body
+    assert 'st.expander("Show lifecycle details", expanded=expanded)' in lifecycle_body
+    assert "section-label'>Lifecycle Progress" not in lifecycle_body
 
 
 def test_dashboard_hides_developer_controls_and_raw_internals() -> None:

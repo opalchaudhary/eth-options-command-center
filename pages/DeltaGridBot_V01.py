@@ -20,6 +20,8 @@ from grid_bot.operator_dashboard import (
     human_lifecycle,
     human_spacing,
     inventory_summary,
+    lifecycle_compact_summary,
+    lifecycle_details_should_expand,
     lifecycle_progress_summary,
     live_config,
     orders_are_updating,
@@ -374,9 +376,11 @@ def render_lifecycle_progress(live: dict) -> None:
     lines = lifecycle_progress_summary(live)
     if not lines:
         return
-    st.markdown("<div class='section-label'>Lifecycle Progress</div>", unsafe_allow_html=True)
-    for line in lines:
-        st.write(line)
+    expanded = lifecycle_details_should_expand(live)
+    st.caption(lifecycle_compact_summary(live))
+    with st.expander("Show lifecycle details", expanded=expanded):
+        for line in lines:
+            st.write(line)
 
 
 def render_live_status(live: dict) -> None:

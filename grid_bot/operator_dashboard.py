@@ -265,17 +265,17 @@ def lifecycle_progress_summary(live: dict | None) -> list[str]:
     expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
     confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
     filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
-    buy_confirmed = int(progress.get("buy_confirmed_orders") or completeness.get("buy_accounted") or 0)
-    sell_confirmed = int(progress.get("sell_confirmed_orders") or completeness.get("sell_accounted") or 0)
     ambiguous = int(progress.get("ambiguous_orders") or completeness.get("ambiguous") or 0)
     missing = int(progress.get("missing_orders") or completeness.get("missing") or 0)
     waiting = int(progress.get("waiting_orders") or 0)
-    remaining = max(0, expected - confirmed - filled - int(progress.get("deferred_orders") or completeness.get("deferred") or 0))
+    deferred = int(progress.get("deferred_orders") or completeness.get("deferred") or 0)
+    accounted = confirmed + filled + deferred
+    remaining = max(0, expected - accounted)
     if operation or stage:
         lines.append(" | ".join(part for part in [operation, stage] if part))
     if expected:
-        lines.append(f"Configured: {expected} levels")
-        lines.append(f"Deployed: {confirmed + filled} confirmed ({buy_confirmed} BUY / {sell_confirmed} SELL), {remaining} waiting")
+        lines.append(f"Grid obligations: {accounted}/{expected} accounted")
+        lines.append(f"Current open deployment orders: {confirmed} resting, {filled} filled, {deferred} deferred, {remaining} waiting")
     elif waiting:
         lines.append(f"{waiting} orders waiting for Delta.")
     if ambiguous:
@@ -292,6 +292,50 @@ def lifecycle_progress_summary(live: dict | None) -> list[str]:
     if elapsed not in [None, ""]:
         lines.append(f"Elapsed: {int(float(elapsed))}s")
     return lines
+
+
+def current_resting_order_counts(live: dict | None) -> tuple[int, int]:
+    buys, sells = split_pending_orders(live)
+    return len(buys), len(sells)
+
+
+def lifecycle_obligation_counts(live: dict | None) -> tuple[int, int]:
+    live = live or {}
+    progress = live.get("lifecycle_progress") or {}
+    completeness = live.get("deployment_completeness") or {}
+    expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
+    confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
+    filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
+    deferred = int(progress.get("deferred_orders") or completeness.get("deferred") or 0)
+    return confirmed + filled + deferred, expected
+
+
+def lifecycle_details_should_expand(live: dict | None) -> bool:
+    live = live or {}
+    lifecycle = str(live.get("lifecycle_state") or "").upper()
+    health = str((live.get("health") or {}).get("overall_status") or "HEALTHY").upper()
+    progress = live.get("lifecycle_progress") or {}
+    completeness = live.get("deployment_completeness") or {}
+    waiting = int(progress.get("waiting_orders") or 0)
+    waiting += int(progress.get("ambiguous_orders") or completeness.get("ambiguous") or 0)
+    waiting += int(progress.get("missing_orders") or completeness.get("missing") or 0)
+    recovery_required = bool((live.get("active_run") or {}).get("resume_diagnostics") or (live.get("active_run") or {}).get("edit_diagnostics"))
+    return (
+        lifecycle in TRANSITIONAL_LIFECYCLE_STATES
+        or health in {"ATTENTION_REQUIRED", "DEGRADED", "CRITICAL"}
+        or recovery_required
+        or waiting > 0
+    )
+
+
+def lifecycle_compact_summary(live: dict | None) -> str:
+    live = live or {}
+    lifecycle = human_lifecycle(live.get("lifecycle_state") or "RUNNING")
+    health = str((live.get("health") or {}).get("overall_status") or "HEALTHY").replace("_", " ").title()
+    accounted, expected = lifecycle_obligation_counts(live)
+    buy_open, sell_open = current_resting_order_counts(live)
+    obligation_text = f"{accounted}/{expected} accounted" if expected else "obligations unavailable"
+    return f"{lifecycle} | {health} | {obligation_text} | Current resting orders: {buy_open} BUY / {sell_open} SELL"
 
 
 def orders_are_updating(live: dict | None) -> bool:
