@@ -281,7 +281,8 @@ def test_dashboard_uses_live_fragment_without_full_page_refresh() -> None:
     assert "streamlit_autorefresh" not in text
     assert "@fragment(run_every=\"5s\")" in text
     assert "@st.cache_data(ttl=5" in text
-    assert "fetch_live_state" in text
+    assert "fetch_compact_live_state" in text
+    assert "/api/grid/v01/live/compact" in text
     assert "/api/grid/v01/live/state" in text
 
 
@@ -293,6 +294,22 @@ def test_dashboard_splits_live_surface_into_small_fragments() -> None:
     assert "def live_orders_fragment()" in text
     assert "def live_activity_fragment()" in text
     assert "render_live_dashboard(live)" not in text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1]
+
+
+def test_dashboard_uses_mixed_cadence_for_compact_and_detailed_state() -> None:
+    text = PAGE.read_text()
+    status_fragment = text.split("def live_status_fragment()", maxsplit=1)[1].split("@fragment", maxsplit=1)[0]
+    metrics_fragment = text.split("def live_metrics_fragment()", maxsplit=1)[1].split("@fragment", maxsplit=1)[0]
+    orders_fragment = text.split("def live_orders_fragment()", maxsplit=1)[1].split("@fragment", maxsplit=1)[0]
+    activity_fragment = text.split("def live_activity_fragment()", maxsplit=1)[1].split("def render_idle", maxsplit=1)[0]
+
+    assert "@st.cache_data(ttl=5" in text
+    assert "@st.cache_data(ttl=15" in text
+    assert "@fragment(run_every=\"15s\")" in text
+    assert "fetch_compact_live_state()" in status_fragment
+    assert "fetch_compact_live_state()" in metrics_fragment
+    assert "fetch_detailed_live_state()" in orders_fragment
+    assert "fetch_detailed_live_state()" in activity_fragment
 
 
 def test_dashboard_lifecycle_panel_is_compact_and_expandable() -> None:

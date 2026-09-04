@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from grid_bot.config import DEFAULT_RISK_THRESHOLDS
-from grid_bot.continuous_worker import gridbot_live_state, start_continuous_gridbot_worker
+from grid_bot.continuous_worker import gridbot_compact_live_state, gridbot_live_state, start_continuous_gridbot_worker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
 from grid_bot.durable_lifecycle import DurableGridBotLifecycle
 from grid_bot.grid_builder import NeutralGridRangeValidationError
@@ -426,6 +426,14 @@ def durable_stop(payload: StopRequest):
 def durable_live_state():
     try:
         return gridbot_live_state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/v01/live/compact")
+def durable_live_compact():
+    try:
+        return gridbot_compact_live_state()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

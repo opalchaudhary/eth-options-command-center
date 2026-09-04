@@ -3380,6 +3380,72 @@ def test_gridbot_live_state_refreshes_latest_persisted_transitional_progress(mon
     assert state["health"]["overall_status"] != "HEALTHY"
 
 
+def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(monkeypatch):
+    class DB:
+        enabled = True
+
+        def load_run_state(self, _run_id):
+            raise AssertionError("compact live state must not reload full Supabase run state")
+
+        def stats(self):
+            return {"select": 99}
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": True,
+                "thread_alive": True,
+                "run_id": "run-compact",
+                "status": "running",
+                "lifecycle_state": GridStatus.RUNNING.value,
+                "config": {
+                    "grid_type": "neutral",
+                    "lower_price": "2400",
+                    "upper_price": "2600",
+                    "grid_count": 4,
+                    "spacing_type": "arithmetic",
+                    "lot_size": "1",
+                    "max_inventory_lots": "2",
+                    "product_symbol": "ETHUSD",
+                    "config_version": 1,
+                },
+                "deployment_completeness": {"expected": 4, "confirmed_open": 3, "filled": 1, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
+                "lifecycle_progress": {"operation": "RUNNING", "stage": "RUNNING", "message": "Grid running", "expected_orders": 4, "confirmed_orders": 3, "filled_orders": 1},
+                "known_gridbot_orders": [
+                    {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
+                    {"client_order_id": "sell-open", "side": "sell", "status": "open", "remaining_quantity": "1"},
+                    {"client_order_id": "filled", "side": "sell", "status": "filled", "remaining_quantity": "0"},
+                ],
+                "fill_derived_inventory": "-1",
+                "delta_position": "-1",
+                "known_fill_count": 1,
+                "accounting": {"net_realized_pnl": "0", "unrealized_pnl": "-1", "live_net_pnl": "-1", "trading_fees": "0.01", "cycles_completed": 0, "accounting_status": "COMPLETE"},
+                "account_risk_state": {"telemetry_status": "HEALTHY", "mark_price": "2500", "account_equity": "1000", "available_margin": "990", "used_margin": "10", "margin_utilisation_pct": "1", "position_lots": "-1"},
+                "health": {"overall_status": "HEALTHY", "active_issues": [], "position_inventory_agreement": {"gridbot_inventory": "-1", "delta_position": "-1", "matches": True, "difference": "0"}},
+                "last_poll_at": "2026-01-01T00:00:00+00:00",
+                "last_successful_poll_at": "2026-01-01T00:00:00+00:00",
+                "last_successful_reconcile": "2026-01-01T00:00:00+00:00",
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["source"] == "worker_memory_compact"
+    assert compact["run_id"] == "run-compact"
+    assert compact["deployment_completeness"]["accounted"] == 4
+    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
+    assert compact["account_risk_state"]["mark_price"] == "2500"
+    assert "known_gridbot_orders" not in compact
+    assert "active_run" not in compact
+    assert "risk_snapshots" not in compact
+    assert "fills" not in compact
+
+
 def test_snapshot_material_change_ignores_regular_mark_and_margin_drift():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     baseline = (

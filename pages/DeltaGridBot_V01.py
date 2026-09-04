@@ -214,7 +214,12 @@ def apply_pending_suggested_range(button_key: str) -> None:
 
 
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_live_state() -> dict:
+def fetch_compact_live_state() -> dict:
+    return safe_get("/api/grid/v01/live/compact", timeout=10)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_detailed_live_state() -> dict:
     return safe_get("/api/grid/v01/live/state", timeout=15)
 
 
@@ -606,7 +611,7 @@ def render_edit_grid(live: dict) -> None:
 
 @fragment(run_every="5s")
 def live_status_fragment() -> None:
-    live = fetch_live_state()
+    live = fetch_compact_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
@@ -617,25 +622,25 @@ def live_status_fragment() -> None:
 
 @fragment(run_every="5s")
 def live_metrics_fragment() -> None:
-    live = fetch_live_state()
+    live = fetch_compact_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
         render_live_metrics(live)
 
 
-@fragment(run_every="5s")
+@fragment(run_every="15s")
 def live_orders_fragment() -> None:
-    live = fetch_live_state()
+    live = fetch_detailed_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
         render_live_orders(live)
 
 
-@fragment(run_every="5s")
+@fragment(run_every="15s")
 def live_activity_fragment() -> None:
-    live = fetch_live_state()
+    live = fetch_detailed_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):

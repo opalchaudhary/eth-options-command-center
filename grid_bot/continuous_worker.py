@@ -549,3 +549,126 @@ def gridbot_live_state() -> dict:
         state["account_risk_state_error"] = str(exc)[:300]
     state["health"] = evaluate_gridbot_health(state, health_run)
     return state
+
+
+def _compact_order_counts(rows: list[dict]) -> dict:
+    open_statuses = {"open", "submitted", "partially_filled", "pending"}
+    open_orders = [row for row in rows if str(row.get("status") or "").lower() in open_statuses]
+    return {
+        "open_buy_count": len([row for row in open_orders if str(row.get("side") or "").lower() == "buy"]),
+        "open_sell_count": len([row for row in open_orders if str(row.get("side") or "").lower() == "sell"]),
+        "open_order_count": len(open_orders),
+    }
+
+
+def gridbot_compact_live_state() -> dict:
+    state = worker.state()
+    run = state.get("active_run") if isinstance(state.get("active_run"), dict) else {}
+    config = state.get("config") or (run.get("config") if isinstance(run, dict) else {}) or {}
+    telemetry = state.get("account_risk_state") or {}
+    health = state.get("health") or {}
+    accounting = state.get("accounting") or {}
+    completeness = state.get("deployment_completeness") or (run.get("deployment_completeness") if isinstance(run, dict) else {}) or {}
+    progress = state.get("lifecycle_progress") or (run.get("lifecycle_progress") if isinstance(run, dict) else {}) or {}
+    orders = state.get("known_gridbot_orders") or list((run.get("orders") or {}).values()) if isinstance(run, dict) else []
+    counts = _compact_order_counts(orders)
+    expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
+    confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
+    filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
+    deferred = int(progress.get("deferred_orders") or completeness.get("deferred") or 0)
+    return {
+        "ok": state.get("ok", True),
+        "source": "worker_memory_compact",
+        "worker_owner": state.get("worker_owner"),
+        "running": state.get("running"),
+        "thread_alive": state.get("thread_alive"),
+        "run_id": state.get("run_id"),
+        "status": state.get("status"),
+        "lifecycle_state": state.get("lifecycle_state"),
+        "config_version": config.get("config_version"),
+        "config": {
+            "grid_type": config.get("grid_type"),
+            "lower_price": config.get("lower_price"),
+            "upper_price": config.get("upper_price"),
+            "grid_count": config.get("grid_count"),
+            "spacing_type": config.get("spacing_type"),
+            "lot_size": config.get("lot_size"),
+            "max_inventory_lots": config.get("max_inventory_lots"),
+            "product_symbol": config.get("product_symbol"),
+            "config_version": config.get("config_version"),
+        },
+        "deployment_completeness": {
+            "expected": expected or completeness.get("expected"),
+            "confirmed_open": confirmed or completeness.get("confirmed_open"),
+            "filled": filled or completeness.get("filled"),
+            "deferred": deferred or completeness.get("deferred"),
+            "ambiguous": progress.get("ambiguous_orders", completeness.get("ambiguous")),
+            "missing": progress.get("missing_orders", completeness.get("missing")),
+            "waiting": progress.get("waiting_orders"),
+            "complete": completeness.get("complete"),
+            "accounted": confirmed + filled + deferred,
+            "buy_accounted": completeness.get("buy_accounted"),
+            "sell_accounted": completeness.get("sell_accounted"),
+            "checked_at": completeness.get("checked_at"),
+        },
+        "lifecycle_progress": {
+            "operation": progress.get("operation"),
+            "stage": progress.get("stage"),
+            "message": progress.get("message"),
+            "last_progress_at": progress.get("last_progress_at"),
+            "retry_attempts": progress.get("retry_attempts"),
+            "retry_wait_seconds": progress.get("retry_wait_seconds"),
+            "stall_message": progress.get("stall_message"),
+            "expected_orders": expected,
+            "confirmed_orders": confirmed,
+            "filled_orders": filled,
+            "deferred_orders": deferred,
+            "ambiguous_orders": progress.get("ambiguous_orders", completeness.get("ambiguous")),
+            "missing_orders": progress.get("missing_orders", completeness.get("missing")),
+            "waiting_orders": progress.get("waiting_orders"),
+        },
+        "current_orders": counts,
+        **counts,
+        "fill_derived_inventory": state.get("fill_derived_inventory"),
+        "delta_position": state.get("delta_position") or telemetry.get("position_lots"),
+        "known_fill_count": state.get("known_fill_count"),
+        "accounting": {
+            "gross_realized_pnl": accounting.get("gross_realized_pnl"),
+            "net_realized_pnl": accounting.get("net_realized_pnl"),
+            "unrealized_pnl": accounting.get("unrealized_pnl"),
+            "live_net_pnl": accounting.get("live_net_pnl"),
+            "trading_fees": accounting.get("trading_fees"),
+            "cycles_completed": accounting.get("cycles_completed"),
+            "accounting_status": accounting.get("accounting_status"),
+        },
+        "account_risk_state": {
+            "timestamp": telemetry.get("timestamp"),
+            "telemetry_status": telemetry.get("telemetry_status"),
+            "account_equity": telemetry.get("account_equity"),
+            "available_margin": telemetry.get("available_margin"),
+            "used_margin": telemetry.get("used_margin"),
+            "margin_utilisation_pct": telemetry.get("margin_utilisation_pct"),
+            "mark_price": telemetry.get("mark_price"),
+            "position_lots": telemetry.get("position_lots"),
+            "position_side": telemetry.get("position_side"),
+            "account_age_seconds": telemetry.get("account_age_seconds"),
+            "position_age_seconds": telemetry.get("position_age_seconds"),
+            "order_age_seconds": telemetry.get("order_age_seconds"),
+            "market_age_seconds": telemetry.get("market_age_seconds"),
+        },
+        "health": {
+            "overall_status": health.get("overall_status"),
+            "safe_for_risk_increase": health.get("safe_for_risk_increase"),
+            "safe_for_risk_reduce": health.get("safe_for_risk_reduce"),
+            "operator_attention_required": health.get("operator_attention_required"),
+            "active_issues": health.get("active_issues") or [],
+            "position_inventory_agreement": health.get("position_inventory_agreement") or {},
+            "telemetry_freshness": health.get("telemetry_freshness") or {},
+        },
+        "timestamps": {
+            "last_poll_at": state.get("last_poll_at"),
+            "last_successful_poll_at": state.get("last_successful_poll_at"),
+            "last_successful_reconcile": state.get("last_successful_reconcile"),
+            "telemetry_timestamp": telemetry.get("timestamp"),
+        },
+    }

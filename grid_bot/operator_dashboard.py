@@ -295,6 +295,12 @@ def lifecycle_progress_summary(live: dict | None) -> list[str]:
 
 
 def current_resting_order_counts(live: dict | None) -> tuple[int, int]:
+    live = live or {}
+    current = live.get("current_orders") or {}
+    if current:
+        return int(current.get("open_buy_count") or 0), int(current.get("open_sell_count") or 0)
+    if live.get("open_buy_count") not in [None, ""] or live.get("open_sell_count") not in [None, ""]:
+        return int(live.get("open_buy_count") or 0), int(live.get("open_sell_count") or 0)
     buys, sells = split_pending_orders(live)
     return len(buys), len(sells)
 
