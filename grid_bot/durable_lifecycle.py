@@ -2487,6 +2487,16 @@ class DurableGridBotLifecycle:
 
         try:
             for level in run["levels"]:
+                state = self._load()
+                run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+                if not run:
+                    raise RuntimeError("No active durable DeltaGridBot run found.")
+                if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+                    return self.stop(run["run_id"], reason=run.get("stop_reason") or "stop_preempted_resume")
+                if run.get("status") == GridStatus.STOPPED.value:
+                    return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run.get("summary") or {})}
+                if run.get("status") != GridStatus.RESUMING.value:
+                    return {"ok": True, "run": deepcopy(run), "reconciliation": reconciliation}
                 existing_open = [
                     order
                     for order in run.get("orders", {}).values()
@@ -2494,7 +2504,25 @@ class DurableGridBotLifecycle:
                 ]
                 if not existing_open:
                     proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
-                    self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
+                    created = self._place_proposal(run, product_id, proposal, "resume_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
+                    latest_state = self._load()
+                    latest_run = latest_state.get("runs", {}).get(run["run_id"])
+                    if not latest_run:
+                        if created.get("status") not in START_TERMINAL_ORDER_STATUSES:
+                            self._cancel_order_safely(product_id, created)
+                        raise RuntimeError("No active durable DeltaGridBot run found.")
+                    if latest_run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+                        if created.get("status") not in START_TERMINAL_ORDER_STATUSES:
+                            self._cancel_order_safely(product_id, created)
+                        latest_run.setdefault("orders", {})[created["client_order_id"]] = created
+                        self._save(latest_state)
+                        return self.stop(latest_run["run_id"], reason=latest_run.get("stop_reason") or "stop_preempted_resume")
+                    if latest_run.get("status") == GridStatus.STOPPED.value:
+                        if created.get("status") not in START_TERMINAL_ORDER_STATUSES:
+                            self._cancel_order_safely(product_id, created)
+                        latest_run.setdefault("orders", {})[created["client_order_id"]] = created
+                        self._save(latest_state)
+                        return {"ok": True, "run": deepcopy(latest_run), "summary": deepcopy(latest_run.get("summary") or {})}
                     self._update_lifecycle_progress(
                         run,
                         "RESUME",
@@ -2505,15 +2533,19 @@ class DurableGridBotLifecycle:
                         retry_attempts=(run.get("lifecycle_retry") or {}).get("attempts", 0),
                         retry_wait_seconds=(run.get("lifecycle_retry") or {}).get("backoff_seconds", 0),
                     )
+                    self._save(state)
         except Exception as exc:
             return self._resume_blocked(state, run, "placement_failed", {"error": str(exc)[:500]})
-        self._save(state)
 
         self._update_lifecycle_progress(run, "RESUME", "VERIFYING_ORDERS", message="Resuming Grid: waiting for Delta verification")
         self._save(state, include_children=False)
         verified = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+            return self.stop(run["run_id"], reason=run.get("stop_reason") or "stop_preempted_resume")
+        if run.get("status") == GridStatus.STOPPED.value:
+            return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run.get("summary") or {})}
         errors = verified["reconciliation"].get("errors") or []
         unresolved = int(verified["reconciliation"].get("unresolved_orders") or 0)
         mismatches = int(verified["reconciliation"].get("position_mismatches") or 0)

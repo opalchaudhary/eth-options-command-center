@@ -4042,6 +4042,37 @@ def test_worker_refreshes_lifecycle_state_before_advancing_stale_edit(tmp_path):
     assert "GRID_WORKER_ERROR" not in {event["event_type"] for event in events}
 
 
+def test_resume_honors_stop_request_during_order_placement(tmp_path):
+    class StopDuringResumeLifecycle(DurableGridBotLifecycle):
+        fired = False
+
+        def _place_proposal(self, run, product_id, proposal, order_kind, **kwargs):
+            created = super()._place_proposal(run, product_id, proposal, order_kind, **kwargs)
+            if order_kind == "resume_grid" and not self.fired:
+                self.fired = True
+                DurableGridBotLifecycle(client=self.client, state_path=self.state_path, db=self.db, use_supabase=True).request_stop(
+                    run["run_id"],
+                    reason="stop_during_resume_placement",
+                )
+            return created
+
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    base = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    run_id = base.start_tiny_grid()["run"]["run_id"]
+    base.pause(run_id)
+    base.request_resume(run_id)
+
+    result = StopDuringResumeLifecycle(client, base.state_path, db=db, use_supabase=True).resume(run_id)
+
+    assert result["run"]["status"] == "STOPPED"
+    assert result["summary"]["accounting_status"] == "COMPLETE"
+    assert client.open_orders(1699)["result"] == []
+    events = list(db.tables.get("grid_events", {}).values())
+    assert "GRID_RUN_STOP_REQUESTED" in {event["event_type"] for event in events}
+    assert "GRID_RUN_SUMMARY_GENERATED" in {event["event_type"] for event in events}
+
+
 def test_worker_confirmed_position_mismatch_pauses_external_change(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
