@@ -639,6 +639,9 @@ def gridbot_compact_live_state() -> dict:
             "live_net_pnl": accounting.get("live_net_pnl"),
             "trading_fees": accounting.get("trading_fees"),
             "cycles_completed": accounting.get("cycles_completed"),
+            "fifo_inventory_closures_completed": accounting.get("fifo_inventory_closures_completed"),
+            "grid_cycles_completed": accounting.get("grid_cycles_completed"),
+            "cycle_semantics_version": accounting.get("cycle_semantics_version"),
             "accounting_status": accounting.get("accounting_status"),
         },
         "account_risk_state": {

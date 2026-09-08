@@ -972,7 +972,8 @@ def test_stop_and_close_flattens_long_inventory_reduce_only_and_accounts(tmp_pat
     ]
     assert stopped["summary"]["trading_fees"] == "0.03"
     assert stopped["summary"]["flatten_fills"]
-    assert stopped["summary"]["cycles_total"] == 1
+    assert stopped["summary"]["cycles_total"] == 0
+    assert stopped["summary"]["fifo_inventory_closures_total"] == 1
 
 
 def test_stop_and_close_flattens_short_inventory_reduce_only(tmp_path):
@@ -3577,6 +3578,34 @@ def test_risk_snapshot_persists_account_margin_fields(tmp_path):
     assert margin_state["liquidation_price"] is None
 
 
+def test_risk_snapshot_grr_uses_contract_multiplier():
+    db = _CountingSupabaseGridRepository()
+    run = {
+        "run_id": "run-grr",
+        "bot_id": "bot-grr",
+        "status": "RUNNING",
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "0.01"},
+        "config": {"config_version": 1, "risk_thresholds": {}, "product_symbol": "ETHUSD"},
+        "reference_price": "2500",
+    }
+
+    db.persist_snapshot(
+        run,
+        {
+            "created_at": "2026-08-31T00:00:00+00:00",
+            "gridbot_inventory": "10",
+            "account_risk_state": {
+                "account_equity": "1000",
+                "mark_price": "2500",
+                "position_lots": "10",
+            },
+        },
+    )
+
+    snapshot = next(iter(db.tables["grid_bot_snapshots"].values()))
+    assert Decimal(snapshot["grr"]) == Decimal("0.25")
+
+
 def test_worker_position_mismatch_waits_for_confirmation_before_external_pause(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
@@ -4196,6 +4225,33 @@ def test_supabase_stop_external_close_generates_summary_and_releases_lock(tmp_pa
     assert health_rows[0]["resolved_at"]
 
 
+def test_terminal_health_cleanup_resolves_only_operational_stale_codes():
+    db = _MemorySupabaseGridRepository()
+    run_id = "run-terminal-health"
+    for code in ["GRID_ORDER_UNRESOLVED", "GRID_ORDER_ORPHAN", "DELTA_API_ERROR", "ACCOUNTING_INCOMPLETE", "STOPPED_WITH_EXPOSURE"]:
+        db.upsert(
+            "grid_health_events",
+            {
+                "issue_key": f"{run_id}:{code}:",
+                "run_id": run_id,
+                "code": code,
+                "active": True,
+                "opened_at": utc_now(),
+            },
+            on_conflict="issue_key",
+        )
+
+    resolved = db.resolve_terminal_health_issues(run_id)
+    rows = {row["code"]: row for row in db.tables["grid_health_events"].values()}
+
+    assert resolved == 3
+    assert rows["GRID_ORDER_UNRESOLVED"]["active"] is False
+    assert rows["GRID_ORDER_ORPHAN"]["active"] is False
+    assert rows["DELTA_API_ERROR"]["active"] is False
+    assert rows["ACCOUNTING_INCOMPLETE"]["active"] is True
+    assert rows["STOPPED_WITH_EXPOSURE"]["active"] is True
+
+
 def test_stale_unresolved_order_is_reconciled_from_delta_cancel_history(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -4540,7 +4596,7 @@ def test_supabase_load_run_state_reconstructs_completeness_from_normalized_repla
             {"level_id": "L016", "index": 16, "side": "sell", "price": "2499.15", "quantity": "10"},
             {"level_id": "L017", "index": 17, "side": "sell", "price": "2508.8", "quantity": "10"},
         ],
-        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "0.01"},
     }
     db.upsert("grid_runs", [{"run_id": run["run_id"], "bot_id": run["bot_id"], "status": run["status"], "active_config_version": 1, "config_version": 1, "started_at": utc_now()}], on_conflict="run_id")
     db.upsert("grid_bots", [{"bot_id": run["bot_id"], "bot_name": "Loader Grid", "product_symbol": "ETHUSD"}], on_conflict="bot_id")
@@ -4614,6 +4670,44 @@ def test_supabase_load_run_state_reconstructs_completeness_from_normalized_repla
     assert completeness["filled"] == 1
     assert completeness["terminal"] == 0
     assert completeness["reasons"] == []
+    assert recovered["product"]["contract_multiplier"] == "0.01"
+
+
+def test_supabase_persist_config_closes_prior_open_versions():
+    db = _MemorySupabaseGridRepository()
+    run = {
+        "run_id": "run-config-chain",
+        "bot_id": "bot-config-chain",
+        "status": GridStatus.RUNNING.value,
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "0.01"},
+        "config": {
+            "bot_id": "bot-config-chain",
+            "bot_name": "Config Chain",
+            "product_symbol": "ETHUSD",
+            "config_version": 1,
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "2",
+        },
+        "levels": [],
+        "orders": {},
+        "fills": {},
+    }
+
+    db.persist_config(run)
+    run["config"] = {**run["config"], "config_version": 2}
+    db.persist_config(run, reason="edit_grid")
+    run["config"] = {**run["config"], "config_version": 3}
+    db.persist_config(run, reason="regrid")
+
+    rows = sorted(db.tables["grid_config_versions"].values(), key=lambda row: int(row["config_version"]))
+    assert rows[0]["effective_to"]
+    assert rows[1]["effective_to"]
+    assert rows[2].get("effective_to") in [None, ""]
 
 
 def test_gridbot_health_detects_position_mismatch_and_attribution_risk():

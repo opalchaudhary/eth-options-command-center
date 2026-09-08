@@ -371,7 +371,8 @@ def pnl_values(live: dict | None) -> dict:
         "realized": None if unavailable else accounting.get("net_realized_pnl"),
         "unrealized": None if unavailable else accounting.get("unrealized_pnl"),
         "fees": None if unavailable else accounting.get("trading_fees"),
-        "cycles": accounting.get("cycles_completed") or 0,
+        "cycles": accounting.get("grid_cycles_completed") if accounting.get("grid_cycles_completed") not in [None, ""] else accounting.get("cycles_completed") or 0,
+        "fifo_inventory_closures": accounting.get("fifo_inventory_closures_completed") or accounting.get("cycles_completed") or 0,
         "incomplete": incomplete,
     }
 

@@ -82,6 +82,26 @@ class ProductSpec:
     best_ask: Optional[Decimal] = None
 
 
+KNOWN_PRODUCT_METADATA = {
+    "ETHUSD": {
+        "product_id": 1699,
+        "symbol": "ETHUSD",
+        "contract_multiplier": Decimal("0.01"),
+    }
+}
+
+
+def product_metadata(symbol: str = "ETHUSD", product_id: int | str | None = None, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    symbol = str(symbol or (existing or {}).get("symbol") or "ETHUSD").upper()
+    known = KNOWN_PRODUCT_METADATA.get(symbol, {})
+    metadata = {
+        "product_id": product_id or (existing or {}).get("product_id") or known.get("product_id"),
+        "symbol": symbol,
+        "contract_multiplier": str(known.get("contract_multiplier") or (existing or {}).get("contract_multiplier") or Decimal("1")),
+    }
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
 @dataclass(frozen=True)
 class GridConfig:
     bot_id: str

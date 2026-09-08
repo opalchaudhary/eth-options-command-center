@@ -6,6 +6,7 @@ from grid_bot.accounting import (
     FEE_PENDING,
     FEE_UNAVAILABLE,
     build_cycle_ledger,
+    build_grid_cycle_ledger,
     build_run_accounting,
     calculate_unrealized_pnl,
     extract_fee,
@@ -43,7 +44,7 @@ def _run(fills, multiplier="1", status="RUNNING"):
     }
 
 
-def _fill(fill_id, side, price, size="10", fee="0.5", role="maker", config_version=1):
+def _fill(fill_id, side, price, size="10", fee="0.5", role="maker", config_version=1, source_fill_id=None, order_kind="initial_grid"):
     order_hint = {
         "entry": 1,
         "older": 1,
@@ -66,6 +67,8 @@ def _fill(fill_id, side, price, size="10", fee="0.5", role="maker", config_versi
         "created_at": f"2026-08-28T00:00:{order_hint:02d}+00:00",
         "level_id": f"L{len(fill_id)}",
         "config_version": config_version,
+        "source_fill_id": source_fill_id,
+        "order_kind": order_kind,
     }
 
 
@@ -100,6 +103,24 @@ def test_long_cycle_profit_and_fees():
     assert accounting.taker_fees == Decimal("1.5")
 
 
+def test_known_run_reconstruction_totals_use_ethusd_multiplier():
+    entry = _fill("entry", "buy", "2500", size="882", fee="4.64814345")
+    exit_fill = _fill("exit", "sell", "2504.5453514739229024943310657596371882086167800454", size="882", fee="4.64814345", source_fill_id="entry", order_kind="replacement")
+    filler = [
+        _fill(f"z{i:03d}", "buy" if i % 2 else "sell", "2500", size="0", fee="0")
+        for i in range(175)
+    ]
+    run = _run([entry, exit_fill, *filler], multiplier="0.01", status="STOPPED")
+
+    accounting = build_run_accounting(run, mark_price=Decimal("2504.55"), account_position_lots=Decimal("0"))
+
+    assert accounting.fills_total == 177
+    assert accounting.remaining_inventory_lots == Decimal("0")
+    assert accounting.gross_realized_pnl.quantize(Decimal("0.0001")) == Decimal("40.0900")
+    assert accounting.trading_fees == Decimal("9.29628690")
+    assert accounting.net_realized_pnl.quantize(Decimal("0.00000001")) == Decimal("30.79371310")
+
+
 def test_short_cycle_profit_and_neutral_sell_to_buy():
     run = _run([_fill("entry", "sell", "3010", fee="1"), _fill("exit", "buy", "3000", fee="1")])
     accounting = build_run_accounting(run, mark_price=Decimal("3000"), account_position_lots=Decimal("0"))
@@ -128,6 +149,14 @@ def test_partial_close_leaves_remaining_inventory_basis():
     assert accounting.remaining_inventory_lots == Decimal("6")
     assert accounting.unrealized_pnl == Decimal("120")
     assert accounting.live_net_pnl == Decimal("158.6")
+
+
+def test_unrealized_pnl_uses_contract_multiplier():
+    run = _run([_fill("entry", "buy", "3000", size="10", fee="0")], multiplier="0.01")
+    accounting = build_run_accounting(run, mark_price=Decimal("3010"), account_position_lots=Decimal("10"))
+
+    assert accounting.remaining_inventory_basis == Decimal("300.00")
+    assert accounting.unrealized_pnl == Decimal("1.00")
 
 
 def test_open_inventory_fee_is_not_reported_as_realized_loss():
@@ -206,6 +235,38 @@ def test_zero_gross_fee_ratio_is_unknown():
     run = _run([_fill("entry", "buy", "3000", fee="1"), _fill("exit", "sell", "3000", fee="1")])
 
     assert build_run_accounting(run).fee_to_gross_ratio is None
+
+
+def test_fifo_closure_is_separate_from_lineaged_grid_cycle():
+    profitable = _fill("entry", "buy", "3000", size="1", fee="0")
+    profitable_exit = _fill("exit", "sell", "3010", size="1", fee="0", source_fill_id="entry", order_kind="replacement")
+    same = _fill("older", "buy", "3000", size="1", fee="0")
+    same_exit = _fill("exit1", "sell", "3000", size="1", fee="0", source_fill_id="older", order_kind="replacement")
+    adverse = _fill("newer", "buy", "3010", size="1", fee="0")
+    adverse_exit = _fill("exit2", "sell", "3005", size="1", fee="0", source_fill_id="newer", order_kind="replacement")
+    run = _run([profitable, profitable_exit, same, same_exit, adverse, adverse_exit], multiplier="0.01")
+
+    accounting = build_run_accounting(run)
+
+    assert accounting.fifo_inventory_closures_completed == 3
+    assert accounting.grid_cycles_completed == 1
+    assert accounting.grid_cycles[0].entry_fill_id == "entry"
+    assert accounting.grid_cycles[0].exit_fill_id == "exit"
+
+
+def test_lineaged_grid_cycles_allocate_partial_source_once():
+    entry = _fill("entry", "buy", "3000", size="10", fee="0")
+    exit1 = _fill("exit1", "sell", "3010", size="4", fee="0", source_fill_id="entry", order_kind="replacement")
+    exit2 = _fill("exit2", "sell", "3011", size="6", fee="0", source_fill_id="entry", order_kind="replacement")
+    exit3 = _fill("exit3", "sell", "3012", size="2", fee="0", source_fill_id="entry", order_kind="replacement")
+    run = _run([entry, exit1, exit2, exit3], multiplier="0.01")
+
+    first = build_grid_cycle_ledger(run)
+    second = build_grid_cycle_ledger(run)
+
+    assert [cycle.quantity_lots for cycle in first] == [Decimal("4"), Decimal("6")]
+    assert sum(cycle.quantity_lots for cycle in first) == Decimal("10")
+    assert [cycle.cycle_id for cycle in first] == [cycle.cycle_id for cycle in second]
 
 
 def test_unrealized_long_short_flat_and_ambiguous_attribution():

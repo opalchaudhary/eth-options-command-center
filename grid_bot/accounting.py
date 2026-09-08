@@ -118,6 +118,8 @@ class PnlSummary:
 class RunAccounting:
     fills_total: int
     cycles_completed: int
+    fifo_inventory_closures_completed: int
+    grid_cycles_completed: int
     gross_realized_pnl: Decimal
     trading_fees: Decimal
     realized_trading_fees: Decimal
@@ -134,6 +136,7 @@ class RunAccounting:
     accounting_status: str
     warnings: list[str]
     cycles: list[CycleRecord]
+    grid_cycles: list[CycleRecord]
     remaining_inventory_lots: Decimal
     remaining_inventory_basis: Decimal
     maker_fees: Decimal
@@ -146,6 +149,8 @@ class RunAccounting:
         return {
             "fills_total": self.fills_total,
             "cycles_completed": self.cycles_completed,
+            "fifo_inventory_closures_completed": self.fifo_inventory_closures_completed,
+            "grid_cycles_completed": self.grid_cycles_completed,
             "gross_realized_pnl": str(self.gross_realized_pnl),
             "trading_fees": str(self.trading_fees),
             "realized_trading_fees": str(self.realized_trading_fees),
@@ -168,6 +173,7 @@ class RunAccounting:
             "unknown_role_fees": str(self.unknown_role_fees),
             "funding_attribution_status": self.funding_attribution_status,
             "accounting_version": self.accounting_version,
+            "cycle_semantics_version": "gridbot_v01_cycle_semantics_v2",
         }
 
 
@@ -453,6 +459,74 @@ def build_cycle_ledger(run: dict[str, Any]) -> tuple[list[CycleRecord], list[Acc
     return cycles, fills, remaining_lots, remaining_basis
 
 
+def build_grid_cycle_ledger(run: dict[str, Any]) -> list[CycleRecord]:
+    fills = sorted(
+        [normalize_fill(run, fill_id, fill) for fill_id, fill in (run.get("fills") or {}).items()],
+        key=_fill_sort_key,
+    )
+    fills_by_id: dict[str, AccountingFill] = {}
+    for fill in fills:
+        for key in {fill.fill_id, fill.exchange_fill_id}:
+            if key:
+                fills_by_id[str(key)] = fill
+    remaining_by_fill = {fill.fill_id: fill.quantity_lots for fill in fills}
+    cycles: list[CycleRecord] = []
+    multiplier = decimal_value((run.get("product") or {}).get("contract_multiplier"), "1")
+    for exit_fill in fills:
+        if not exit_fill.source_fill_id:
+            continue
+        entry_fill = fills_by_id.get(str(exit_fill.source_fill_id))
+        if not entry_fill or entry_fill.side == exit_fill.side:
+            continue
+        if (entry_fill.timestamp or "") > (exit_fill.timestamp or ""):
+            continue
+        close_lots = min(remaining_by_fill.get(entry_fill.fill_id, Decimal("0")), remaining_by_fill.get(exit_fill.fill_id, exit_fill.quantity_lots))
+        if close_lots <= 0:
+            continue
+        base_quantity = close_lots * multiplier
+        gross = futures_pnl(entry_fill.side, entry_fill.fill_price, exit_fill.fill_price, base_quantity)
+        if gross <= 0:
+            continue
+        entry_fee = _allocated_fee(entry_fill, close_lots)
+        exit_fee = _allocated_fee(exit_fill, close_lots)
+        direction = "LONG_GRID_CYCLE" if entry_fill.side == Side.BUY else "SHORT_GRID_CYCLE"
+        cycles.append(
+            CycleRecord(
+                cycle_id=f"grid_cycle_{entry_fill.fill_id}_{exit_fill.fill_id}_{len(cycles) + 1}",
+                run_id=exit_fill.run_id,
+                config_version=exit_fill.config_version,
+                entry_config_version=entry_fill.config_version,
+                exit_config_version=exit_fill.config_version,
+                entry_fill_id=entry_fill.fill_id,
+                exit_fill_id=exit_fill.fill_id,
+                direction=direction,
+                entry_level=entry_fill.level_id,
+                exit_level=exit_fill.level_id,
+                quantity_lots=close_lots,
+                base_quantity=base_quantity,
+                entry_price=entry_fill.fill_price,
+                exit_price=exit_fill.fill_price,
+                gross_pnl=gross,
+                entry_fee=entry_fee,
+                exit_fee=exit_fee,
+                total_trading_fees=entry_fee + exit_fee,
+                funding=Decimal("0"),
+                other_costs=Decimal("0"),
+                other_credits=Decimal("0"),
+                net_pnl=gross - entry_fee - exit_fee,
+                opened_at=entry_fill.timestamp,
+                closed_at=exit_fill.timestamp,
+                duration_seconds=_interval_seconds(entry_fill.timestamp, exit_fill.timestamp),
+                status=ACCOUNTING_COMPLETE,
+                fee_to_gross_profit_ratio=(entry_fee + exit_fee) / gross if gross > 0 else None,
+                warnings=[],
+            )
+        )
+        remaining_by_fill[entry_fill.fill_id] = remaining_by_fill.get(entry_fill.fill_id, Decimal("0")) - close_lots
+        remaining_by_fill[exit_fill.fill_id] = remaining_by_fill.get(exit_fill.fill_id, exit_fill.quantity_lots) - close_lots
+    return cycles
+
+
 def calculate_unrealized_pnl(
     remaining_lots: Decimal,
     remaining_basis: Decimal,
@@ -479,6 +553,7 @@ def build_run_accounting(
 ) -> RunAccounting:
     costs = [normalize_cost(cost) for cost in (costs if costs is not None else run.get("exchange_costs") or [])]
     cycles, fills, remaining_lots, remaining_basis = build_cycle_ledger(run)
+    grid_cycles = build_grid_cycle_ledger(run)
     gross = sum((cycle.gross_pnl for cycle in cycles), Decimal("0"))
     maker_fees = sum((fill.trading_fee or Decimal("0") for fill in fills if fill.maker_taker_role == "maker"), Decimal("0"))
     taker_fees = sum((fill.trading_fee or Decimal("0") for fill in fills if fill.maker_taker_role == "taker"), Decimal("0"))
@@ -523,6 +598,8 @@ def build_run_accounting(
     return RunAccounting(
         fills_total=len(fills),
         cycles_completed=len(cycles),
+        fifo_inventory_closures_completed=len(cycles),
+        grid_cycles_completed=len(grid_cycles),
         gross_realized_pnl=gross,
         trading_fees=trading_fees,
         realized_trading_fees=realized_trading_fees,
@@ -539,6 +616,7 @@ def build_run_accounting(
         accounting_status=status,
         warnings=sorted(set(warnings)),
         cycles=cycles,
+        grid_cycles=grid_cycles,
         remaining_inventory_lots=remaining_lots,
         remaining_inventory_basis=remaining_basis,
         maker_fees=maker_fees,

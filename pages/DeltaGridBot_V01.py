@@ -151,8 +151,10 @@ def fragment(run_every: str | None = None) -> Callable:
 def safe_get(path: str, params: dict | None = None, timeout: int = 15) -> dict:
     try:
         return api_get(path, params=params, timeout=timeout)
+    except requests.Timeout:
+        return {"ok": False, "error": "timeout", "status_class": "UNKNOWN"}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "status_class": "UNKNOWN"}
 
 
 def safe_post(path: str, payload: dict | None = None, timeout: int = 15) -> dict:
@@ -221,6 +223,10 @@ def fetch_compact_live_state() -> dict:
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_detailed_live_state() -> dict:
     return safe_get("/api/grid/v01/live/state", timeout=15)
+
+
+def fetch_operational_live_state() -> dict:
+    return fetch_compact_live_state()
 
 
 def render_card(title: str, value: Any, note: str = "") -> None:
@@ -436,7 +442,7 @@ def render_live_metrics(live: dict) -> None:
     with position_cols[0]:
         render_card("Delta Position", inv["delta_label"], f"Difference {inv['difference']} lots")
     with position_cols[1]:
-        render_card("Trading Fees", fmt_money(pnl["fees"]), f"Completed cycles {pnl['cycles']}")
+        render_card("Trading Fees", fmt_money(pnl["fees"]), f"Grid cycles {pnl['cycles']} | FIFO closes {pnl.get('fifo_inventory_closures')}")
     if not inv["matches"]:
         st.warning("Delta position does not match the bot's records.")
     if pnl.get("incomplete"):
@@ -471,7 +477,7 @@ def render_live_activity(live: dict) -> None:
     with activity_cols[0]:
         render_card("Orders Filled", live.get("known_fill_count") or 0)
     with activity_cols[1]:
-        render_card("Completed Cycles", pnl["cycles"])
+        render_card("Grid Cycles", pnl["cycles"], f"FIFO closes {pnl.get('fifo_inventory_closures')}")
     with activity_cols[2]:
         render_card("Open Orders", len(order_rows))
     with activity_cols[3]:
@@ -480,11 +486,30 @@ def render_live_activity(live: dict) -> None:
         st.markdown(f"<div class='activity-line'>{line}</div>", unsafe_allow_html=True)
 
 
+def coalesced_live_warning(live: dict) -> None:
+    message = live.get("error") or "GridBot API unavailable."
+    previous = st.session_state.get("gridbot_last_live_warning")
+    if previous == message:
+        return
+    st.session_state["gridbot_last_live_warning"] = message
+    st.warning(f"GridBot live status is temporarily unknown: {message}")
+
+
 def remember_live_state(live: dict) -> bool:
-    st.session_state["gridbot_last_live_state"] = live
     if not live.get("ok", True):
-        st.error(live.get("error") or "GridBot API unavailable.")
+        st.session_state["gridbot_live_authority"] = "UNKNOWN"
+        st.session_state["gridbot_live_unknown_at"] = datetime.now(timezone.utc).isoformat()
+        coalesced_live_warning(live)
         return False
+    st.session_state["gridbot_last_live_warning"] = None
+    if live.get("run_id") or live.get("lifecycle_state"):
+        live["authority_state"] = "CONFIRMED_ACTIVE"
+        st.session_state["gridbot_last_good_active_live_state"] = live
+        st.session_state["gridbot_live_authority"] = "CONFIRMED_ACTIVE"
+    else:
+        live["authority_state"] = "CONFIRMED_NO_ACTIVE"
+        st.session_state["gridbot_live_authority"] = "CONFIRMED_NO_ACTIVE"
+    st.session_state["gridbot_last_live_state"] = live
     return True
 
 
@@ -544,8 +569,10 @@ def render_operator_panel(live: dict) -> None:
         st.markdown("<div class='section-label'>Actions</div>", unsafe_allow_html=True)
         render_actions(live)
         render_pending_operator_forms(live)
-    else:
+    elif live.get("authority_state") == "CONFIRMED_NO_ACTIVE":
         render_create_grid(live)
+    else:
+        render_idle(live)
 
 
 def render_edit_grid(live: dict) -> None:
@@ -611,7 +638,7 @@ def render_edit_grid(live: dict) -> None:
 
 @fragment(run_every="5s")
 def live_status_fragment() -> None:
-    live = fetch_compact_live_state()
+    live = fetch_operational_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
@@ -622,7 +649,7 @@ def live_status_fragment() -> None:
 
 @fragment(run_every="5s")
 def live_metrics_fragment() -> None:
-    live = fetch_compact_live_state()
+    live = fetch_operational_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
@@ -631,7 +658,7 @@ def live_metrics_fragment() -> None:
 
 @fragment(run_every="15s")
 def live_orders_fragment() -> None:
-    live = fetch_detailed_live_state()
+    live = fetch_operational_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
@@ -640,7 +667,7 @@ def live_orders_fragment() -> None:
 
 @fragment(run_every="15s")
 def live_activity_fragment() -> None:
-    live = fetch_detailed_live_state()
+    live = fetch_operational_live_state()
     if not remember_live_state(live):
         return
     if live.get("run_id") or live.get("lifecycle_state"):
@@ -800,7 +827,8 @@ def render_history() -> None:
                 "Date": (run.get("started_at") or run.get("created_at") or "")[:16].replace("T", " "),
                 "Grid Type": human_grid_type(report.get("grid_type") or run.get("grid_type")),
                 "Status": human_lifecycle(run.get("status")),
-                "Cycles": report.get("cycles_total") or report.get("cycles_completed") or "-",
+                "Grid Cycles": report.get("completed_grid_cycles") or report.get("cycles_total") or "-",
+                "FIFO Closes": report.get("fifo_inventory_closures_total") or report.get("cycles_completed") or "-",
                 "Net P&L": fmt_money(summary_net_pnl(report)),
                 "Fees": fmt_money(report.get("delta_fees") or report.get("trading_fees")),
                 "Accounting": report.get("accounting_status") or "-",
@@ -819,7 +847,7 @@ def render_history() -> None:
         with cols[1]:
             render_card("Fees", fmt_money(report.get("delta_fees") or report.get("trading_fees")))
         with cols[2]:
-            render_card("Cycles", report.get("cycles_total") or "-")
+            render_card("Grid Cycles", report.get("completed_grid_cycles") or report.get("cycles_total") or "-", f"FIFO closes {report.get('fifo_inventory_closures_total') or '-'}")
         with cols[3]:
             render_card("Final Position", fmt_lots(report.get("final_position") or 0))
 
@@ -834,5 +862,12 @@ live_metrics_fragment()
 live_orders_fragment()
 live_activity_fragment()
 last_live = st.session_state.get("gridbot_last_live_state") or {}
+if st.session_state.get("gridbot_live_authority") == "UNKNOWN":
+    last_live = st.session_state.get("gridbot_last_good_active_live_state") or {
+        "ok": False,
+        "authority_state": "UNKNOWN",
+        "health": {"overall_status": "UNKNOWN"},
+        "account_risk_state": {},
+    }
 render_operator_panel(last_live)
 render_history()

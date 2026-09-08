@@ -296,7 +296,7 @@ def test_dashboard_splits_live_surface_into_small_fragments() -> None:
     assert "render_live_dashboard(live)" not in text.split("@fragment(run_every=\"5s\")", maxsplit=1)[1]
 
 
-def test_dashboard_uses_mixed_cadence_for_compact_and_detailed_state() -> None:
+def test_dashboard_reuses_lightweight_operational_state_for_fragments() -> None:
     text = PAGE.read_text()
     status_fragment = text.split("def live_status_fragment()", maxsplit=1)[1].split("@fragment", maxsplit=1)[0]
     metrics_fragment = text.split("def live_metrics_fragment()", maxsplit=1)[1].split("@fragment", maxsplit=1)[0]
@@ -304,12 +304,22 @@ def test_dashboard_uses_mixed_cadence_for_compact_and_detailed_state() -> None:
     activity_fragment = text.split("def live_activity_fragment()", maxsplit=1)[1].split("def render_idle", maxsplit=1)[0]
 
     assert "@st.cache_data(ttl=5" in text
-    assert "@st.cache_data(ttl=15" in text
     assert "@fragment(run_every=\"15s\")" in text
-    assert "fetch_compact_live_state()" in status_fragment
-    assert "fetch_compact_live_state()" in metrics_fragment
-    assert "fetch_detailed_live_state()" in orders_fragment
-    assert "fetch_detailed_live_state()" in activity_fragment
+    assert "fetch_operational_live_state()" in status_fragment
+    assert "fetch_operational_live_state()" in metrics_fragment
+    assert "fetch_operational_live_state()" in orders_fragment
+    assert "fetch_operational_live_state()" in activity_fragment
+    assert "fetch_detailed_live_state()" not in status_fragment + metrics_fragment + orders_fragment + activity_fragment
+
+
+def test_dashboard_unknown_state_preserves_last_good_and_blocks_false_create() -> None:
+    text = PAGE.read_text()
+
+    assert 'st.session_state["gridbot_last_good_active_live_state"] = live' in text
+    assert 'st.session_state["gridbot_live_authority"] = "UNKNOWN"' in text
+    assert 'live.get("authority_state") == "CONFIRMED_NO_ACTIVE"' in text
+    assert 'render_create_grid(live)' in text
+    assert 'st.session_state.get("gridbot_last_good_active_live_state")' in text
 
 
 def test_dashboard_lifecycle_panel_is_compact_and_expandable() -> None:

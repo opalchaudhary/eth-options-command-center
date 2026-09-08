@@ -8,7 +8,7 @@ import requests
 import storage
 from .accounting import FEE_CONFIRMED, build_run_accounting, cycle_to_row, decimal_value, extract_fee, fill_notional, normalize_maker_taker_role
 from .health import HealthIssue
-from .models import new_id, utc_now
+from .models import new_id, product_metadata, utc_now
 
 
 ACTIVE_STATUSES = {"STARTING", "RUNNING", "PAUSING", "PAUSED", "RESUMING", "EDITING", "REGRID_PENDING", "STOPPING", "STOP_REQUIRES_ATTENTION"}
@@ -456,6 +456,7 @@ class SupabaseGridRepository:
     def persist_config(self, run: dict, reason: str = "start") -> None:
         config = deepcopy(run.get("config") or {})
         version = int(config.get("config_version") or 1)
+        self.retire_open_prior_configs(run["run_id"], version)
         self.upsert(
             "grid_config_versions",
             {
@@ -483,6 +484,30 @@ class SupabaseGridRepository:
     def retire_config(self, run_id: str, config_version: int) -> None:
         self.patch("grid_config_versions", {"run_id": run_id, "config_version": config_version}, {"effective_to": utc_now(), "regrid_required": True})
         self.patch("grid_levels", {"run_id": run_id, "config_version": config_version}, {"state": "retired", "retired_at": utc_now()})
+
+    def retire_open_prior_configs(self, run_id: str, current_config_version: int) -> int:
+        try:
+            rows = self.select(
+                "grid_config_versions",
+                {"select": "config_version,effective_to", "run_id": f"eq.{run_id}"},
+            )
+        except SupabasePersistenceError:
+            return 0
+        retired = 0
+        now = utc_now()
+        for row in rows:
+            try:
+                version = int(row.get("config_version") or 0)
+            except Exception:
+                continue
+            if version < current_config_version and not row.get("effective_to"):
+                self.patch(
+                    "grid_config_versions",
+                    {"run_id": run_id, "config_version": version},
+                    {"effective_to": now, "regrid_required": True},
+                )
+                retired += 1
+        return retired
 
     def persist_levels(self, run: dict) -> None:
         config = run.get("config") or {}
@@ -722,7 +747,8 @@ class SupabaseGridRepository:
         try:
             equity = decimal_value(account_equity)
             if equity > 0 and mark_price and gridbot_inventory:
-                grr = str((abs(decimal_value(gridbot_inventory)) * decimal_value(mark_price)) / equity)
+                multiplier = decimal_value(product_metadata((run.get("product") or {}).get("symbol") or (run.get("config") or {}).get("product_symbol") or "ETHUSD", existing=run.get("product") or {}).get("contract_multiplier"), "1")
+                grr = str((abs(decimal_value(gridbot_inventory)) * decimal_value(mark_price) * multiplier) / equity)
         except Exception:
             grr = None
         telemetry_freshness = {
@@ -963,14 +989,16 @@ class SupabaseGridRepository:
 
     def resolve_terminal_health_issues(self, run_id: str, *, keep_codes: set[str] | None = None) -> int:
         terminal_cleanup_codes = {
+            "GRID_DEPLOYMENT_INCOMPLETE",
             "GRID_ORDER_UNRESOLVED",
             "GRID_ORDER_MISSING_UNEXPECTEDLY",
+            "GRID_ORDER_ORPHAN",
             "LIFECYCLE_STUCK",
             "POSITION_MISMATCH",
             "POSITION_ATTRIBUTION_UNSAFE",
-            "STOPPED_WITH_EXPOSURE",
             "WORKER_DEAD_RUNNING",
             "RECONCILIATION_STALE",
+            "DELTA_API_ERROR",
         }
         return self.resolve_health_issue_codes(run_id, terminal_cleanup_codes - (keep_codes or set()))
 
@@ -1071,7 +1099,8 @@ class SupabaseGridRepository:
             ),
             None,
         )
-        product_id = bot.get("product_id") or 1699
+        product = product_metadata(bot.get("product_symbol") or config.get("product_symbol") or "ETHUSD", bot.get("product_id"), bot.get("product") if isinstance(bot.get("product"), dict) else None)
+        product_id = product.get("product_id") or 1699
         startup_stage = latest_stage or ("RUNNING" if run_row.get("status") == "RUNNING" else run_row.get("status"))
         startup = {
             "start_stage": startup_stage,
@@ -1099,7 +1128,7 @@ class SupabaseGridRepository:
                 }
                 for row in levels
             ],
-            "product": {"product_id": product_id, "symbol": bot.get("product_symbol") or "ETHUSD", "contract_multiplier": "1"},
+            "product": product,
             "reference_price": str(run_row.get("starting_market_price") or "0"),
             "execution_event_mode": run_row.get("execution_event_mode") or "REST_FALLBACK",
             "private_ws_status": "BLOCKED_403",
