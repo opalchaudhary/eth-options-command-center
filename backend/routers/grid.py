@@ -11,6 +11,7 @@ from grid_bot.grid_builder import NeutralGridRangeValidationError
 from grid_bot.engine import engine
 from grid_bot.models import GridConfig, GridType, SpacingType, new_id, to_record_dict
 from grid_bot.recommendation_service import GridRecommendationService, GridRecommendationStorageError, GridRecommendationUnavailable
+from grid_bot.recommendation_outcome_evaluator import GridRecommendationOutcomeEvaluator
 from grid_bot.repository import repository
 from grid_bot.rest_fallback import RestFallbackPoller
 from grid_bot.supabase_repository import SupabaseGridRepository
@@ -295,9 +296,18 @@ def grid_v01_recommendation_history(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/v01/recommendation-outcomes/summary")
+def grid_v01_recommendation_outcomes_summary(limit: int = 5000):
+    try:
+        return GridRecommendationOutcomeEvaluator().summary(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 public_grid_router.add_api_route("/v01/recommendation", grid_v01_recommendation, methods=["GET"])
 public_grid_router.add_api_route("/v01/recommendation", grid_v01_recommendation_request, methods=["POST"])
 public_grid_router.add_api_route("/v01/recommendations/history", grid_v01_recommendation_history, methods=["GET"])
+public_grid_router.add_api_route("/v01/recommendation-outcomes/summary", grid_v01_recommendation_outcomes_summary, methods=["GET"])
 
 
 
