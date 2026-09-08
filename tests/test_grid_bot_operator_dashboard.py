@@ -322,6 +322,27 @@ def test_dashboard_unknown_state_preserves_last_good_and_blocks_false_create() -
     assert 'st.session_state.get("gridbot_last_good_active_live_state")' in text
 
 
+def test_active_telemetry_failure_preserves_operator_controls_and_blocks_false_create() -> None:
+    text = PAGE.read_text()
+    remember_body = text.split("def remember_live_state", maxsplit=1)[1].split("def render_live_status", maxsplit=1)[0]
+    operator_panel_body = text.split("def render_operator_panel", maxsplit=1)[1].split("def render_edit_grid", maxsplit=1)[0]
+    unknown_fallback_body = text.split('if st.session_state.get("gridbot_live_authority") == "UNKNOWN":', maxsplit=1)[1].split("render_operator_panel", maxsplit=1)[0]
+    edit_body = text.split("def render_edit_grid", maxsplit=1)[1].split("def render_actions", maxsplit=1)[0]
+
+    assert 'if not live.get("ok", True):' in remember_body
+    assert 'coalesced_live_warning(live)' in remember_body
+    assert 'st.session_state["gridbot_live_authority"] = "UNKNOWN"' in remember_body
+    assert 'st.session_state["gridbot_last_good_active_live_state"] = live' in remember_body
+    assert 'st.session_state.get("gridbot_last_good_active_live_state")' in unknown_fallback_body
+    assert 'render_actions(live)' in operator_panel_body
+    assert 'render_pending_operator_forms(live)' in operator_panel_body
+    assert 'live.get("authority_state") == "CONFIRMED_NO_ACTIVE"' in operator_panel_body
+    assert operator_panel_body.index("render_actions(live)") < operator_panel_body.index('live.get("authority_state") == "CONFIRMED_NO_ACTIVE"')
+    assert '"gridbot_edit_preview"' in edit_body
+    assert '"edit_lower"' in edit_body
+    assert '"edit_upper"' in edit_body
+
+
 def test_dashboard_lifecycle_panel_is_compact_and_expandable() -> None:
     text = PAGE.read_text()
     lifecycle_body = text.split("def render_lifecycle_progress", maxsplit=1)[1].split("def render_live_status", maxsplit=1)[0]

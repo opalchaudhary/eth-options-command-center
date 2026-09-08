@@ -563,6 +563,16 @@ def _compact_order_counts(rows: list[dict]) -> dict:
 
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
+    if not state.get("run_id"):
+        try:
+            telemetry = account_telemetry_cache.get("ETHUSD").as_dict()
+            state["account_risk_state"] = telemetry
+            open_order_count = _fresh_open_order_count(telemetry)
+            if open_order_count is not None:
+                state["open_gridbot_orders"] = open_order_count
+            state["health"] = evaluate_gridbot_health(state)
+        except Exception as exc:
+            state["account_risk_state_error"] = str(exc)[:300]
     run = state.get("active_run") if isinstance(state.get("active_run"), dict) else {}
     config = state.get("config") or (run.get("config") if isinstance(run, dict) else {}) or {}
     telemetry = state.get("account_risk_state") or {}

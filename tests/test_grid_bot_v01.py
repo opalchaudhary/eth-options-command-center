@@ -3505,6 +3505,160 @@ def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(m
     assert "fills" not in compact
 
 
+def test_gridbot_compact_live_state_refreshes_idle_telemetry_without_supabase_reload(monkeypatch):
+    class DB:
+        enabled = True
+
+        def load_run_state(self, _run_id):
+            raise AssertionError("idle compact live state must not reload full Supabase run state")
+
+        def stats(self):
+            return {"select": 99}
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": True,
+                "thread_alive": True,
+                "run_id": None,
+                "status": "idle",
+                "poll_interval_seconds": 2,
+                "account_risk_state": {
+                    "telemetry_status": "STALE",
+                    "mark_price": "2400",
+                    "position_lots": "0",
+                    "account_age_seconds": 91,
+                    "position_age_seconds": 91,
+                    "order_age_seconds": 91,
+                    "market_age_seconds": 91,
+                },
+                "health": {
+                    "overall_status": "DEGRADED",
+                    "active_issues": [{"code": "TELEMETRY_STALE"}],
+                    "position_inventory_agreement": {"gridbot_inventory": "0", "delta_position": "0", "matches": True, "difference": "0"},
+                },
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "accounting": {},
+            }
+
+    class Telemetry:
+        def as_dict(self):
+            return {
+                "telemetry_status": "HEALTHY",
+                "mark_price": "2500",
+                "account_equity": "1000",
+                "available_margin": "990",
+                "used_margin": "10",
+                "margin_utilisation_pct": "1",
+                "position_lots": "0",
+                "position_side": "FLAT",
+                "open_order_count": 0,
+                "account_age_seconds": 0,
+                "position_age_seconds": 0,
+                "order_age_seconds": 0,
+                "market_age_seconds": 0,
+            }
+
+    class AccountTelemetry:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, symbol):
+            assert symbol == "ETHUSD"
+            self.calls += 1
+            return Telemetry()
+
+    telemetry_cache = AccountTelemetry()
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+    monkeypatch.setattr(continuous_worker_module, "account_telemetry_cache", telemetry_cache)
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert telemetry_cache.calls == 1
+    assert compact["source"] == "worker_memory_compact"
+    assert compact["run_id"] is None
+    assert compact["account_risk_state"]["mark_price"] == "2500"
+    assert compact["account_risk_state"]["telemetry_status"] == "HEALTHY"
+    assert compact["health"]["overall_status"] == "HEALTHY"
+    assert compact["health"]["active_issues"] == []
+    assert "active_run" not in compact
+    assert "known_gridbot_orders" not in compact
+
+
+def test_gridbot_compact_idle_telemetry_uses_existing_cache_interval(monkeypatch):
+    class Telemetry:
+        def __init__(self, status="HEALTHY", age=0):
+            self.status = status
+            self.age = age
+
+        def as_dict(self):
+            return {
+                "telemetry_status": self.status,
+                "mark_price": "2500",
+                "account_equity": "1000",
+                "available_margin": "990",
+                "used_margin": "10",
+                "margin_utilisation_pct": "1",
+                "position_lots": "0",
+                "position_side": "FLAT",
+                "open_order_count": 0,
+                "account_age_seconds": self.age,
+                "position_age_seconds": self.age,
+                "order_age_seconds": self.age,
+                "market_age_seconds": self.age,
+            }
+
+    class ExistingCacheSemantics:
+        def __init__(self):
+            self.get_calls = 0
+            self.real_refreshes = 0
+            self.cached = Telemetry()
+
+        def get(self, _symbol):
+            self.get_calls += 1
+            if self.get_calls == 1:
+                self.real_refreshes += 1
+                self.cached = Telemetry(age=0)
+            else:
+                self.cached = Telemetry(age=5)
+            return self.cached
+
+    class Worker:
+        db = None
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": True,
+                "thread_alive": True,
+                "run_id": None,
+                "status": "idle",
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "accounting": {},
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+            }
+
+    telemetry_cache = ExistingCacheSemantics()
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+    monkeypatch.setattr(continuous_worker_module, "account_telemetry_cache", telemetry_cache)
+
+    first = continuous_worker_module.gridbot_compact_live_state()
+    second = continuous_worker_module.gridbot_compact_live_state()
+
+    assert telemetry_cache.get_calls == 2
+    assert telemetry_cache.real_refreshes == 1
+    assert first["health"]["overall_status"] == "HEALTHY"
+    assert second["health"]["overall_status"] == "HEALTHY"
+    assert second["account_risk_state"]["account_age_seconds"] == 5
+
+
 def test_snapshot_material_change_ignores_regular_mark_and_margin_drift():
     worker = ContinuousGridBotWorker(client=_FakeLifecycleClient(), db=_CountingSupabaseGridRepository())
     baseline = (
