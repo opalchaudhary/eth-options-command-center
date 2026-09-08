@@ -301,6 +301,14 @@ class DurableGridBotLifecycle:
                 time.sleep(0.05)
         raise last_error or RuntimeError("Unable to load durable DeltaGridBot state.")
 
+    def _load_run_by_id(self, run_id: str) -> tuple[dict, dict | None]:
+        state = self._load()
+        run = (state.get("runs") or {}).get(run_id)
+        if not run and self._db_enabled():
+            run = self.db.load_run_state(run_id)
+            state.setdefault("runs", {})[run_id] = run
+        return state, run
+
     def _save(self, state: dict, *, include_children: bool = True) -> None:
         with self._save_lock:
             if self._db_enabled():
@@ -1693,7 +1701,13 @@ class DurableGridBotLifecycle:
         product_spec=None,
         verify_existing_before_submit: bool = True,
     ) -> dict:
-        spec = product_spec or self.client.product_spec(run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD")
+        product_symbol = run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD"
+        spec = product_spec or self.client.product_spec(product_symbol)
+        if proposal.post_only:
+            try:
+                spec = self.client.product_spec(product_symbol)
+            except Exception:
+                pass
         position = current_inventory if current_inventory is not None else _position_size(self.client, product_id)
         normalized_price = round_price_for_side(proposal.price, spec.tick_size, proposal.side)
         semantic = evaluate_order_semantics(
@@ -3090,8 +3104,9 @@ class DurableGridBotLifecycle:
                 run["startup"] = self._startup_progress(run, "STOPPING")
             self._event(state, run["run_id"], "GRID_RUN_STOPPING", {"previous_status": previous_status, "reason": reason})
             self._save(state)
-            state = self._load()
-            run = state["runs"][run["run_id"]]
+            state, run = self._load_run_by_id(run["run_id"])
+            if run and run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
+                return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
         elif run.get("status") == STOP_ATTENTION_STATUS:
             now = utc_now()
             run["status"] = GridStatus.STOPPING.value
@@ -3100,8 +3115,9 @@ class DurableGridBotLifecycle:
             run["stop_reason"] = reason
             self._event(state, run["run_id"], "GRID_RUN_STOP_RETRYING", {"reason": reason, "previous_diagnostics": run.get("stop_diagnostics")})
             self._save(state)
-            state = self._load()
-            run = state["runs"][run["run_id"]]
+            state, run = self._load_run_by_id(run["run_id"])
+            if run and run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
+                return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
 
         product_id = int(run["product"]["product_id"])
         cancelled_attempts = 0
@@ -3138,8 +3154,7 @@ class DurableGridBotLifecycle:
         self._update_lifecycle_progress(run, "STOP", "VERIFYING_CANCELS", message="Stopping Grid: waiting for Delta verification", cancelled_orders=cancelled_attempts)
         self._save(state, include_children=False)
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
-        state = self._load()
-        run = state["runs"][run["run_id"]]
+        state, run = self._load_run_by_id(run["run_id"])
         reconciliation = reconciled["reconciliation"]
         if reconciliation.get("errors"):
             return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": reconciliation.get("errors"), "cancel_attempts": cancelled_attempts})
@@ -3161,8 +3176,7 @@ class DurableGridBotLifecycle:
                     )
                     self._save(state, include_children=False)
                     reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-                    state = self._load()
-                    run = state["runs"][run["run_id"]]
+                    state, run = self._load_run_by_id(run["run_id"])
                     reconciliation = reconciled["reconciliation"]
                     gridbot_inventory = _decimal(reconciliation.get("gridbot_inventory"))
                     delta_position = _decimal(reconciliation.get("delta_position"))
@@ -3202,8 +3216,7 @@ class DurableGridBotLifecycle:
                 self._cancel_known_gridbot_resting_orders(run, product_id)
                 self._save(state)
                 reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-                state = self._load()
-                run = state["runs"][run["run_id"]]
+                state, run = self._load_run_by_id(run["run_id"])
                 reconciliation = reconciled["reconciliation"]
                 if reconciliation.get("errors"):
                     return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable", "errors": reconciliation.get("errors")})
@@ -3233,8 +3246,7 @@ class DurableGridBotLifecycle:
                                 {"reason": "external_delta_flatten_submission_failed", "error": str(exc)[:500], "delta_position": str(delta_position)},
                             )
                         reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-                        state = self._load()
-                        run = state["runs"][run["run_id"]]
+                        state, run = self._load_run_by_id(run["run_id"])
                         reconciliation = reconciled["reconciliation"]
                         if reconciliation.get("errors"):
                             return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_external_delta_flatten", "errors": reconciliation.get("errors")})
@@ -3279,8 +3291,7 @@ class DurableGridBotLifecycle:
                         )
                         self._save(state, include_children=False)
                         reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-                        state = self._load()
-                        run = state["runs"][run["run_id"]]
+                        state, run = self._load_run_by_id(run["run_id"])
                         reconciliation = reconciled["reconciliation"]
                         if reconciliation.get("errors"):
                             return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_flatten_recovery", "errors": reconciliation.get("errors")})
@@ -3338,8 +3349,7 @@ class DurableGridBotLifecycle:
             except Exception as exc:
                 return self._stop_attention(state, run, reason, {"reason": "flatten_submission_failed", "error": str(exc)[:500], "inventory": str(gridbot_inventory)})
             reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-            state = self._load()
-            run = state["runs"][run["run_id"]]
+            state, run = self._load_run_by_id(run["run_id"])
             reconciliation = reconciled["reconciliation"]
             if reconciliation.get("errors"):
                 return self._stop_attention(state, run, reason, {"reason": "exchange_truth_unavailable_after_flatten", "errors": reconciliation.get("errors")})
@@ -3363,8 +3373,7 @@ class DurableGridBotLifecycle:
                 )
                 self._save(state)
                 reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
-                state = self._load()
-                run = state["runs"][run["run_id"]]
+                state, run = self._load_run_by_id(run["run_id"])
                 reconciliation = reconciled["reconciliation"]
                 position = _decimal(reconciliation.get("delta_position"))
                 final_inventory = _decimal(reconciliation.get("gridbot_inventory"))

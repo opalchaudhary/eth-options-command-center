@@ -1,3 +1,4 @@
+from dataclasses import replace
 from decimal import Decimal
 import json
 import time
@@ -815,6 +816,43 @@ def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
     assert not [order for order in edited["run"]["orders"].values() if order.get("status") == "ambiguous_submission"]
 
 
+def test_edit_grid_defers_levels_that_become_post_only_unsafe_after_book_moves(tmp_path):
+    class MovingBookClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.book_moved = False
+            self.move_on_next_place = False
+
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            if self.book_moved:
+                spec = replace(spec, best_bid=Decimal("2520"), best_ask=Decimal("2520.05"))
+            return spec
+
+        def place_order(self, payload):
+            if self.move_on_next_place:
+                self.move_on_next_place = False
+                self.book_moved = True
+            if self.book_moved and payload.get("post_only") and payload["side"] == "sell" and Decimal(str(payload["limit_price"])) <= Decimal("2520"):
+                raise RuntimeError("400 Client Error: Bad Request for url: https://testnet/orders")
+            return super().place_order(payload)
+
+    client = MovingBookClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    client.move_on_next_place = True
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6, "range_width": "150"}, reason="moving_post_only_book")
+    deferred = list((edited["run"].get("deferred_orders") or {}).values())
+
+    assert edited["ok"] is True
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert int(edited["run"]["config"]["grid_count"]) == 6
+    assert any("POST_ONLY_SELL_WOULD_CROSS_BID" in (order.get("rejection_reason") or "") for order in deferred)
+    assert not [order for order in edited["run"]["orders"].values() if order.get("status") == "ambiguous_submission"]
+
+
 def test_request_edit_grid_acknowledges_then_worker_style_apply_completes(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -1215,6 +1253,50 @@ def test_stop_external_close_recovery_is_idempotent(tmp_path):
     assert first["summary"]["summary_id"] == second["summary"]["summary_id"]
     assert events.count("GRID_RUN_STOP_EXTERNAL_POSITION_RESOLVED") == 1
     assert len(client.flatten_payloads) == 0
+
+
+def test_stop_returns_terminal_summary_if_worker_releases_active_lock_during_reload(tmp_path):
+    class ConcurrentTerminalStopLifecycle(DurableGridBotLifecycle):
+        def __init__(self, *args, race_run_id=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.race_run_id = race_run_id
+            self._race_once = True
+
+        def _save(self, state, *, include_children=True):
+            super()._save(state, include_children=include_children)
+            run = (state.get("runs") or {}).get(self.race_run_id)
+            if self._race_once and run and run.get("status") == GridStatus.STOPPING.value:
+                self._race_once = False
+                summary = {
+                    "summary_id": "summary-concurrent-stop",
+                    "run_id": run["run_id"],
+                    "gridbot_version": "0.1",
+                    "stopped_at": utc_now(),
+                    "final_position": "0",
+                    "final_delta_position": "0",
+                    "final_gridbot_inventory": "0",
+                    "stray_gridbot_orders": 0,
+                    "accounting_status": "COMPLETE",
+                    "immutable": True,
+                    "created_at": utc_now(),
+                }
+                stopped = {**run, "status": GridStatus.STOPPED.value, "summary": summary, "stopped_at": summary["stopped_at"]}
+                self.db.persist_summary(stopped, summary)
+                self.db.persist_run_state(stopped, include_children=False)
+                self.db.release_active_run_guard(run["run_id"])
+
+    client = _FakeLifecycleClient()
+    db = _MemorySupabaseGridRepository()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, db=db, use_supabase=True)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    stopped = ConcurrentTerminalStopLifecycle(client, path, db=db, use_supabase=True, race_run_id=run["run_id"]).stop(run["run_id"], "operator_stop")
+
+    assert stopped["ok"] is True
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert stopped["summary"]["summary_id"] == "summary-concurrent-stop"
+    assert DurableGridBotLifecycle(client, path, db=db, use_supabase=True).status()["active_run_id"] is None
 
 
 def test_stop_requires_attention_on_exchange_truth_failure(tmp_path):
