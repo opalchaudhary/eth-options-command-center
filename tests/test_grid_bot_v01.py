@@ -4021,6 +4021,27 @@ def test_worker_position_mismatch_waits_for_confirmation_before_external_pause(t
     assert "GRID_RUN_EXTERNAL_POSITION_CHANGE" not in {event["event_type"] for event in events}
 
 
+def test_worker_refreshes_lifecycle_state_before_advancing_stale_edit(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    edit = lifecycle.request_edit_grid(run_id, {"grid_count": 6}, reason="stale_worker_edit")
+    stale_edit_run = edit["run"]
+    lifecycle.request_stop(run_id, reason="stop_wins_over_stale_edit")
+
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    result = worker._advance_lifecycle_once(stale_edit_run)
+
+    assert result["run"]["status"] == "STOPPED"
+    assert result["run"]["summary"]["accounting_status"] == "COMPLETE"
+    events = list(db.tables.get("grid_events", {}).values())
+    assert "GRID_RUN_STOP_REQUESTED" in {event["event_type"] for event in events}
+    assert "GRID_RUN_SUMMARY_GENERATED" in {event["event_type"] for event in events}
+    assert "GRID_WORKER_ERROR" not in {event["event_type"] for event in events}
+
+
 def test_worker_confirmed_position_mismatch_pauses_external_change(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()

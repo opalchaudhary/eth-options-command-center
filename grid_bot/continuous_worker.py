@@ -509,6 +509,8 @@ class ContinuousGridBotWorker:
 
     def _advance_lifecycle_once(self, run: dict) -> dict:
         lifecycle = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled)
+        if self.db.enabled and run.get("run_id"):
+            run = self.db.load_run_state(run["run_id"]) or run
         status = run.get("status")
         if status == GridStatus.PAUSING.value:
             return lifecycle.pause(run["run_id"])
