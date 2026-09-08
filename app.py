@@ -10,6 +10,7 @@ from analytics import (
 )
 
 from api_client import api_get, backend_url
+from streamlit_auth import require_authentication
 from ui_styles import load_css
 
 
@@ -19,6 +20,7 @@ st.set_page_config(
 )
 
 load_css()
+require_authentication()
 
 st.title("ETH Options Command Center")
 st.caption("Clean ETH options dashboard powered by Delta Exchange -> FastAPI -> Supabase")

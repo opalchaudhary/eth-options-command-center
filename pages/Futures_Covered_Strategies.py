@@ -2,11 +2,13 @@ import pandas as pd
 import streamlit as st
 
 from api_client import api_get, backend_url
+from streamlit_auth import require_authentication
 from ui_styles import load_css
 
 
 st.set_page_config(page_title="Futures & Covered Strategies", layout="wide")
 load_css()
+require_authentication()
 
 st.title("Futures & Covered Strategies")
 st.caption("Research-only futures direction and covered option suitability.")

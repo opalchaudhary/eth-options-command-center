@@ -2,11 +2,13 @@ import pandas as pd
 import streamlit as st
 
 from btc_iron_fly_engine import build_btc_iron_fly_recommendation
+from streamlit_auth import require_authentication
 from ui_styles import load_css
 
 
 st.set_page_config(page_title="BTC Iron Fly Optimizer", layout="wide")
 load_css()
+require_authentication()
 
 st.title("BTC Iron Fly Optimizer")
 st.caption("Research-only BTC Iron Fly feasibility, expiry comparison, and leg optimization using Delta Exchange data.")

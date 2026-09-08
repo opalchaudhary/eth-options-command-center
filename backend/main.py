@@ -5,8 +5,9 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.auth import DeltaForgeAuthMiddleware
 from backend.config import log_startup_config
-from backend.routers import grid, health, market, mobile, strategy, system
+from backend.routers import auth, grid, health, market, mobile, strategy, system
 from backend.services.rich_orderflow_ws_service import start_orderflow_ws_service, stop_orderflow_ws_service
 from backend.services.scheduler_service import start_scheduler, stop_scheduler
 from grid_bot.continuous_worker import start_continuous_gridbot_worker, stop_continuous_gridbot_worker
@@ -40,7 +41,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(DeltaForgeAuthMiddleware)
 
+app.include_router(auth.router)
 app.include_router(health.router)
 app.include_router(market.router)
 app.include_router(mobile.router)

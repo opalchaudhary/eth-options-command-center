@@ -30,11 +30,13 @@ from grid_bot.operator_dashboard import (
     recent_activity,
     split_pending_orders,
 )
+from streamlit_auth import require_authentication
 from ui_styles import load_css
 
 
 st.set_page_config(page_title="Delta Grid Bot", layout="wide")
 load_css()
+require_authentication()
 
 
 st.markdown(
