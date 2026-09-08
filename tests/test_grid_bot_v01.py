@@ -4949,6 +4949,65 @@ def test_supabase_load_run_state_reconstructs_completeness_from_normalized_repla
     assert recovered["product"]["contract_multiplier"] == "0.01"
 
 
+def test_supabase_load_run_state_reconstructs_pending_edit_request_state():
+    db = _MemorySupabaseGridRepository()
+    old_config = {
+        "bot_id": "bot-edit-request",
+        "bot_name": "Edit Request",
+        "product_symbol": "ETHUSD",
+        "config_version": 1,
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 30,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "25",
+    }
+    target_config = {**old_config, "config_version": 2, "grid_count": 40}
+    run_id = "run-edit-request"
+    created_at = utc_now()
+    db.upsert(
+        "grid_runs",
+        [{"run_id": run_id, "bot_id": old_config["bot_id"], "status": GridStatus.EDITING.value, "active_config_version": 1, "config_version": 1, "started_at": created_at}],
+        on_conflict="run_id",
+    )
+    db.upsert("grid_bots", [{"bot_id": old_config["bot_id"], "bot_name": "Edit Request", "product_symbol": "ETHUSD"}], on_conflict="bot_id")
+    db.upsert(
+        "grid_config_versions",
+        [{"run_id": run_id, "bot_id": old_config["bot_id"], "config_version": 1, "config": old_config, "created_at": created_at}],
+        on_conflict="run_id,config_version",
+    )
+    db.insert_once(
+        "grid_events",
+        {
+            "event_id": "evt-edit-request",
+            "run_id": run_id,
+            "event_type": "GRID_RUN_EDIT_REQUESTED",
+            "payload": {
+                "operation_id": "edit-run-edit-request-1-2-test",
+                "previous_status": GridStatus.RUNNING.value,
+                "from_config_version": 1,
+                "to_config_version": 2,
+                "reason": "unit_pending_edit",
+                "source_config": old_config,
+                "target_config": target_config,
+            },
+            "created_at": created_at,
+        },
+        on_conflict="event_id",
+    )
+
+    recovered = db.load_run_state(run_id)
+
+    assert recovered["edit_state"]["operation_id"] == "edit-run-edit-request-1-2-test"
+    assert recovered["edit_state"]["previous_status"] == GridStatus.RUNNING.value
+    assert recovered["edit_state"]["source_config"]["grid_count"] == 30
+    assert recovered["edit_state"]["target_config"]["grid_count"] == 40
+    assert recovered["edit_state"]["config_persisted"] is False
+    assert recovered["lifecycle_operation"]["operation_id"] == "edit-run-edit-request-1-2-test"
+
+
 def test_supabase_persist_config_closes_prior_open_versions():
     db = _MemorySupabaseGridRepository()
     run = {

@@ -1095,7 +1095,7 @@ class SupabaseGridRepository:
             (
                 row
                 for row in event_rows
-                if row.get("event_type") == "GRID_RUN_EDITING"
+                if row.get("event_type") in {"GRID_RUN_EDITING", "GRID_RUN_EDIT_REQUESTED"}
             ),
             None,
         )
@@ -1262,6 +1262,7 @@ class SupabaseGridRepository:
                 }
             elif latest_editing:
                 payload = latest_editing.get("payload") or {}
+                event_type = latest_editing.get("event_type")
                 run_state["edit_state"] = {
                     "operation_id": payload.get("operation_id"),
                     "previous_status": payload.get("previous_status") or "RUNNING",
@@ -1269,11 +1270,23 @@ class SupabaseGridRepository:
                     "to_config_version": payload.get("to_config_version"),
                     "source_config": payload.get("source_config") or {},
                     "target_config": payload.get("target_config") or config,
-                    "stage": "FREEZE_PLACEMENT",
+                    "stage": "EDIT_REQUESTED" if event_type == "GRID_RUN_EDIT_REQUESTED" else "FREEZE_PLACEMENT",
                     "reason": payload.get("reason"),
                     "started_at": latest_editing.get("created_at"),
+                    "requested_at": latest_editing.get("created_at") if event_type == "GRID_RUN_EDIT_REQUESTED" else None,
                     "config_persisted": False,
                 }
+                if payload.get("operation_id"):
+                    run_state["lifecycle_operation"] = {
+                        "operation_id": payload.get("operation_id"),
+                        "run_id": run_id,
+                        "operation_type": "EDIT",
+                        "requested_at": latest_editing.get("created_at"),
+                        "phase": "EDIT_REQUESTED",
+                        "status": "REQUESTED",
+                        "last_error": None,
+                        "retry_count": 0,
+                    }
         return run_state
 
     def status_payload(self) -> dict:
