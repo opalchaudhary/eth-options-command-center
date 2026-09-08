@@ -1245,7 +1245,41 @@ class SupabaseGridRepository:
                 "grid_parameter_changes",
                 {"select": "*", "run_id": f"eq.{run_id}", "to_config_version": f"eq.{config.get('config_version')}", "order": "created_at.desc", "limit": 1},
             )
-            if change_rows:
+            pending_payload = (latest_editing or {}).get("payload") or {}
+            pending_to_version = int(pending_payload.get("to_config_version") or 0)
+            active_version = int(config.get("config_version") or run_row.get("active_config_version") or 0)
+            pending_request = (
+                latest_editing
+                and latest_editing.get("event_type") == "GRID_RUN_EDIT_REQUESTED"
+                and pending_to_version > active_version
+            )
+            if pending_request:
+                payload = pending_payload
+                run_state["edit_state"] = {
+                    "operation_id": payload.get("operation_id"),
+                    "previous_status": payload.get("previous_status") or "RUNNING",
+                    "from_config_version": payload.get("from_config_version"),
+                    "to_config_version": payload.get("to_config_version"),
+                    "source_config": payload.get("source_config") or {},
+                    "target_config": payload.get("target_config") or config,
+                    "stage": "EDIT_REQUESTED",
+                    "reason": payload.get("reason"),
+                    "started_at": latest_editing.get("created_at"),
+                    "requested_at": latest_editing.get("created_at"),
+                    "config_persisted": False,
+                }
+                if payload.get("operation_id"):
+                    run_state["lifecycle_operation"] = {
+                        "operation_id": payload.get("operation_id"),
+                        "run_id": run_id,
+                        "operation_type": "EDIT",
+                        "requested_at": latest_editing.get("created_at"),
+                        "phase": "EDIT_REQUESTED",
+                        "status": "REQUESTED",
+                        "last_error": None,
+                        "retry_count": 0,
+                    }
+            elif change_rows:
                 change = change_rows[0]
                 payload = change.get("payload") or {}
                 run_state["edit_state"] = {

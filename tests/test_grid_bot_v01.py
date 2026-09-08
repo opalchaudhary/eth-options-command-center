@@ -2365,6 +2365,35 @@ def test_operator_grid_start_does_not_resurrect_run_when_stop_races_placement(tm
     assert client.cancelled == ["100"]
 
 
+def test_edit_grid_does_not_resurrect_run_when_stop_races_placement(tmp_path):
+    class StopDuringEditPlacementClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.on_place = None
+            self._stopped_once = False
+
+        def place_order(self, payload):
+            row = super().place_order(payload)
+            if self.on_place and not self._stopped_once:
+                self._stopped_once = True
+                self.on_place()
+            return row
+
+    client = StopDuringEditPlacementClient()
+    path = tmp_path / "state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    run_id = run["run_id"]
+    client.on_place = lambda: DurableGridBotLifecycle(client, path, use_supabase=False).stop(run_id, "race_stop")
+
+    result = lifecycle.edit_grid(run_id, {"grid_count": 6}, reason="race_edit")
+    final_status = DurableGridBotLifecycle(client, path, use_supabase=False).status()
+
+    assert result["run"]["status"] == GridStatus.STOPPED.value
+    assert final_status["active_run_id"] is None
+    assert client.open_orders(1699)["result"] == []
+
+
 def test_duplicate_background_start_attaches_to_starting_run(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
@@ -5006,6 +5035,80 @@ def test_supabase_load_run_state_reconstructs_pending_edit_request_state():
     assert recovered["edit_state"]["target_config"]["grid_count"] == 40
     assert recovered["edit_state"]["config_persisted"] is False
     assert recovered["lifecycle_operation"]["operation_id"] == "edit-run-edit-request-1-2-test"
+
+
+def test_supabase_pending_edit_request_takes_precedence_over_previous_change():
+    db = _MemorySupabaseGridRepository()
+    old_config = {
+        "bot_id": "bot-edit-request",
+        "bot_name": "Edit Request",
+        "product_symbol": "ETHUSD",
+        "config_version": 1,
+        "grid_type": "neutral",
+        "lower_price": "2400",
+        "upper_price": "2600",
+        "grid_count": 30,
+        "spacing_type": "arithmetic",
+        "lot_size": "1",
+        "max_inventory_lots": "25",
+    }
+    version_two = {**old_config, "config_version": 2, "grid_count": 40}
+    version_three = {**old_config, "config_version": 3, "grid_count": 30}
+    run_id = "run-edit-request-v3"
+    created_at = utc_now()
+    db.upsert(
+        "grid_runs",
+        [{"run_id": run_id, "bot_id": old_config["bot_id"], "status": GridStatus.EDITING.value, "active_config_version": 2, "config_version": 2, "started_at": created_at}],
+        on_conflict="run_id",
+    )
+    db.upsert("grid_bots", [{"bot_id": old_config["bot_id"], "bot_name": "Edit Request", "product_symbol": "ETHUSD"}], on_conflict="bot_id")
+    db.upsert(
+        "grid_config_versions",
+        [{"run_id": run_id, "bot_id": old_config["bot_id"], "config_version": 2, "config": version_two, "created_at": created_at}],
+        on_conflict="run_id,config_version",
+    )
+    db.insert_once(
+        "grid_parameter_changes",
+        {
+            "change_id": "chg-v2",
+            "run_id": run_id,
+            "bot_id": old_config["bot_id"],
+            "from_config_version": 1,
+            "to_config_version": 2,
+            "reason": "previous_edit",
+            "payload": {"operation_id": "edit-run-edit-request-1-2-test", "old_config": old_config, "new_config": version_two},
+            "created_at": created_at,
+        },
+        on_conflict="change_id",
+    )
+    db.insert_once(
+        "grid_events",
+        {
+            "event_id": "evt-edit-request-v3",
+            "run_id": run_id,
+            "event_type": "GRID_RUN_EDIT_REQUESTED",
+            "payload": {
+                "operation_id": "edit-run-edit-request-2-3-test",
+                "previous_status": GridStatus.RUNNING.value,
+                "from_config_version": 2,
+                "to_config_version": 3,
+                "reason": "unit_pending_edit_v3",
+                "source_config": version_two,
+                "target_config": version_three,
+            },
+            "created_at": utc_now(),
+        },
+        on_conflict="event_id",
+    )
+
+    recovered = db.load_run_state(run_id)
+
+    assert recovered["edit_state"]["operation_id"] == "edit-run-edit-request-2-3-test"
+    assert recovered["edit_state"]["from_config_version"] == 2
+    assert recovered["edit_state"]["to_config_version"] == 3
+    assert recovered["edit_state"]["target_config"]["grid_count"] == 30
+    assert recovered["edit_state"]["config_persisted"] is False
+    assert recovered["lifecycle_operation"]["operation_id"] == "edit-run-edit-request-2-3-test"
 
 
 def test_supabase_persist_config_closes_prior_open_versions():

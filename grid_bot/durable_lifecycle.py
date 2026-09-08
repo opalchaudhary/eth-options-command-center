@@ -2697,6 +2697,18 @@ class DurableGridBotLifecycle:
         self._save(state)
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"])}
 
+    def _edit_stop_preemption(self, run_id: str) -> dict | None:
+        state = self._load()
+        latest = state.get("runs", {}).get(run_id)
+        if not latest:
+            return None
+        status = latest.get("status")
+        if status in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+            return self.stop(run_id, reason="stop_preempted_edit")
+        if status == GridStatus.STOPPED.value:
+            return {"ok": True, "run": deepcopy(latest), "summary": deepcopy(latest.get("summary") or {})}
+        return None
+
     def edit_grid(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
         payload = payload or {}
         state = self._load()
@@ -2879,6 +2891,9 @@ class DurableGridBotLifecycle:
                 for level in run["levels"]:
                     proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
                     order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
+                    preempted = self._edit_stop_preemption(run["run_id"])
+                    if preempted:
+                        return preempted
                     if order.get("status") == "deferred":
                         deferred += 1
                     else:
@@ -2917,13 +2932,22 @@ class DurableGridBotLifecycle:
                 self._event(state, run["run_id"], "GRID_RUN_EDIT_PLACEMENT_FAILED", run["edit_diagnostics"])
                 self._save(state)
                 return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run["edit_state"])}
+        preempted = self._edit_stop_preemption(run["run_id"])
+        if preempted:
+            return preempted
         self._save(state)
 
+        preempted = self._edit_stop_preemption(run["run_id"])
+        if preempted:
+            return preempted
         self._update_lifecycle_progress(run, "EDIT", "VERIFYING_ORDERS", message="Editing Grid: waiting for Delta verification", expected_orders=len(run.get("levels") or []), confirmed_orders=created, cancelled_orders=cancelled)
         self._save(state, include_children=False)
         verified = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)
         state = self._load()
         run = state["runs"][run["run_id"]]
+        preempted = self._edit_stop_preemption(run["run_id"])
+        if preempted:
+            return preempted
         if int(verified["reconciliation"].get("position_mismatches") or 0):
             return self._safe_pause_for_external_position_change(state, run, verified["reconciliation"], reason="edit_verification", previous_status=previous_status)
         if verified["reconciliation"].get("errors") or int(verified["reconciliation"].get("unresolved_orders") or 0) or int(verified["reconciliation"].get("fill_ledger_mismatches") or 0):
@@ -2931,6 +2955,11 @@ class DurableGridBotLifecycle:
         completeness = self._assert_deployment_complete(state, run, verified["reconciliation"], "EDIT") if previous_status == GridStatus.RUNNING.value else None
         if completeness and not completeness["complete"]:
             return self._editing_blocked(state, run, "deployment_incomplete", {"deployment_completeness": completeness, "reconciliation": verified["reconciliation"]})
+        preempted = self._edit_stop_preemption(run["run_id"])
+        if preempted:
+            return preempted
+        state = self._load()
+        run = state["runs"][run["run_id"]]
         now = utc_now()
         run["status"] = GridStatus.RUNNING.value if previous_status == GridStatus.RUNNING.value else GridStatus.PAUSED.value
         run["status_updated_at"] = now
