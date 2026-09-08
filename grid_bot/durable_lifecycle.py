@@ -69,6 +69,13 @@ START_ACCOUNTED_ORDER_STATUSES = RUNNING_VALID_ORDER_STATUSES | START_UNRESOLVED
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
 STOP_ATTENTION_STATUS = GridStatus.STOP_REQUIRES_ATTENTION.value
+LIFECYCLE_REQUEST_STATUSES = {
+    GridStatus.PAUSING.value,
+    GridStatus.RESUMING.value,
+    GridStatus.EDITING.value,
+    GridStatus.STOPPING.value,
+    STOP_ATTENTION_STATUS,
+}
 
 
 def _decimal(value: Any, default: str = "0") -> Decimal:
@@ -174,6 +181,11 @@ def _config_fingerprint(config: dict) -> tuple:
         str(config.get("lot_size")),
         str(config.get("max_inventory_lots")),
     )
+
+
+def _lifecycle_operation_id(run_id: str, operation: str, *parts: Any) -> str:
+    stable = hashlib.sha256(json.dumps([str(part) for part in parts], separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+    return f"{operation.lower()}-{run_id}-{stable}"
 
 
 def _compact_account_context(account_risk_state: dict | None) -> dict:
@@ -554,6 +566,12 @@ class DurableGridBotLifecycle:
         temporary_markers = ("timeout", "timed out", "429", "too many", "temporar", "connection", "network", "502", "503", "504")
         return any(marker in text for marker in temporary_markers)
 
+    def _is_unknown_submission_error(self, exc: Exception) -> bool:
+        if self._is_temporary_exchange_error(exc):
+            return True
+        text = str(exc).lower()
+        return any(marker in text for marker in ("connection", "response lost", "lost response", "read timed out"))
+
     def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
         completeness = self._deployment_completeness(run, reconciliation)
         run["deployment_completeness"] = completeness
@@ -654,6 +672,18 @@ class DurableGridBotLifecycle:
         }
 
     def _config_from_operator_payload(self, payload: dict, spec, reference: Decimal, health: dict) -> GridConfig:
+        payload = dict(payload or {})
+        range_width = payload.get("range_width")
+        if str(payload.get("grid_type") or "").lower() == GridType.NEUTRAL.value and range_width not in [None, ""]:
+            width = _decimal(range_width)
+            if width <= 0:
+                raise ValueError("Neutral range_width must be greater than zero.")
+            width_ticks = max(Decimal("1"), (width / spec.tick_size).to_integral_value(rounding=ROUND_HALF_UP))
+            normalized_width = width_ticks * spec.tick_size
+            lower_price = quantize_price(reference - (normalized_width / Decimal("2")), spec.tick_size)
+            upper_price = quantize_price(lower_price + normalized_width, spec.tick_size)
+            payload["lower_price"] = lower_price
+            payload["upper_price"] = upper_price
         required = [
             "grid_type",
             "lower_price",
@@ -695,6 +725,13 @@ class DurableGridBotLifecycle:
         try:
             validate_neutral_grid_suitability(config, reference, spec.tick_size)
         except ValueError as exc:
+            if str(exc) == NEUTRAL_RANGE_ERROR_MESSAGE and range_width not in [None, ""]:
+                suggestion = neutral_range_invalid_details(config, reference, spec.tick_size).get("suggested")
+                if suggestion:
+                    config.lower_price = _decimal(suggestion["lower_price"])
+                    config.upper_price = _decimal(suggestion["upper_price"])
+                    validate_neutral_grid_suitability(config, reference, spec.tick_size)
+                    return config
             if str(exc) == NEUTRAL_RANGE_ERROR_MESSAGE:
                 raise NeutralGridRangeValidationError(neutral_range_invalid_details(config, reference, spec.tick_size)) from exc
             raise
@@ -1082,6 +1119,28 @@ class DurableGridBotLifecycle:
             count += 1
         return count
 
+    def _resolve_zero_risk_ambiguous_orders(self, run: dict, reconciliation: dict) -> int:
+        if int(reconciliation.get("exchange_open_orders") or 0) != 0:
+            return 0
+        resolved = 0
+        now = utc_now()
+        for order in list((run.get("orders") or {}).values()):
+            status = str(order.get("status") or "").lower()
+            if status not in {"ambiguous_submission", "submitted", "pending", "proposed"}:
+                continue
+            if order.get("exchange_order_id") or _decimal(order.get("filled_quantity")) != 0:
+                continue
+            order["status"] = "never_submitted"
+            order["remaining_quantity"] = "0"
+            order["terminal_reason"] = "resolved_absent_from_exchange_truth"
+            order["resolved_at"] = now
+            order["cancelled_at"] = now
+            run.setdefault("orders", {})[str(order.get("client_order_id") or order.get("order_key"))] = order
+            if self._db_enabled():
+                self.db.persist_order(run, order)
+            resolved += 1
+        return resolved
+
     def _open_order_records(self, run: dict) -> list[dict]:
         return [
             order
@@ -1113,6 +1172,147 @@ class DurableGridBotLifecycle:
         self._update_lifecycle_progress(run, operation, status.value, message=message)
         self._event(state, run["run_id"], event_type, payload or {})
         self._save(state)
+
+    def _request_lifecycle(self, state: dict, run: dict, status: GridStatus, operation: str, event_type: str, payload: dict | None = None) -> dict:
+        now = utc_now()
+        request_payload = payload or {}
+        operation_id = request_payload.get("operation_id") or _lifecycle_operation_id(run["run_id"], operation, now, run.get("status"))
+        run["status"] = status.value
+        run["status_updated_at"] = now
+        run["updated_at"] = now
+        run["lifecycle_operation"] = {
+            **(run.get("lifecycle_operation") or {}),
+            "operation_id": operation_id,
+            "run_id": run["run_id"],
+            "operation_type": operation,
+            "requested_at": request_payload.get("requested_at") or now,
+            "phase": f"{operation}_REQUESTED",
+            "status": "REQUESTED",
+            "retry_count": 0,
+            "last_error": None,
+        }
+        self._update_lifecycle_progress(run, operation, f"{operation}_REQUESTED", message=f"{operation.title()} requested; worker will continue.")
+        self._event(state, run["run_id"], event_type, {"operation_id": operation_id, **request_payload})
+        self._save(state, include_children=False)
+        return {"ok": True, "accepted": True, "operation_id": operation_id, "run": deepcopy(run)}
+
+    def request_pause(self, run_id: str | None = None) -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") == GridStatus.PAUSED.value:
+            return {"ok": True, "accepted": True, "attached": True, "run": deepcopy(run)}
+        if run.get("status") == GridStatus.PAUSING.value:
+            op = run.get("lifecycle_operation") or {}
+            return {"ok": True, "accepted": True, "attached": True, "operation_id": op.get("operation_id"), "run": deepcopy(run)}
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS, GridStatus.STOPPED.value}:
+            raise RuntimeError(f"Stop state takes precedence; cannot pause run from {run.get('status')}.")
+        if run.get("status") not in {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.RESUMING.value, GridStatus.EDITING.value, GridStatus.REGRID_PENDING.value}:
+            raise RuntimeError(f"Cannot pause durable DeltaGridBot run from status {run.get('status')}.")
+        return self._request_lifecycle(state, run, GridStatus.PAUSING, "PAUSE", "GRID_RUN_PAUSE_REQUESTED", {"previous_status": run.get("status")})
+
+    def request_resume(self, run_id: str | None = None) -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") == GridStatus.RUNNING.value:
+            return {"ok": True, "accepted": True, "attached": True, "run": deepcopy(run)}
+        if run.get("status") == GridStatus.RESUMING.value:
+            op = run.get("lifecycle_operation") or {}
+            return {"ok": True, "accepted": True, "attached": True, "operation_id": op.get("operation_id"), "run": deepcopy(run)}
+        if run.get("status") not in {GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value}:
+            raise RuntimeError(f"Cannot resume durable DeltaGridBot run from status {run.get('status')}.")
+        return self._request_lifecycle(state, run, GridStatus.RESUMING, "RESUME", "GRID_RUN_RESUME_REQUESTED", {"previous_status": run.get("status")})
+
+    def request_stop(self, run_id: str | None = None, reason: str = "manual") -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run and run_id and self._db_enabled():
+            run = self.db.load_run_state(run_id)
+            state.setdefault("runs", {})[run_id] = run
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") == GridStatus.STOPPED.value and run.get("summary"):
+            return {"ok": True, "accepted": True, "attached": True, "run": deepcopy(run), "summary": deepcopy(run["summary"])}
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS}:
+            op = run.get("lifecycle_operation") or {}
+            return {"ok": True, "accepted": True, "attached": True, "operation_id": op.get("operation_id"), "run": deepcopy(run)}
+        run["stop_reason"] = reason
+        return self._request_lifecycle(state, run, GridStatus.STOPPING, "STOP", "GRID_RUN_STOP_REQUESTED", {"previous_status": run.get("status"), "reason": reason})
+
+    def request_edit_grid(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
+        payload = payload or {}
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        if run.get("status") in {GridStatus.STOPPING.value, STOP_ATTENTION_STATUS, GridStatus.STOPPED.value}:
+            raise RuntimeError(f"Stop state takes precedence; cannot edit run from {run.get('status')}.")
+        if run.get("status") == GridStatus.EDITING.value:
+            op = run.get("lifecycle_operation") or {}
+            return {"ok": True, "accepted": True, "attached": True, "operation_id": op.get("operation_id"), "run": deepcopy(run)}
+        if run.get("status") not in {GridStatus.RUNNING.value, GridStatus.PAUSED.value, GridStatus.REGRID_PENDING.value}:
+            raise RuntimeError(f"Cannot edit durable DeltaGridBot run from status {run.get('status')}.")
+
+        product_symbol = (run.get("config") or {}).get("product_symbol") or (run.get("product") or {}).get("symbol") or "ETHUSD"
+        health = self.product_account_health(product_symbol)
+        spec = self.client.product_spec(product_symbol)
+        reference = _decimal(health["market"]["reference_price"] or run.get("reference_price"))
+        old_config = deepcopy(run.get("config") or {})
+        proposed = self._edit_config_from_payload(run, payload, spec, reference, health)
+        new_config = to_record_dict(proposed)
+        if _config_fingerprint(old_config) == _config_fingerprint(new_config):
+            return {"ok": True, "accepted": True, "idempotent": True, "run": deepcopy(run), "preview": self.preview_edit_grid(run["run_id"], payload)}
+
+        now = utc_now()
+        edit_digest = hashlib.sha256(json.dumps(_config_fingerprint(new_config), separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+        edit_operation_id = f"edit-{run['run_id']}-{old_config.get('config_version')}-{new_config.get('config_version')}-{edit_digest}"
+        run["edit_state"] = {
+            "operation_id": edit_operation_id,
+            "previous_status": run.get("status"),
+            "from_config_version": int(old_config.get("config_version") or 1),
+            "to_config_version": int(new_config.get("config_version") or 1),
+            "fingerprint": list(_config_fingerprint(new_config)),
+            "stage": "EDIT_REQUESTED",
+            "reason": reason,
+            "requested_at": now,
+            "source_config": old_config,
+            "target_config": new_config,
+            "config_persisted": False,
+        }
+        return self._request_lifecycle(
+            state,
+            run,
+            GridStatus.EDITING,
+            "EDIT",
+            "GRID_RUN_EDIT_REQUESTED",
+            {
+                "operation_id": edit_operation_id,
+                "previous_status": run["edit_state"]["previous_status"],
+                "from_config_version": run["edit_state"]["from_config_version"],
+                "to_config_version": run["edit_state"]["to_config_version"],
+                "reason": reason,
+                "source_config": old_config,
+                "target_config": new_config,
+            },
+        )
+
+    def request_regrid(self, run_id: str | None = None, reason: str = "manual_regrid") -> dict:
+        state = self._load()
+        run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+        if not run:
+            raise RuntimeError("No active durable DeltaGridBot run found.")
+        old_config = deepcopy(run.get("config") or {})
+        spec = self.client.product_spec((run.get("product") or {}).get("symbol") or old_config.get("product_symbol") or "ETHUSD")
+        reference = _decimal(run.get("reference_price"))
+        width = max(abs(_decimal(old_config["upper_price"]) - _decimal(old_config["lower_price"])) / Decimal("2"), Decimal("45"))
+        payload = {
+            "lower_price": str(quantize_price(reference - width - Decimal("5"), spec.tick_size)),
+            "upper_price": str(quantize_price(reference + width + Decimal("5"), spec.tick_size)),
+        }
+        return self.request_edit_grid(run["run_id"], payload, reason=reason)
 
     def _terminalize_deferred_for_pause(self, run: dict) -> int:
         return self._terminalize_never_submitted_orders(
@@ -1569,6 +1769,8 @@ class DurableGridBotLifecycle:
                     client_order_id=proposal.client_order_id,
                     attempt=attempt,
                     temporary=self._is_temporary_exchange_error(exc),
+                    unknown_submission=self._is_unknown_submission_error(exc),
+                    error=str(exc)[:300],
                 )
                 last_error = exc
                 if not self._is_temporary_exchange_error(exc) or attempt >= max(1, LIFECYCLE_RETRY_ATTEMPTS):
@@ -1578,6 +1780,8 @@ class DurableGridBotLifecycle:
                 time.sleep(wait_seconds)
         if not exchange_order:
             if last_error:
+                if not self._is_unknown_submission_error(last_error):
+                    raise last_error
                 record = {
                     "order_key": proposal.client_order_id,
                     "run_id": run["run_id"],
@@ -2917,6 +3121,25 @@ class DurableGridBotLifecycle:
             open_gridbot_orders = int(reconciliation.get("exchange_open_orders") or 0)
             unresolved = int(reconciliation.get("unresolved_orders") or 0)
             fill_mismatches = int(reconciliation.get("fill_ledger_mismatches") or 0)
+            if unresolved and not open_gridbot_orders:
+                resolved = self._resolve_zero_risk_ambiguous_orders(run, reconciliation)
+                if resolved:
+                    self._event(
+                        state,
+                        run["run_id"],
+                        "GRID_RUN_STOP_ZERO_RISK_AMBIGUOUS_RESOLVED",
+                        {"resolved_orders": resolved, "reconciliation": reconciliation},
+                    )
+                    self._save(state, include_children=False)
+                    reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
+                    state = self._load()
+                    run = state["runs"][run["run_id"]]
+                    reconciliation = reconciled["reconciliation"]
+                    gridbot_inventory = _decimal(reconciliation.get("gridbot_inventory"))
+                    delta_position = _decimal(reconciliation.get("delta_position"))
+                    open_gridbot_orders = int(reconciliation.get("exchange_open_orders") or 0)
+                    unresolved = int(reconciliation.get("unresolved_orders") or 0)
+                    fill_mismatches = int(reconciliation.get("fill_ledger_mismatches") or 0)
             if unresolved or fill_mismatches:
                 return self._stop_attention(
                     state,

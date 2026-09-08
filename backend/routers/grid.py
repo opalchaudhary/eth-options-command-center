@@ -1,4 +1,5 @@
 from decimal import Decimal
+import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -19,6 +20,7 @@ from grid_bot.supabase_repository import SupabaseGridRepository
 
 router = APIRouter(prefix="/api/grid", tags=["gridbot"])
 public_grid_router = APIRouter(prefix="/grid", tags=["gridbot"])
+logger = logging.getLogger(__name__)
 
 
 class GridCreateRequest(BaseModel):
@@ -57,6 +59,7 @@ class EditGridRequest(BaseModel):
     grid_type: GridType | None = None
     lower_price: Decimal | None = None
     upper_price: Decimal | None = None
+    range_width: Decimal | None = None
     grid_count: int | None = None
     spacing_type: SpacingType | None = None
     lot_size: Decimal | None = None
@@ -67,8 +70,9 @@ class OperatorGridRequest(BaseModel):
     bot_name: str = "ETH Testnet Grid"
     product_symbol: str = "ETHUSD"
     grid_type: GridType = GridType.NEUTRAL
-    lower_price: Decimal
-    upper_price: Decimal
+    lower_price: Decimal | None = None
+    upper_price: Decimal | None = None
+    range_width: Decimal | None = None
     grid_count: int = 4
     spacing_type: SpacingType = SpacingType.ARITHMETIC
     lot_size: Decimal = Decimal("1")
@@ -374,26 +378,33 @@ def durable_reconcile():
 @router.post("/v01/live/pause")
 def durable_pause():
     try:
-        return DurableGridBotLifecycle().pause()
+        result = DurableGridBotLifecycle().request_pause()
+        start_continuous_gridbot_worker()
+        return result
     except Exception as exc:
+        logger.exception("DeltaGridBot V0.1 pause request failed.")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/v01/live/resume")
 def durable_resume():
     try:
-        result = DurableGridBotLifecycle().resume()
+        result = DurableGridBotLifecycle().request_resume()
         start_continuous_gridbot_worker()
         return result
     except Exception as exc:
+        logger.exception("DeltaGridBot V0.1 resume request failed.")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/v01/live/regrid")
 def durable_regrid(_payload: RegridRequest | None = None):
     try:
-        return DurableGridBotLifecycle().regrid()
+        result = DurableGridBotLifecycle().request_regrid(reason=(_payload.reason if _payload else "manual_regrid"))
+        start_continuous_gridbot_worker()
+        return result
     except Exception as exc:
+        logger.exception("DeltaGridBot V0.1 regrid request failed.")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -414,21 +425,24 @@ def durable_edit(payload: EditGridRequest):
     try:
         data = _model_payload(payload)
         reason = data.pop("reason", "manual_edit")
-        result = DurableGridBotLifecycle().edit_grid(payload=data, reason=reason)
-        if (result.get("run") or {}).get("status") == "RUNNING":
-            start_continuous_gridbot_worker()
+        result = DurableGridBotLifecycle().request_edit_grid(payload=data, reason=reason)
+        start_continuous_gridbot_worker()
         return result
     except NeutralGridRangeValidationError as exc:
         raise HTTPException(status_code=400, detail=exc.details) from exc
     except Exception as exc:
+        logger.exception("DeltaGridBot V0.1 edit request failed.")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/v01/live/stop")
 def durable_stop(payload: StopRequest):
     try:
-        return DurableGridBotLifecycle().stop(reason=payload.reason)
+        result = DurableGridBotLifecycle().request_stop(reason=payload.reason)
+        start_continuous_gridbot_worker()
+        return result
     except Exception as exc:
+        logger.exception("DeltaGridBot V0.1 stop request failed.")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

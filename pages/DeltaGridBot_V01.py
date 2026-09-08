@@ -593,8 +593,16 @@ def render_edit_grid(live: dict) -> None:
                 format_func=lambda value: {"neutral": "Neutral", "long_bias": "Long", "short_bias": "Short"}[value],
                 horizontal=True,
             )
-            lower = st.number_input("Lower Range", min_value=1.0, value=float(cfg.get("lower_price") or 2400), step=5.0, key="edit_lower")
-            upper = st.number_input("Upper Range", min_value=1.0, value=float(cfg.get("upper_price") or 2600), step=5.0, key="edit_upper")
+            current_lower = float(cfg.get("lower_price") or 2400)
+            current_upper = float(cfg.get("upper_price") or 2600)
+            if grid_type == "neutral":
+                range_width = st.number_input("Range Width", min_value=1.0, value=max(1.0, current_upper - current_lower), step=5.0, key="edit_range_width")
+                lower = current_lower
+                upper = current_upper
+            else:
+                range_width = None
+                lower = st.number_input("Lower Range", min_value=1.0, value=current_lower, step=5.0, key="edit_lower")
+                upper = st.number_input("Upper Range", min_value=1.0, value=current_upper, step=5.0, key="edit_upper")
         with e2:
             grid_count = st.number_input("Grid Levels", min_value=2, max_value=200, value=int(cfg.get("grid_count") or 4), step=1, key="edit_count")
             spacing = st.radio("Spacing", ["arithmetic", "geometric"], index=0 if str(cfg.get("spacing_type") or "arithmetic") == "arithmetic" else 1, format_func=str.title, horizontal=True)
@@ -612,6 +620,8 @@ def render_edit_grid(live: dict) -> None:
             "lot_size": str(Decimal(str(lot_size))),
             "max_inventory_lots": str(Decimal(str(max_inventory))),
         }
+        if range_width is not None:
+            payload["range_width"] = str(Decimal(str(range_width)))
         preview = st.session_state.get("gridbot_edit_preview")
         if preview:
             render_neutral_range_suggestion(preview, lower_key="edit_lower", upper_key="edit_upper", button_key="edit_use_suggested_range")

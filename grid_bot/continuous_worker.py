@@ -21,6 +21,14 @@ from .supabase_repository import SupabaseGridRepository
 logger = logging.getLogger(__name__)
 
 EXECUTABLE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value}
+LIFECYCLE_STATUSES = {
+    GridStatus.PAUSING.value,
+    GridStatus.RESUMING.value,
+    GridStatus.EDITING.value,
+    GridStatus.STOPPING.value,
+    GridStatus.STOP_REQUIRES_ATTENTION.value,
+}
+ACTIVE_WORKER_STATUSES = EXECUTABLE_STATUSES | LIFECYCLE_STATUSES | {GridStatus.PAUSED.value}
 POLL_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_POLL_SECONDS", "2"))
 SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS", "300"))
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
@@ -230,7 +238,7 @@ class ContinuousGridBotWorker:
             self._state.update(
                 {
                     "run_id": run.get("run_id"),
-                    "status": "running" if run.get("status") in EXECUTABLE_STATUSES else "waiting",
+                    "status": "running" if run.get("status") in ACTIVE_WORKER_STATUSES else "waiting",
                     "known_fill_count": len(run.get("fills") or {}),
                     "known_order_count": len(run.get("orders") or {}),
                     "replacement_count": len(run.get("replacement_keys") or {}),
@@ -243,7 +251,7 @@ class ContinuousGridBotWorker:
             return self._run
         now = time.monotonic()
         run = self._run
-        if run and run.get("status") in EXECUTABLE_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
+        if run and run.get("status") in ACTIVE_WORKER_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
             return run
         self._last_active_refresh_monotonic = now
         active = self.db.active_run()
@@ -255,7 +263,7 @@ class ContinuousGridBotWorker:
             run
             and active.get("run_id") == run.get("run_id")
             and active.get("status") == run.get("status")
-            and active.get("status") in EXECUTABLE_STATUSES
+            and active.get("status") in ACTIVE_WORKER_STATUSES
         ):
             return run
         return self._recover_active_run()
@@ -267,7 +275,7 @@ class ContinuousGridBotWorker:
             started = time.monotonic()
             try:
                 run = self._refresh_active_run_if_due()
-                if not run or run.get("status") not in EXECUTABLE_STATUSES:
+                if not run or run.get("status") not in ACTIVE_WORKER_STATUSES:
                     self._set_idle_state()
                     self._stop.wait(self.poll_interval_seconds)
                     continue
@@ -295,6 +303,72 @@ class ContinuousGridBotWorker:
                         self._stop.wait(self.poll_interval_seconds)
                         continue
                     run = recovered_run
+
+                if run.get("status") in LIFECYCLE_STATUSES:
+                    result = self._advance_lifecycle_once(run)
+                    run = result.get("run") or run
+                    reconciliation = result.get("reconciliation") or {}
+                    duration = time.monotonic() - started
+                    poll_count = self._state["poll_count"] + 1
+                    previous_average = _decimal(self._state.get("average_loop_duration_seconds"), "0")
+                    average = duration if poll_count == 1 else ((float(previous_average) * (poll_count - 1)) + duration) / poll_count
+                    self._set_state(
+                        status="running",
+                        poll_count=poll_count,
+                        successful_polls=self._state["successful_polls"] + 1,
+                        last_poll_at=utc_now(),
+                        last_successful_poll_at=utc_now(),
+                        last_successful_reconcile=run.get("last_reconciled_at"),
+                        last_loop_duration_seconds=round(duration, 4),
+                        average_loop_duration_seconds=round(average, 4),
+                        last_error=None,
+                        fill_derived_inventory=reconciliation.get("gridbot_inventory", self._state.get("fill_derived_inventory")),
+                        delta_position=reconciliation.get("delta_position", self._state.get("delta_position")),
+                        open_gridbot_orders=reconciliation.get("exchange_open_orders", self._state.get("open_gridbot_orders")),
+                        known_fill_count=len(run.get("fills") or {}),
+                        known_order_count=len(run.get("orders") or {}),
+                        replacement_count=len(run.get("replacement_keys") or {}),
+                        deferred_replacement_count=len(run.get("deferred_orders") or {}),
+                        position_mismatches=reconciliation.get("position_mismatches", self._state.get("position_mismatches")),
+                        fill_ledger_mismatches=reconciliation.get("fill_ledger_mismatches", self._state.get("fill_ledger_mismatches")),
+                    )
+                    with self._lock:
+                        self._run = run
+                    self._update_health(run, reconciliation)
+                    elapsed = time.monotonic() - started
+                    self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
+                    continue
+
+                if run.get("status") == GridStatus.PAUSED.value:
+                    result = self._poll_paused_once(run)
+                    run = result.get("run") or run
+                    duration = time.monotonic() - started
+                    poll_count = self._state["poll_count"] + 1
+                    previous_average = _decimal(self._state.get("average_loop_duration_seconds"), "0")
+                    average = duration if poll_count == 1 else ((float(previous_average) * (poll_count - 1)) + duration) / poll_count
+                    self._set_state(
+                        status="running",
+                        poll_count=poll_count,
+                        successful_polls=self._state["successful_polls"] + 1,
+                        last_poll_at=utc_now(),
+                        last_successful_poll_at=utc_now(),
+                        last_successful_reconcile=run.get("last_reconciled_at"),
+                        last_loop_duration_seconds=round(duration, 4),
+                        average_loop_duration_seconds=round(average, 4),
+                        last_error=None,
+                        fill_derived_inventory=result.get("gridbot_inventory"),
+                        delta_position=result.get("delta_position"),
+                        open_gridbot_orders=result.get("exchange_open_orders"),
+                        known_fill_count=len(run.get("fills") or {}),
+                        known_order_count=len(run.get("orders") or {}),
+                        replacement_count=len(run.get("replacement_keys") or {}),
+                        deferred_replacement_count=len(run.get("deferred_orders") or {}),
+                        position_mismatches=result.get("position_mismatches"),
+                        fill_ledger_mismatches=result.get("fill_ledger_mismatches"),
+                    )
+                    elapsed = time.monotonic() - started
+                    self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
+                    continue
 
                 result = self._poll_once(run)
                 duration = time.monotonic() - started
@@ -433,6 +507,27 @@ class ContinuousGridBotWorker:
         self._update_health(run, result)
         return result
 
+    def _advance_lifecycle_once(self, run: dict) -> dict:
+        lifecycle = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled)
+        status = run.get("status")
+        if status == GridStatus.PAUSING.value:
+            return lifecycle.pause(run["run_id"])
+        if status == GridStatus.RESUMING.value:
+            return lifecycle.resume(run["run_id"])
+        if status == GridStatus.EDITING.value:
+            reason = (run.get("edit_state") or {}).get("reason") or "worker_edit"
+            return lifecycle.edit_grid(run["run_id"], {}, reason=reason)
+        if status in {GridStatus.STOPPING.value, GridStatus.STOP_REQUIRES_ATTENTION.value}:
+            return lifecycle.stop(run["run_id"], reason=run.get("stop_reason") or "worker_stop_recovery")
+        return {"ok": True, "run": run}
+
+    def _poll_paused_once(self, run: dict) -> dict:
+        result = reconcile_exchange_truth(run, self.client, self.db if self.db.enabled else None, persist_order_updates=True)
+        with self._lock:
+            self._run = run
+        self._update_health(run, result)
+        return result
+
     def _position_mismatch_signature(self, run: dict, reconciliation: dict) -> dict:
         return {
             "run_id": run.get("run_id"),
@@ -561,6 +656,30 @@ def _compact_order_counts(rows: list[dict]) -> dict:
     }
 
 
+def _compact_order_rows(rows: list[dict], limit: int = 100) -> list[dict]:
+    visible_statuses = {"open", "submitted", "partially_filled", "pending", "ambiguous_submission"}
+    compact = []
+    for row in rows:
+        if str(row.get("status") or "").lower() not in visible_statuses:
+            continue
+        compact.append(
+            {
+                "client_order_id": row.get("client_order_id") or row.get("order_key"),
+                "exchange_order_id": row.get("exchange_order_id"),
+                "side": row.get("side"),
+                "price": row.get("price"),
+                "requested_quantity": row.get("requested_quantity"),
+                "filled_quantity": row.get("filled_quantity"),
+                "remaining_quantity": row.get("remaining_quantity"),
+                "status": row.get("status"),
+                "level_id": row.get("level_id"),
+                "order_kind": row.get("order_kind"),
+                "config_version": row.get("config_version"),
+            }
+        )
+    return compact[:limit]
+
+
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
     if not state.get("run_id"):
@@ -580,8 +699,9 @@ def gridbot_compact_live_state() -> dict:
     accounting = state.get("accounting") or {}
     completeness = state.get("deployment_completeness") or (run.get("deployment_completeness") if isinstance(run, dict) else {}) or {}
     progress = state.get("lifecycle_progress") or (run.get("lifecycle_progress") if isinstance(run, dict) else {}) or {}
-    orders = state.get("known_gridbot_orders") or list((run.get("orders") or {}).values()) if isinstance(run, dict) else []
+    orders = (state.get("known_gridbot_orders") or list((run.get("orders") or {}).values())) if isinstance(run, dict) else []
     counts = _compact_order_counts(orders)
+    compact_orders = _compact_order_rows(orders)
     expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
     confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
     filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
@@ -637,6 +757,7 @@ def gridbot_compact_live_state() -> dict:
             "missing_orders": progress.get("missing_orders", completeness.get("missing")),
             "waiting_orders": progress.get("waiting_orders"),
         },
+        "known_gridbot_orders": compact_orders,
         "current_orders": counts,
         **counts,
         "fill_derived_inventory": state.get("fill_derived_inventory"),

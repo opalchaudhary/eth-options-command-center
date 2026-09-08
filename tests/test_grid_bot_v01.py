@@ -812,6 +812,67 @@ def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
     assert edited["run"]["status"] == GridStatus.PAUSED.value
     assert edited["edit"]["stage"] == "PLACEMENT_FAILED"
     assert client.open_orders(1699)["result"] == []
+    assert not [order for order in edited["run"]["orders"].values() if order.get("status") == "ambiguous_submission"]
+
+
+def test_request_edit_grid_acknowledges_then_worker_style_apply_completes(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    requested = lifecycle.request_edit_grid(run["run_id"], {"grid_count": 6}, reason="operator_width_change")
+    after_request = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()["active_run"]
+
+    assert requested["accepted"] is True
+    assert after_request["status"] == GridStatus.EDITING.value
+    assert int(after_request["config"]["config_version"]) == 1
+    assert after_request["edit_state"]["target_config"]["grid_count"] == 6
+
+    advanced = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).edit_grid(run["run_id"], {}, reason="operator_width_change")
+
+    assert advanced["run"]["status"] == GridStatus.RUNNING.value
+    assert int(advanced["run"]["config"]["config_version"]) == 2
+    assert advanced["run"]["config"]["grid_count"] == 6
+
+
+def test_neutral_range_width_recomputes_around_current_reference_for_edit_request(tmp_path):
+    class MovingMarketClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.mark = Decimal("2500")
+
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            return ProductSpec(
+                product_id=spec.product_id,
+                symbol=spec.symbol,
+                contract_type=spec.contract_type,
+                contract_multiplier=spec.contract_multiplier,
+                lot_size=spec.lot_size,
+                min_quantity=spec.min_quantity,
+                tick_size=spec.tick_size,
+                price_precision=spec.price_precision,
+                quantity_precision=spec.quantity_precision,
+                mark_price=self.mark,
+                last_price=self.mark,
+                best_bid=self.mark - Decimal("0.05"),
+                best_ask=self.mark + Decimal("0.05"),
+            )
+
+        def ticker(self, symbol):
+            return {"success": True, "result": {"symbol": symbol, "mark_price": str(self.mark), "spot_price": str(self.mark)}}
+
+    client = MovingMarketClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid({**_edit_payload(), "range_width": "200", "lower_price": None, "upper_price": None})["run"]
+    client.mark = Decimal("2530")
+
+    requested = lifecycle.request_edit_grid(run["run_id"], {"range_width": "200"}, reason="refresh_neutral_width")
+    target = requested["run"]["edit_state"]["target_config"]
+
+    assert target["lower_price"] == "2430.00"
+    assert target["upper_price"] == "2630.00"
+    assert target["grid_type"] == "neutral"
 
 
 def test_edit_grid_external_position_change_fails_closed_to_paused(tmp_path):
@@ -844,6 +905,37 @@ def test_stop_preempts_editing_state(tmp_path):
 
     assert stopped["run"]["status"] == GridStatus.STOPPED.value
     assert stopped["summary"]["final_gridbot_inventory"] == "0"
+
+
+def test_stop_resolves_zero_risk_ambiguous_submission_without_exchange_evidence(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    ambiguous = {
+        "order_key": "DGB01-unit-L999-B-1",
+        "run_id": run["run_id"],
+        "level_id": "L999",
+        "side": "buy",
+        "price": "2400",
+        "requested_quantity": "1",
+        "filled_quantity": "0",
+        "remaining_quantity": "1",
+        "client_order_id": "DGB01-unit-L999-B-1",
+        "exchange_order_id": "",
+        "status": "ambiguous_submission",
+        "order_kind": "edit_grid",
+        "config_version": 1,
+        "created_at": utc_now(),
+    }
+    state = lifecycle._load()
+    state["runs"][run["run_id"]].setdefault("orders", {})[ambiguous["client_order_id"]] = ambiguous
+    lifecycle._save(state)
+
+    stopped = lifecycle.stop(run["run_id"], "resolve_zero_risk_ambiguous")
+
+    assert stopped["run"]["status"] == GridStatus.STOPPED.value
+    assert stopped["run"]["orders"][ambiguous["client_order_id"]]["status"] == "never_submitted"
+    assert stopped["summary"]["stray_gridbot_orders"] == 0
 
 
 def test_config_attribution_across_edit_preserves_historical_orders_and_fills(tmp_path):
@@ -3499,7 +3591,34 @@ def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(m
     assert compact["deployment_completeness"]["accounted"] == 4
     assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
     assert compact["account_risk_state"]["mark_price"] == "2500"
-    assert "known_gridbot_orders" not in compact
+    assert compact["known_gridbot_orders"] == [
+        {
+            "client_order_id": "buy-open",
+            "exchange_order_id": None,
+            "side": "buy",
+            "price": None,
+            "requested_quantity": None,
+            "filled_quantity": None,
+            "remaining_quantity": "1",
+            "status": "open",
+            "level_id": None,
+            "order_kind": None,
+            "config_version": None,
+        },
+        {
+            "client_order_id": "sell-open",
+            "exchange_order_id": None,
+            "side": "sell",
+            "price": None,
+            "requested_quantity": None,
+            "filled_quantity": None,
+            "remaining_quantity": "1",
+            "status": "open",
+            "level_id": None,
+            "order_kind": None,
+            "config_version": None,
+        },
+    ]
     assert "active_run" not in compact
     assert "risk_snapshots" not in compact
     assert "fills" not in compact
@@ -3587,7 +3706,7 @@ def test_gridbot_compact_live_state_refreshes_idle_telemetry_without_supabase_re
     assert compact["health"]["overall_status"] == "HEALTHY"
     assert compact["health"]["active_issues"] == []
     assert "active_run" not in compact
-    assert "known_gridbot_orders" not in compact
+    assert compact["known_gridbot_orders"] == []
 
 
 def test_gridbot_compact_idle_telemetry_uses_existing_cache_interval(monkeypatch):
