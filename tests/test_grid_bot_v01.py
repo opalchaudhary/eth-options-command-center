@@ -911,30 +911,33 @@ def test_stop_resolves_zero_risk_ambiguous_submission_without_exchange_evidence(
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
     run = lifecycle.start_operator_grid(_edit_payload())["run"]
-    ambiguous = {
-        "order_key": "DGB01-unit-L999-B-1",
-        "run_id": run["run_id"],
-        "level_id": "L999",
-        "side": "buy",
-        "price": "2400",
-        "requested_quantity": "1",
-        "filled_quantity": "0",
-        "remaining_quantity": "1",
-        "client_order_id": "DGB01-unit-L999-B-1",
-        "exchange_order_id": "",
-        "status": "ambiguous_submission",
-        "order_kind": "edit_grid",
-        "config_version": 1,
-        "created_at": utc_now(),
-    }
     state = lifecycle._load()
-    state["runs"][run["run_id"]].setdefault("orders", {})[ambiguous["client_order_id"]] = ambiguous
+    ambiguous_ids = []
+    for index in range(4):
+        client_order_id = f"DGB01-unit-L99{index}-B-1"
+        ambiguous_ids.append(client_order_id)
+        state["runs"][run["run_id"]].setdefault("orders", {})[client_order_id] = {
+            "order_key": client_order_id,
+            "run_id": run["run_id"],
+            "level_id": f"L99{index}",
+            "side": "buy",
+            "price": "2400",
+            "requested_quantity": "1",
+            "filled_quantity": "0",
+            "remaining_quantity": "1",
+            "client_order_id": client_order_id,
+            "exchange_order_id": "",
+            "status": "ambiguous_submission",
+            "order_kind": "edit_grid",
+            "config_version": 1,
+            "created_at": utc_now(),
+        }
     lifecycle._save(state)
 
     stopped = lifecycle.stop(run["run_id"], "resolve_zero_risk_ambiguous")
 
     assert stopped["run"]["status"] == GridStatus.STOPPED.value
-    assert stopped["run"]["orders"][ambiguous["client_order_id"]]["status"] == "never_submitted"
+    assert all(stopped["run"]["orders"][client_order_id]["status"] == "never_submitted" for client_order_id in ambiguous_ids)
     assert stopped["summary"]["stray_gridbot_orders"] == 0
 
 

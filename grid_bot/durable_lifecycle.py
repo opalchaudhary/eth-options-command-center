@@ -3323,6 +3323,23 @@ class DurableGridBotLifecycle:
         open_orders = []
         if open_count:
             open_orders = _gridbot_orders(_result_rows(self.client.open_orders(product_id)))
+        else:
+            resolved = self._resolve_zero_risk_ambiguous_orders(run, reconciliation)
+            if resolved:
+                self._event(
+                    state,
+                    run["run_id"],
+                    "GRID_RUN_STOP_FINAL_ZERO_RISK_AMBIGUOUS_RESOLVED",
+                    {"resolved_orders": resolved, "reconciliation": reconciliation},
+                )
+                self._save(state)
+                reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_order_updates=False)
+                state = self._load()
+                run = state["runs"][run["run_id"]]
+                reconciliation = reconciled["reconciliation"]
+                position = _decimal(reconciliation.get("delta_position"))
+                final_inventory = _decimal(reconciliation.get("gridbot_inventory"))
+                open_count = int(reconciliation.get("exchange_open_orders") or 0)
         external_resolution = (run.get("external_position_resolution") or {}).get("status") == "EXTERNALLY_RESOLVED"
         if (final_inventory != 0 and not external_resolution) or open_count or position != 0:
             return self._stop_attention(
