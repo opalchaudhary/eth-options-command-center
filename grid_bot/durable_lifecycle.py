@@ -2672,7 +2672,12 @@ class DurableGridBotLifecycle:
 
         product_id = int(run["product"]["product_id"])
         edit_state = run.get("edit_state") or {}
-        config_already_persisted = bool(edit_state.get("config_persisted")) and int((run.get("config") or {}).get("config_version") or 0) == int(new_config["config_version"])
+        current_config = run.get("config") or {}
+        current_config_is_target = (
+            int(current_config.get("config_version") or 0) == int(new_config["config_version"])
+            and _config_fingerprint(current_config) == _config_fingerprint(new_config)
+        )
+        config_already_persisted = bool(edit_state.get("config_persisted") or current_config_is_target)
         cancelled = 0
         deferred_superseded = 0
         if not config_already_persisted:
@@ -2695,6 +2700,9 @@ class DurableGridBotLifecycle:
         else:
             cancelled = int(edit_state.get("cancelled_orders") or 0)
             deferred_superseded = int(edit_state.get("deferred_superseded") or 0)
+            if not edit_state.get("config_persisted"):
+                run["edit_state"] = {**edit_state, "config_persisted": True, "stage": "CONFIG_PERSISTED", "persisted_at": utc_now()}
+                self._save(state, include_children=False)
 
         state = self._load()
         latest = state.get("runs", {}).get(run["run_id"])

@@ -978,6 +978,47 @@ def test_restart_after_edit_config_persisted_does_not_cancel_target_orders(tmp_p
     assert recovered_edit_ids == edit_order_ids
 
 
+def test_restart_after_target_config_persisted_with_stale_flag_does_not_cancel_target_orders(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    started = lifecycle.start_operator_grid(_edit_payload())["run"]
+    edited = lifecycle.edit_grid(started["run_id"], {"grid_count": 6}, reason="initial_edit")
+    cancel_count = len(client.cancelled)
+    edit_order_ids = {
+        order["client_order_id"]
+        for order in edited["run"]["orders"].values()
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    }
+
+    state = lifecycle._load()
+    run = state["runs"][started["run_id"]]
+    run["status"] = GridStatus.EDITING.value
+    run["edit_state"] = {
+        "operation_id": "edit-restart-stale-persisted-flag",
+        "previous_status": GridStatus.RUNNING.value,
+        "from_config_version": 1,
+        "to_config_version": 2,
+        "source_config": started["config"],
+        "target_config": edited["run"]["config"],
+        "config_persisted": False,
+        "stage": "FREEZE_PLACEMENT",
+    }
+    lifecycle._save(state)
+
+    recovered = DurableGridBotLifecycle(client, path, use_supabase=False).edit_grid(started["run_id"], {}, reason="recover_edit")
+    recovered_edit_ids = {
+        order["client_order_id"]
+        for order in recovered["run"]["orders"].values()
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    }
+
+    assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert recovered["edit"]["config_persisted"] is True
+    assert len(client.cancelled) == cancel_count
+    assert recovered_edit_ids == edit_order_ids
+
+
 def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
     class FailEditPlacementClient(_FakeLifecycleClient):
         def __init__(self):
