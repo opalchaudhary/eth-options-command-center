@@ -1241,11 +1241,33 @@ class SupabaseGridRepository:
                 "accounting_warning": "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED",
             }
         if run_row.get("status") == "EDITING":
+            latest_editing_payload = (latest_editing or {}).get("payload") or {}
+            latest_editing_to_version = latest_editing_payload.get("to_config_version")
+            current_config_version = config.get("config_version")
+            newer_pending_edit = False
+            try:
+                newer_pending_edit = bool(latest_editing) and int(latest_editing_to_version or 0) > int(current_config_version or 0)
+            except Exception:
+                newer_pending_edit = bool(latest_editing) and str(latest_editing_to_version or "") != str(current_config_version or "")
             change_rows = self.select(
                 "grid_parameter_changes",
                 {"select": "*", "run_id": f"eq.{run_id}", "to_config_version": f"eq.{config.get('config_version')}", "order": "created_at.desc", "limit": 1},
-            )
-            if change_rows:
+            ) if not newer_pending_edit else []
+            if newer_pending_edit:
+                payload = latest_editing_payload
+                run_state["edit_state"] = {
+                    "operation_id": payload.get("operation_id"),
+                    "previous_status": payload.get("previous_status") or "RUNNING",
+                    "from_config_version": payload.get("from_config_version"),
+                    "to_config_version": payload.get("to_config_version"),
+                    "source_config": payload.get("source_config") or {},
+                    "target_config": payload.get("target_config") or config,
+                    "stage": "FREEZE_PLACEMENT",
+                    "reason": payload.get("reason"),
+                    "started_at": latest_editing.get("created_at"),
+                    "config_persisted": False,
+                }
+            elif change_rows:
                 change = change_rows[0]
                 payload = change.get("payload") or {}
                 run_state["edit_state"] = {
