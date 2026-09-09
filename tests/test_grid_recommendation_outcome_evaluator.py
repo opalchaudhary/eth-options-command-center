@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from backend.routers import grid as grid_router
 from grid_bot.recommendation_outcome_evaluator import (
+    CHALLENGER_OUTCOME_TABLE,
+    CHALLENGER_TABLE,
     HORIZON_MINUTES,
     OUTCOME_TABLE,
     GridRecommendationOutcomeEvaluator,
@@ -44,10 +46,12 @@ def _candle(minutes, open_price, high, low, close):
 class FakeDb:
     enabled = True
 
-    def __init__(self, *, recommendations=None, candles=None, outcomes=None, latest=None):
+    def __init__(self, *, recommendations=None, challengers=None, candles=None, outcomes=None, challenger_outcomes=None, latest=None):
         self.recommendations = recommendations if recommendations is not None else [_recommendation()]
+        self.challengers = challengers if challengers is not None else []
         self.candles = candles if candles is not None else []
         self.outcomes = outcomes if outcomes is not None else []
+        self.challenger_outcomes = challenger_outcomes if challenger_outcomes is not None else []
         self.latest = latest or (START + timedelta(hours=24))
         self.inserts = []
         self.selects = []
@@ -57,8 +61,12 @@ class FakeDb:
         self.selects.append({"table": table, "params": params})
         if table == "grid_parameter_recommendations":
             return self.recommendations[: int(params.get("limit") or len(self.recommendations))]
+        if table == CHALLENGER_TABLE:
+            return self.challengers[: int(params.get("limit") or len(self.challengers))]
         if table == OUTCOME_TABLE:
             return self.outcomes
+        if table == CHALLENGER_OUTCOME_TABLE:
+            return self.challenger_outcomes
         if table == "eth_ohlcv":
             if params.get("order") == "candle_time.desc":
                 resolution = str(params.get("resolution", "eq.5m")).replace("eq.", "")
@@ -99,6 +107,74 @@ def test_evaluator_calculates_breach_metrics_and_persists_idempotently():
     assert one_hour["actual_recommended_width_ratio"] == 1.6
     assert db.inserts[0]["table"] == OUTCOME_TABLE
     assert db.inserts[0]["on_conflict"] == "recommendation_id,horizon"
+
+
+def test_evaluator_calculates_shadow_challenger_outcomes_separately():
+    db = FakeDb(
+        challengers=[
+            {
+                "challenger_id": "chall-1",
+                "recommendation_id": "rec-1",
+                "challenger_policy": "expansion_widen",
+                "challenger_policy_version": "grid_intelligence_shadow_challenger_v0_1",
+                "symbol": "ETHUSD",
+                "horizon": "12H",
+                "shadow_action": "KEEP_CURRENT",
+                "shadow_lower_price": "90",
+                "shadow_upper_price": "110",
+                "no_grid": False,
+                "metadata_json": {"width_vs_champion": 2.0},
+            }
+        ],
+        candles=[
+            _candle(5, 100, 103, 98, 102),
+            _candle(10, 102, 108, 101, 107),
+            _candle(15, 107, 109, 93, 94),
+        ],
+    )
+    evaluator = GridRecommendationOutcomeEvaluator(db=db, now_fn=lambda: NOW)
+
+    result = evaluator.evaluate_pending(persist=True)
+
+    assert result.challenger_persisted == 1
+    challenger_insert = next(row for row in db.inserts if row["table"] == CHALLENGER_OUTCOME_TABLE)
+    payload = challenger_insert["payload"]
+    assert challenger_insert["on_conflict"] == "challenger_id,horizon"
+    assert payload["challenger_id"] == "chall-1"
+    assert payload["challenger_policy"] == "expansion_widen"
+    assert payload["stayed_inside_shadow_range"] is True
+    assert payload["width_vs_champion"] == 2.0
+    assert payload["actual_recommended_width_ratio"] == 0.8
+
+
+def test_evaluator_records_no_grid_challenger_outcome_without_mutating_champion_outcomes():
+    db = FakeDb(
+        challengers=[
+            {
+                "challenger_id": "chall-ng",
+                "recommendation_id": "rec-1",
+                "challenger_policy": "stress_filter_no_grid",
+                "challenger_policy_version": "grid_intelligence_shadow_challenger_v0_1",
+                "symbol": "ETHUSD",
+                "horizon": "12H",
+                "shadow_action": "NO_GRID",
+                "no_grid": True,
+                "no_grid_reason": "containment <= 0.38 and expansion >= 0.72",
+                "metadata_json": {},
+            }
+        ],
+        candles=[_candle(5, 100, 103, 98, 102)],
+    )
+    evaluator = GridRecommendationOutcomeEvaluator(db=db, now_fn=lambda: NOW)
+
+    result = evaluator.evaluate_pending(persist=True)
+
+    assert result.challenger_persisted == 1
+    assert any(row["table"] == OUTCOME_TABLE for row in db.inserts)
+    challenger_insert = next(row for row in db.inserts if row["table"] == CHALLENGER_OUTCOME_TABLE)
+    assert challenger_insert["payload"]["no_grid"] is True
+    assert challenger_insert["payload"]["stayed_inside_shadow_range"] is False
+    assert challenger_insert["payload"]["shadow_lower_price"] is None
 
 
 def test_evaluator_skips_unmatured_horizons():
@@ -165,6 +241,56 @@ def test_summary_aggregates_by_horizon_and_version():
             "median_actual_recommended_width_ratio": 0.85,
         }
     ]
+    assert payload["policy_rows"][0]["policy"] == "champion_v0_1"
+
+
+def test_summary_compares_champion_and_shadow_policies():
+    db = FakeDb(
+        outcomes=[
+            {
+                "horizon": "12H",
+                "recommender_version": "grid_parameter_recommender_v0_1",
+                "stayed_inside_recommended_range": True,
+                "upper_breached": False,
+                "lower_breached": False,
+                "minutes_to_first_breach": None,
+                "actual_recommended_width_ratio": "0.5",
+            }
+        ],
+        challenger_outcomes=[
+            {
+                "horizon": "12H",
+                "challenger_policy": "expansion_widen",
+                "no_grid": False,
+                "stayed_inside_shadow_range": True,
+                "upper_breached": False,
+                "lower_breached": False,
+                "minutes_to_first_breach": None,
+                "actual_recommended_width_ratio": "0.4",
+                "width_vs_champion": "1.2",
+            },
+            {
+                "horizon": "12H",
+                "challenger_policy": "stress_filter_no_grid",
+                "no_grid": True,
+                "stayed_inside_shadow_range": False,
+                "upper_breached": False,
+                "lower_breached": False,
+                "minutes_to_first_breach": None,
+                "actual_recommended_width_ratio": None,
+                "width_vs_champion": None,
+            },
+        ],
+    )
+    evaluator = GridRecommendationOutcomeEvaluator(db=db, now_fn=lambda: NOW)
+
+    payload = evaluator.summary()
+
+    rows = {(row["policy"], row["horizon"]): row for row in payload["policy_rows"]}
+    assert rows[("champion_v0_1", "12H")]["containment_rate"] == 1.0
+    assert rows[("expansion_widen", "12H")]["participation_rate"] == 1.0
+    assert rows[("expansion_widen", "12H")]["median_width_vs_champion"] == 1.2
+    assert rows[("stress_filter_no_grid", "12H")]["no_grid_rate"] == 1.0
 
 
 def test_summary_endpoint_is_registered(monkeypatch):

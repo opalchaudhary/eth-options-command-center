@@ -24,6 +24,7 @@ from .recommendation import (
     no_grid,
     recommend_grid_parameters,
 )
+from .recommendation_challenger_repository import GridRecommendationChallengerRepository
 from .recommendation_snapshot_repository import GridRecommendationSnapshotRepository
 from .supabase_repository import SupabaseGridRepository
 
@@ -129,12 +130,14 @@ class GridRecommendationService:
         prediction_repository: Any | None = None,
         grid_repository: Any | None = None,
         snapshot_repository: Any | None = None,
+        challenger_repository: Any | None = None,
         market_snapshot_fn: Any | None = None,
         now_fn: Any | None = None,
     ):
         self.prediction_repository = prediction_repository or V2ShadowPredictionRepository()
         self.grid_repository = grid_repository if grid_repository is not None else SupabaseGridRepository()
         self.snapshot_repository = snapshot_repository
+        self.challenger_repository = challenger_repository
         self.market_snapshot_fn = market_snapshot_fn or eth_market_snapshot
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
@@ -374,9 +377,26 @@ class GridRecommendationService:
                 return {"saved": False, "recommendation_id": None, "error": "Recommendation snapshot storage is not configured."}
             snapshot = repository.build_snapshot(payload, requested_at=requested_at)
             recommendation_id = repository.insert(snapshot)
-            return {"saved": True, "recommendation_id": recommendation_id}
+            challengers = self._persist_shadow_challengers(snapshot, repository)
+            return {"saved": True, "recommendation_id": recommendation_id, "shadow_challengers": challengers}
         except Exception:
             return {"saved": False, "recommendation_id": None, "error": "Recommendation snapshot could not be saved."}
+
+    def _challenger_repository(self, champion_repository: Any | None = None):
+        if self.challenger_repository is not None:
+            return self.challenger_repository
+        db = getattr(champion_repository, "db", None)
+        return GridRecommendationChallengerRepository(db=db)
+
+    def _persist_shadow_challengers(self, champion_snapshot: dict, champion_repository: Any | None = None) -> dict:
+        try:
+            repository = self._challenger_repository(champion_repository)
+            if not getattr(repository, "enabled", True):
+                return {"saved": False, "count": 0, "error": "Shadow challenger storage is not configured."}
+            rows = repository.insert_for_recommendation(champion_snapshot)
+            return {"saved": True, "count": len(rows), "policies": [row["challenger_policy"] for row in rows]}
+        except Exception:
+            return {"saved": False, "count": 0, "error": "Shadow challenger snapshots could not be saved."}
 
     def _selected_prediction(self, inputs: GridProbabilityInputs, recommendation: GridParameterRecommendation) -> HorizonProbability | None:
         horizon = (recommendation.metadata or {}).get("selected_operating_horizon")

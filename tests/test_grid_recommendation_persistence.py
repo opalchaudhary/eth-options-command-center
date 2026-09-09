@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from backend.routers import grid as grid_router
+from grid_bot.recommendation_challenger_repository import CHALLENGER_TABLE
 from grid_bot.recommendation_service import GridRecommendationService
 from grid_bot.recommendation_snapshot_repository import GridRecommendationSnapshotRepository, TABLE_NAME
 
@@ -113,6 +114,18 @@ class RecordingDb:
 
     def select(self, table, params=None):
         self.selects.append({"table": table, "params": params or {}})
+        if table == "eth_ohlcv":
+            return [
+                {
+                    "candle_time": (NOW - timedelta(minutes=minutes)).isoformat(),
+                    "open": "4490",
+                    "high": "4510",
+                    "low": "4480",
+                    "close": "4500",
+                    "volume": "1",
+                }
+                for minutes in range(720, 0, -5)
+            ]
         return [
             {"recommendation_id": "rec-new", "created_at": "2026-09-03T10:02:00+00:00"},
             {"recommendation_id": "rec-old", "created_at": "2026-09-03T10:01:00+00:00"},
@@ -150,8 +163,15 @@ def test_manual_recommendation_request_inserts_exactly_one_snapshot():
     payload = _service(snapshot_db=db, grid=_grid()).recommendation(persist=True)
 
     assert payload["persistence"]["saved"] is True
-    assert len(db.inserts) == 1
-    assert db.inserts[0]["table"] == TABLE_NAME
+    champion_rows = [row for row in db.inserts if row["table"] == TABLE_NAME]
+    challenger_rows = [row for row in db.inserts if row["table"] == CHALLENGER_TABLE]
+    assert len(champion_rows) == 1
+    assert len(challenger_rows) == 3
+    assert payload["persistence"]["shadow_challengers"] == {
+        "saved": True,
+        "count": 3,
+        "policies": ["expansion_widen", "v2_range70_trailing_buffer", "stress_filter_no_grid"],
+    }
 
 
 def test_two_manual_requests_insert_two_rows_even_when_identical():
@@ -161,8 +181,11 @@ def test_two_manual_requests_insert_two_rows_even_when_identical():
     service.recommendation(persist=True)
     service.recommendation(persist=True)
 
-    ids = [row["payload"]["recommendation_id"] for row in db.inserts]
-    assert len(db.inserts) == 2
+    champion_rows = [row for row in db.inserts if row["table"] == TABLE_NAME]
+    challenger_rows = [row for row in db.inserts if row["table"] == CHALLENGER_TABLE]
+    ids = [row["payload"]["recommendation_id"] for row in champion_rows]
+    assert len(champion_rows) == 2
+    assert len(challenger_rows) == 6
     assert len(set(ids)) == 2
 
 
@@ -171,6 +194,24 @@ def test_non_persistent_recommendation_inserts_zero_rows():
     _service(snapshot_db=db, grid=_grid()).recommendation()
 
     assert db.inserts == []
+
+
+def test_manual_recommendation_persists_exact_shadow_challenger_policies():
+    db = RecordingDb()
+    _service(snapshot_db=db, grid=_grid()).recommendation(persist=True)
+
+    champion = next(row["payload"] for row in db.inserts if row["table"] == TABLE_NAME)
+    challenger_rows = [row for row in db.inserts if row["table"] == CHALLENGER_TABLE]
+
+    assert [row["payload"]["challenger_policy"] for row in challenger_rows] == [
+        "expansion_widen",
+        "v2_range70_trailing_buffer",
+        "stress_filter_no_grid",
+    ]
+    assert {row["payload"]["recommendation_id"] for row in challenger_rows} == {champion["recommendation_id"]}
+    assert all(row["payload"]["challenger_policy_version"] == "grid_intelligence_shadow_challenger_v0_1" for row in challenger_rows)
+    assert all(row["payload"]["metadata_json"]["source"] == "research.grid_intelligence_policy_challenger_v01" for row in challenger_rows)
+    assert all(row["payload"]["shadow_action"] == champion["recommendation_action"] for row in challenger_rows)
 
 
 def test_ordinary_page_load_and_rerender_do_not_request_recommendation():
