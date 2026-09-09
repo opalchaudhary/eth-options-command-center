@@ -46,6 +46,8 @@ ACTIVE_STATUSES = {
 GRIDBOT_ORDER_PREFIX = "DGB01-"
 LIFECYCLE_RETRY_ATTEMPTS = int(os.getenv("GRIDBOT_V01_LIFECYCLE_RETRY_ATTEMPTS", "3"))
 LIFECYCLE_RETRY_BACKOFF_SECONDS = float(os.getenv("GRIDBOT_V01_LIFECYCLE_RETRY_BACKOFF_SECONDS", "1"))
+RESUME_MAX_SECONDS = float(os.getenv("GRIDBOT_V01_RESUME_MAX_SECONDS", "300"))
+RESUME_NO_PROGRESS_SECONDS = float(os.getenv("GRIDBOT_V01_RESUME_NO_PROGRESS_SECONDS", "120"))
 DEFAULT_STATE_PATH = Path(os.getenv("GRIDBOT_V01_STATE_PATH", "grid_bot_state_v01.json"))
 START_TERMINAL_ORDER_STATUSES = {
     "cancelled",
@@ -85,6 +87,15 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal(default)
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def _jsonable(value: Any) -> Any:
@@ -1673,10 +1684,25 @@ class DurableGridBotLifecycle:
 
     def _resume_blocked(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
         now = utc_now()
+        cleanup = {}
+        try:
+            product_id = int(run["product"]["product_id"])
+            cancelled = self._cancel_known_gridbot_resting_orders(run, product_id)
+            self._save(state)
+            reconciled = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=False)
+            state = self._load()
+            run = state["runs"][run["run_id"]]
+            cleanup = {
+                "cancelled_orders": cancelled,
+                "reconciliation": reconciled.get("reconciliation") or {},
+                "open_gridbot_orders": reconciled.get("open_gridbot_orders"),
+            }
+        except Exception as exc:
+            cleanup = {"error": str(exc)[:500]}
         run["status"] = GridStatus.PAUSED.value
         run["status_updated_at"] = now
         run["updated_at"] = now
-        run["resume_diagnostics"] = {"reason": reason, "updated_at": now, **diagnostics}
+        run["resume_diagnostics"] = {"reason": reason, "updated_at": now, "cleanup": cleanup, **diagnostics}
         self._update_lifecycle_progress(
             run,
             "RESUME",
@@ -1688,6 +1714,19 @@ class DurableGridBotLifecycle:
         self._event(state, run["run_id"], "GRID_RUN_RESUME_BLOCKED", run["resume_diagnostics"])
         self._save(state)
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["resume_diagnostics"])}
+
+    def _resume_budget_exhausted(self, run: dict) -> str | None:
+        if run.get("status") != GridStatus.RESUMING.value:
+            return None
+        progress = run.get("lifecycle_progress") or {}
+        started_at = _utc_datetime(progress.get("started_at") or run.get("status_updated_at") or run.get("updated_at"))
+        last_progress_at = _utc_datetime(progress.get("last_progress_at") or run.get("updated_at"))
+        now = datetime.now(timezone.utc)
+        if started_at and (now - started_at).total_seconds() > RESUME_MAX_SECONDS:
+            return "resume_elapsed_budget_exhausted"
+        if last_progress_at and (now - last_progress_at).total_seconds() > RESUME_NO_PROGRESS_SECONDS:
+            return "resume_no_progress_budget_exhausted"
+        return None
 
     def _place_proposal(
         self,
@@ -2471,12 +2510,29 @@ class DurableGridBotLifecycle:
             self._set_run_status(state, run, GridStatus.RESUMING, "GRID_RUN_RESUMING", {"previous_status": run.get("status")})
             state = self._load()
             run = state["runs"][run["run_id"]]
+        else:
+            budget_reason = self._resume_budget_exhausted(run)
+            if budget_reason:
+                return self._resume_blocked(
+                    state,
+                    run,
+                    budget_reason,
+                    {"lifecycle_progress": deepcopy(run.get("lifecycle_progress") or {})},
+                )
 
         product_id = int(run["product"]["product_id"])
         spec = self.client.product_spec((run.get("product") or {}).get("symbol") or (run.get("config") or {}).get("product_symbol") or "ETHUSD")
         reconciled = self.reconcile(run["run_id"], process_replacements=False)
         state = self._load()
         run = state["runs"][run["run_id"]]
+        budget_reason = self._resume_budget_exhausted(run)
+        if budget_reason:
+            return self._resume_blocked(
+                state,
+                run,
+                budget_reason,
+                {"lifecycle_progress": deepcopy(run.get("lifecycle_progress") or {}), "reconciliation": reconciled.get("reconciliation") or {}},
+            )
         reconciliation = reconciled["reconciliation"]
         if int(reconciliation.get("position_mismatches") or 0):
             return self._safe_pause_for_external_position_change(state, run, reconciliation, reason="resume_preflight", previous_status=GridStatus.RESUMING.value)

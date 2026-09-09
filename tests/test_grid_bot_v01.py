@@ -1512,6 +1512,70 @@ def test_resume_reconciles_before_placement_rebuilds_reservations_and_is_idempot
     assert resumed["reconciliation"]["gridbot_inventory"] == signed_position
 
 
+def test_resume_defers_post_only_unsafe_levels_after_book_moves_and_runs(tmp_path):
+    class MovingResumeBookClient(_FakeLifecycleClient):
+        moved = False
+
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            if self.moved:
+                return replace(spec, best_bid=Decimal("2600"), best_ask=Decimal("2600.05"), mark_price=Decimal("2500"))
+            return spec
+
+    client = MovingResumeBookClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_tiny_grid()["run"]
+    lifecycle.pause(run["run_id"])
+    client.moved = True
+
+    resumed = lifecycle.resume(run["run_id"])
+
+    resume_orders = [order for order in resumed["run"]["orders"].values() if order.get("order_kind") == "resume_grid"] + [
+        order for order in resumed["run"].get("deferred_orders", {}).values() if order.get("order_kind") == "resume_grid"
+    ]
+    deferred = [order for order in resume_orders if order.get("status") == "deferred"]
+    assert resumed["run"]["status"] == GridStatus.RUNNING.value
+    assert resumed["run"]["deployment_completeness"]["complete"] is True
+    assert resumed["run"]["deployment_completeness"]["deferred"] > 0
+    assert deferred
+    assert any("POST_ONLY_SELL_WOULD_CROSS_BID" in order["rejection_reason"] for order in deferred)
+
+
+def test_resume_no_progress_budget_pauses_and_cleans_partial_deployment(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    lifecycle.pause(run_id)
+    lifecycle.request_resume(run_id)
+    state = lifecycle._load()
+    run = state["runs"][run_id]
+    run["lifecycle_progress"] = {
+        "operation": "RESUME",
+        "stage": "RESUMING_VERIFY",
+        "started_at": "2020-01-01T00:00:00+00:00",
+        "last_progress_at": "2020-01-01T00:00:00+00:00",
+        "expected_orders": len(run["levels"]),
+        "confirmed_orders": 1,
+    }
+    created = lifecycle._place_proposal(
+        run,
+        int(run["product"]["product_id"]),
+        lifecycle._proposal_for_level(run_id, run["levels"][0], int(run["sequence"])),
+        "resume_grid",
+        current_inventory=Decimal("0"),
+    )
+    state["runs"][run_id]["orders"][created["client_order_id"]] = created
+    lifecycle._save(state)
+
+    resumed = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).resume(run_id)
+
+    assert resumed["ok"] is False
+    assert resumed["run"]["status"] == GridStatus.PAUSED.value
+    assert resumed["diagnostics"]["reason"] == "resume_elapsed_budget_exhausted"
+    assert resumed["diagnostics"]["cleanup"]["open_gridbot_orders"] == 0
+    assert client.open_orders(1699)["result"] == []
+
+
 def test_resume_external_partial_reduction_pauses_without_fake_fills_or_replacements(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
