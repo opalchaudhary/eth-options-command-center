@@ -613,6 +613,7 @@ def render_edit_grid(live: dict) -> None:
             "max_inventory_lots": str(Decimal(str(max_inventory))),
         }
         preview = st.session_state.get("gridbot_edit_preview")
+        edit_apply_pending = bool(st.session_state.get("gridbot_edit_apply_pending"))
         if preview:
             render_neutral_range_suggestion(preview, lower_key="edit_lower", upper_key="edit_upper", button_key="edit_use_suggested_range")
             if not neutral_range_payload(preview):
@@ -623,18 +624,23 @@ def render_edit_grid(live: dict) -> None:
                 st.warning(human_operator_reason(warning))
             for error in validation.get("errors") or []:
                 st.error(human_operator_reason(error))
+        if edit_apply_pending:
+            st.info("EDIT REQUESTED / EDIT IN PROGRESS")
 
         b1, b2, b3 = st.columns([1, 1, 1])
         if b1.button("Cancel", use_container_width=True):
             st.session_state["gridbot_edit_open"] = False
             st.session_state.pop("gridbot_edit_preview", None)
+            st.session_state.pop("gridbot_edit_apply_pending", None)
             st.rerun()
-        if b2.button("Preview Changes", use_container_width=True):
+        if b2.button("Preview Changes", disabled=edit_apply_pending, use_container_width=True):
             st.session_state["gridbot_edit_preview"] = safe_post("/api/grid/v01/live/edit/preview", payload, timeout=30)
-        if b3.button("Apply Changes", type="primary", disabled=not preview, use_container_width=True):
+        if b3.button("Apply Changes", type="primary", disabled=(not preview or edit_apply_pending), use_container_width=True):
+            st.session_state["gridbot_edit_apply_pending"] = True
             safe_post("/api/grid/v01/live/edit", payload, timeout=90)
             st.session_state["gridbot_edit_open"] = False
             st.session_state.pop("gridbot_edit_preview", None)
+            st.session_state.pop("gridbot_edit_apply_pending", None)
             st.rerun()
 
 

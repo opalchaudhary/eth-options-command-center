@@ -68,6 +68,8 @@ RUNNING_TERMINAL_REPLACED_STATUSES = {"cancelled", "closed", "filled", "not_open
 START_ACCOUNTED_ORDER_STATUSES = RUNNING_VALID_ORDER_STATUSES | START_UNRESOLVED_ORDER_STATUSES
 _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
+_EDIT_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+_EDIT_OPERATION_LOCKS_GUARD = threading.Lock()
 STOP_ATTENTION_STATUS = GridStatus.STOP_REQUIRES_ATTENTION.value
 
 
@@ -162,6 +164,10 @@ def _replacement_group_client_order_id(run_id: str, level_id: str, side: Side, s
 
 def _flatten_client_order_id(run_id: str, side: Side, sequence: int) -> str:
     return f"DGB01-{run_id[-8:]}-STOP-{side.value[0].upper()}-{sequence}"[:32]
+
+
+def _edit_client_order_id(run_id: str, level_id: str, side: Side, config_version: int) -> str:
+    return f"DGB01-{run_id[-8:]}-{level_id}-{side.value[0].upper()}-E{config_version}"[:32]
 
 
 def _config_fingerprint(config: dict) -> tuple:
@@ -318,6 +324,49 @@ class DurableGridBotLifecycle:
         run_id = state.get("active_run_id")
         run = state.get("runs", {}).get(run_id) if run_id else None
         return run if run and run.get("status") in ACTIVE_STATUSES else None
+
+    def _edit_operation_lock(self, run_id: str | None) -> threading.Lock:
+        key = run_id or "__active__"
+        with _EDIT_OPERATION_LOCKS_GUARD:
+            lock = _EDIT_OPERATION_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _EDIT_OPERATION_LOCKS[key] = lock
+            return lock
+
+    def _edit_already_in_progress(self, run_id: str | None = None) -> dict:
+        run = None
+        edit_state = {}
+        for _ in range(40):
+            state = self._load()
+            run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
+            edit_state = (run or {}).get("edit_state") or {}
+            if edit_state.get("operation_id"):
+                break
+            time.sleep(0.05)
+        return {
+            "ok": False,
+            "requires_attention": False,
+            "idempotent": True,
+            "edit_already_in_progress": True,
+            "operation_id": edit_state.get("operation_id"),
+            "run": deepcopy(run),
+            "edit": deepcopy(edit_state),
+        }
+
+    def _existing_edit_level_obligation(self, run: dict, level: dict, order_kind: str = "edit_grid") -> dict | None:
+        config_version = int((run.get("config") or {}).get("config_version") or 1)
+        level_id = str(level.get("level_id") or "")
+        side = str(level.get("side") or "")
+        candidates = list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
+        for order in candidates:
+            if order.get("order_kind") != order_kind:
+                continue
+            if int(order.get("config_version") or 0) != config_version:
+                continue
+            if str(order.get("level_id") or "") == level_id and str(order.get("side") or "") == side:
+                return order
+        return None
 
     def status(self) -> dict:
         if self._db_enabled():
@@ -2494,6 +2543,15 @@ class DurableGridBotLifecycle:
         return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"])}
 
     def edit_grid(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
+        lock = self._edit_operation_lock(run_id)
+        if not lock.acquire(blocking=False):
+            return self._edit_already_in_progress(run_id)
+        try:
+            return self._edit_grid_unlocked(run_id, payload, reason)
+        finally:
+            lock.release()
+
+    def _edit_grid_unlocked(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
         payload = payload or {}
         state = self._load()
         run = state.get("runs", {}).get(run_id or state.get("active_run_id"))
@@ -2648,7 +2706,7 @@ class DurableGridBotLifecycle:
                 self.db.insert_once(
                     "grid_parameter_changes",
                     {
-                        "change_id": new_id("chg"),
+                        "change_id": run["edit_state"].get("operation_id") or new_id("chg"),
                         "run_id": run["run_id"],
                         "bot_id": run["bot_id"],
                         "from_config_version": int(old_config["config_version"]),
@@ -2673,7 +2731,27 @@ class DurableGridBotLifecycle:
             try:
                 self._update_lifecycle_progress(run, "EDIT", "PLACING_ORDERS", message="Editing Grid: placing new orders", expected_orders=len(run.get("levels") or []), cancelled_orders=cancelled)
                 for level in run["levels"]:
-                    proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]))
+                    existing_obligation = self._existing_edit_level_obligation(run, level)
+                    if existing_obligation:
+                        existing_status = str(existing_obligation.get("status") or "").lower()
+                        if existing_status == "deferred":
+                            deferred += 1
+                        elif existing_obligation.get("exchange_order_id") and existing_status not in START_TERMINAL_ORDER_STATUSES:
+                            created += 1
+                        self._update_lifecycle_progress(
+                            run,
+                            "EDIT",
+                            "PLACING_ORDERS",
+                            message=f"Editing Grid: existing obligation accounted for {level.get('level_id')}",
+                            expected_orders=len(run.get("levels") or []),
+                            confirmed_orders=created,
+                            deferred_orders=deferred,
+                            cancelled_orders=cancelled,
+                        )
+                        continue
+                    side = Side(level["side"])
+                    client_order_id = _edit_client_order_id(run["run_id"], level["level_id"], side, int(run["config"]["config_version"]))
+                    proposal = self._proposal_for_level(run["run_id"], level, int(run["sequence"]), client_order_id=client_order_id)
                     order = self._place_proposal(run, product_id, proposal, "edit_grid", current_inventory=inventory, product_spec=spec, verify_existing_before_submit=False)
                     if order.get("status") == "deferred":
                         deferred += 1

@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import threading
 import time
 
 import pytest
@@ -763,6 +764,106 @@ def test_edit_grid_repeated_apply_is_idempotent(tmp_path):
     assert int(first["run"]["config"]["config_version"]) == 2
     assert int(second["run"]["config"]["config_version"]) == 2
     assert second["idempotent"] is True
+
+
+def test_concurrent_double_apply_returns_existing_edit_without_duplicate_orders(tmp_path):
+    class SlowEditClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.slow_edit = False
+            self.first_edit_started = threading.Event()
+            self.release_first_edit = threading.Event()
+
+        def place_order(self, payload):
+            if self.slow_edit and payload["client_order_id"].endswith("-E2") and not self.first_edit_started.is_set():
+                self.first_edit_started.set()
+                self.release_first_edit.wait(timeout=2)
+            return super().place_order(payload)
+
+    client = SlowEditClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    client.slow_edit = True
+    results = []
+
+    first_thread = threading.Thread(target=lambda: results.append(lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="double_apply")))
+    first_thread.start()
+    assert client.first_edit_started.wait(timeout=2)
+    duplicate = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).edit_grid(run["run_id"], {"grid_count": 6}, reason="double_apply")
+    client.release_first_edit.set()
+    first_thread.join(timeout=3)
+
+    assert duplicate["edit_already_in_progress"] is True
+    assert duplicate["operation_id"] == results[0]["run"]["edit_state"]["operation_id"]
+    final = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()["active_run"]
+    edit_obligations = [
+        order
+        for order in list(final["orders"].values()) + list(final.get("deferred_orders", {}).values())
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    ]
+    obligations = {(order["config_version"], order["level_id"], order["side"]) for order in edit_obligations}
+    assert int(final["config"]["config_version"]) == 2
+    assert len(edit_obligations) == len(obligations) == 6
+
+
+def test_concurrent_triple_apply_creates_one_edit_operation(tmp_path):
+    class SlowEditClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.slow_edit = False
+            self.first_edit_started = threading.Event()
+            self.release_first_edit = threading.Event()
+
+        def place_order(self, payload):
+            if self.slow_edit and payload["client_order_id"].endswith("-E2") and not self.first_edit_started.is_set():
+                self.first_edit_started.set()
+                self.release_first_edit.wait(timeout=2)
+            return super().place_order(payload)
+
+    client = SlowEditClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    client.slow_edit = True
+    results = []
+    first_thread = threading.Thread(target=lambda: results.append(lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="triple_apply")))
+    first_thread.start()
+    assert client.first_edit_started.wait(timeout=2)
+
+    duplicate_1 = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).edit_grid(run["run_id"], {"grid_count": 6}, reason="triple_apply")
+    duplicate_2 = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).edit_grid(run["run_id"], {"grid_count": 6}, reason="triple_apply")
+    client.release_first_edit.set()
+    first_thread.join(timeout=3)
+
+    assert duplicate_1["edit_already_in_progress"] is True
+    assert duplicate_2["edit_already_in_progress"] is True
+    operation_ids = {duplicate_1["operation_id"], duplicate_2["operation_id"], results[0]["run"]["edit_state"]["operation_id"]}
+    assert len(operation_ids) == 1
+    final = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).status()["active_run"]
+    assert int(final["config"]["config_version"]) == 2
+    edit_obligations = [
+        order
+        for order in list(final["orders"].values()) + list(final.get("deferred_orders", {}).values())
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    ]
+    assert len({(order["config_version"], order["level_id"], order["side"]) for order in edit_obligations}) == 6
+
+
+def test_forty_level_edit_has_exactly_one_semantic_obligation_per_level(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 40, "max_inventory_lots": "300", "lot_size": "10"}, reason="forty_level_edit")
+    obligations = [
+        order
+        for order in list(edited["run"]["orders"].values()) + list(edited["run"].get("deferred_orders", {}).values())
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    ]
+    semantic_keys = {(order["config_version"], order["level_id"], order["side"]) for order in obligations}
+
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert len(semantic_keys) == 40
+    assert len(obligations) == 40
 
 
 def test_restart_during_edit_recovers_without_duplicate_config_or_orders(tmp_path):
