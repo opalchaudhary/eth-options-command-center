@@ -507,6 +507,12 @@ class _PostOnlyReject(Exception):
         self.response = type("Response", (), {"status_code": 400, "text": "post_only order would be taker"})()
 
 
+class _DeterministicDelta400(Exception):
+    def __init__(self, body="invalid price"):
+        super().__init__("400 Client Error: Bad Request for url: /orders")
+        self.response = type("Response", (), {"status_code": 400, "text": body})()
+
+
 class _StartBookMoveClient(_FakeLifecycleClient):
     def __init__(self):
         super().__init__()
@@ -3038,13 +3044,17 @@ def test_replacement_exposure_never_exceeds_cumulative_source_fills(tmp_path):
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
 
     lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
-    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+    replacement = [
+        order
+        for order in run["orders"].values()
+        if order.get("order_kind") == "replacement" and order.get("status") == "open"
+    ][0]
 
     assert replacement["requested_quantity"] == "1"
     assert Decimal(str(replacement["requested_quantity"])) <= sum(Decimal(str(fill["size"])) for fill in run["fills"].values())
 
 
-def test_later_partial_fill_cancel_replaces_to_current_entitlement(tmp_path):
+def test_later_partial_fill_keeps_existing_current_replacement_until_resolved(tmp_path):
     client = _FakeLifecycleClient()
     run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-1", fill_size="1")
     source_order_id = next(order["client_order_id"] for order in run["orders"].values() if order.get("order_kind") == "initial_grid")
@@ -3066,12 +3076,13 @@ def test_later_partial_fill_cancel_replaces_to_current_entitlement(tmp_path):
     open_replacements = [order for order in replacements if order.get("status") == "open"]
 
     assert first["created"] == 1
-    assert second["created"] == 1
-    assert second["cancel_replaced"] == 1
-    assert [order["requested_quantity"] for order in replacements] == ["1", "4"]
+    assert second["existing"] == 1
+    assert second["cancel_replaced"] == 0
+    assert [order["requested_quantity"] for order in replacements] == ["1"]
     assert len(open_replacements) == 1
-    assert open_replacements[0]["requested_quantity"] == "4"
+    assert open_replacements[0]["requested_quantity"] == "1"
     assert sum(Decimal(str(order["remaining_quantity"])) for order in open_replacements) <= Decimal("4")
+    assert next(iter(run["replacement_entitlements"].values()))["replacement_deficit_qty"] == "3"
 
 
 def test_replacement_partial_fill_leaves_only_remaining_obligation(tmp_path):
@@ -3081,7 +3092,11 @@ def test_replacement_partial_fill_leaves_only_remaining_obligation(tmp_path):
     run["orders"][source_order_id]["requested_quantity"] = "10"
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
     lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
-    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+    replacement = [
+        order
+        for order in run["orders"].values()
+        if order.get("order_kind") == "replacement" and order.get("status") == "open"
+    ][0]
     replacement["status"] = "partially_filled"
     replacement["filled_quantity"] = "4"
     replacement["remaining_quantity"] = "6"
@@ -3098,6 +3113,38 @@ def test_replacement_partial_fill_leaves_only_remaining_obligation(tmp_path):
     assert source_entitlement["replacement_qty_already_filled"] == "4"
     assert source_entitlement["replacement_qty_currently_open"] == "6"
     assert source_entitlement["replacement_deficit_qty"] == "0"
+
+
+def test_replacement_partial_fill_tracks_residual_without_duplicate_current_order(tmp_path):
+    client = _FakeLifecycleClient()
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-1", fill_size="10")
+    source_order_id = next(order["client_order_id"] for order in run["orders"].values() if order.get("order_kind") == "initial_grid")
+    run["orders"][source_order_id]["requested_quantity"] = "10"
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
+    replacement = [
+        order
+        for order in run["orders"].values()
+        if order.get("order_kind") == "replacement" and order.get("status") == "open"
+    ][0]
+    replacement["status"] = "partially_filled"
+    replacement["filled_quantity"] = "4"
+    replacement["remaining_quantity"] = "3"
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "6"})
+    entitlement = next(iter(run["replacement_entitlements"].values()))
+    open_replacements = [
+        order
+        for order in run["orders"].values()
+        if order.get("order_kind") == "replacement" and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+    ]
+
+    assert result["existing"] == 1
+    assert len(open_replacements) == 1
+    assert entitlement["replacement_entitlement_qty"] == "10"
+    assert entitlement["replacement_qty_already_filled"] == "4"
+    assert entitlement["replacement_qty_currently_open"] == "3"
+    assert entitlement["replacement_deficit_qty"] == "3"
 
 
 def test_replacement_processing_skips_external_position_mismatch(tmp_path):
@@ -3246,7 +3293,11 @@ def test_deferred_replacement_submits_when_post_only_becomes_eligible(tmp_path):
     deferred = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
     client.best_bid = Decimal("2499.95")
     submitted = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
-    replacement = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"][0]
+    replacement = [
+        order
+        for order in run["orders"].values()
+        if order.get("order_kind") == "replacement" and order.get("status") == "open"
+    ][0]
 
     assert deferred["deferred"] == 1
     assert submitted["created"] == 1
@@ -3254,6 +3305,108 @@ def test_deferred_replacement_submits_when_post_only_becomes_eligible(tmp_path):
     assert replacement["exchange_order_id"]
     assert replacement["client_order_id"] == client.orders[0]["client_order_id"]
     assert run["deferred_orders"] == {}
+
+
+def test_replacement_retry_terminalizes_old_attempts_after_ten_deterministic_rejections(tmp_path):
+    class RejectThenAcceptClient(_FakeLifecycleClient):
+        def __init__(self, rejects):
+            super().__init__()
+            self.rejects = rejects
+
+        def place_order(self, payload):
+            if payload.get("client_order_id", "").startswith("DGB01-") and self.rejects:
+                self.rejects -= 1
+                raise _DeterministicDelta400("invalid price")
+            return super().place_order(payload)
+
+    client = RejectThenAcceptClient(10)
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-retry-10", fill_size="10")
+    source_order_id = next(order["client_order_id"] for order in run["orders"].values() if order.get("order_kind") == "initial_grid")
+    run["orders"][source_order_id]["requested_quantity"] = "10"
+
+    for _ in range(10):
+        result = lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
+        assert result["deferred"] == 1
+        assert len([order for order in run["deferred_orders"].values() if order.get("current_retry_attempt")]) == 1
+
+    accepted = lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
+    replacement_orders = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"]
+    current = [order for order in replacement_orders if order.get("current_retry_attempt")]
+
+    assert len(run["replacement_entitlements"]) == 1
+    assert accepted["created"] == 1
+    assert len(client.orders) == 1
+    assert len(current) == 1
+    assert current[0]["status"] == "open"
+    assert len([order for order in replacement_orders if order.get("status") == "retried"]) == 10
+    assert not [order for order in replacement_orders if order.get("status") == "ambiguous_submission"]
+
+
+def test_concurrent_replacement_processing_submits_one_current_order(tmp_path):
+    class SlowClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self._place_lock = threading.Lock()
+
+        def place_order(self, payload):
+            time.sleep(0.02)
+            with self._place_lock:
+                return super().place_order(payload)
+
+    client = SlowClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-concurrent", fill_size="1")
+    results = []
+
+    threads = [
+        threading.Thread(target=lambda: results.append(lifecycle.process_replacements(run, {"gridbot_inventory": "1"})))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"]
+    current = [order for order in replacements if order.get("current_retry_attempt")]
+
+    assert len(results) == 2
+    assert sum(result.get("created", 0) for result in results) == 1
+    assert sum(result.get("existing", 0) for result in results) == 1
+    assert len(client.orders) == 1
+    assert len(replacements) == 1
+    assert len(current) == 1
+
+
+def test_restart_recovery_reuses_replacement_entitlement_after_deferred_attempt(tmp_path):
+    class RejectOnceClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.reject_once = True
+
+        def place_order(self, payload):
+            if self.reject_once:
+                self.reject_once = False
+                raise _DeterministicDelta400("invalid price")
+            return super().place_order(payload)
+
+    client = RejectOnceClient()
+    state_path = tmp_path / "state.json"
+    lifecycle = DurableGridBotLifecycle(client, state_path, use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-restart", fill_size="1")
+    first = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    lifecycle._save({"runs": {run["run_id"]: run}, "active_run_id": run["run_id"], "events": []})
+
+    loaded = DurableGridBotLifecycle(client, state_path, use_supabase=False)._load()["runs"][run["run_id"]]
+    second = DurableGridBotLifecycle(client, state_path, use_supabase=False).process_replacements(loaded, {"gridbot_inventory": "1"})
+    replacements = [order for order in loaded["orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert first["deferred"] == 1
+    assert second["created"] == 1
+    assert len(client.orders) == 1
+    assert len([order for order in replacements if order.get("status") == "open"]) == 1
+    assert len([order for order in replacements if order.get("status") == "retried"]) == 1
 
 
 def test_stop_terminalizes_never_submitted_deferred_replacement_without_unresolved_noise(tmp_path):

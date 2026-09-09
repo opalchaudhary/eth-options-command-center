@@ -60,6 +60,7 @@ START_TERMINAL_ORDER_STATUSES = {
     "superseded",
     "never_submitted",
     "rejected",
+    "retried",
 }
 START_UNRESOLVED_ORDER_STATUSES = {"unresolved", "ambiguous_submission", "submitted", "pending", "proposed"}
 DEFERRED_ORDER_STATUSES = {"deferred", "blocked"}
@@ -70,6 +71,8 @@ _START_WORKERS: dict[str, threading.Thread] = {}
 _START_WORKERS_LOCK = threading.Lock()
 _EDIT_OPERATION_LOCKS: dict[str, threading.Lock] = {}
 _EDIT_OPERATION_LOCKS_GUARD = threading.Lock()
+_REPLACEMENT_ENTITLEMENT_LOCKS: dict[str, threading.Lock] = {}
+_REPLACEMENT_ENTITLEMENT_LOCKS_GUARD = threading.Lock()
 STOP_ATTENTION_STATUS = GridStatus.STOP_REQUIRES_ATTENTION.value
 
 
@@ -92,6 +95,39 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     return value
+
+
+def _safe_exchange_error_body(exc: Exception, limit: int = 500) -> str:
+    response = getattr(exc, "response", None)
+    text = getattr(response, "text", None)
+    return str(text or "")[:limit]
+
+
+def _exchange_error_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _classify_exchange_rejection(exc: Exception) -> str | None:
+    if _exchange_error_status(exc) != 400:
+        return None
+    body = _safe_exchange_error_body(exc).lower()
+    text = f"{str(exc).lower()} {body}"
+    if "post_only" in text or "post only" in text or "taker" in text:
+        return "EXCHANGE_POST_ONLY_REJECTED"
+    if "duplicate" in text or "client_order_id" in text:
+        return "EXCHANGE_DUPLICATE_CLIENT_ORDER_ID"
+    if "price" in text or "tick" in text:
+        return "EXCHANGE_INVALID_PRICE"
+    if "margin" in text or "risk" in text or "insufficient" in text:
+        return "EXCHANGE_MARGIN_OR_RISK_REJECTED"
+    if "parameter" in text or "invalid" in text:
+        return "EXCHANGE_INVALID_PARAMETER"
+    return "EXCHANGE_DETERMINISTIC_REJECTION"
 
 
 def _result_rows(payload: dict | None) -> list[dict]:
@@ -274,6 +310,11 @@ class DurableGridBotLifecycle:
 
     def _db_enabled(self) -> bool:
         return bool(self.db and self.db.enabled)
+
+    def _replacement_entitlement_lock(self, run_id: str, group_key: str) -> threading.Lock:
+        lock_key = f"{run_id}:{group_key}"
+        with _REPLACEMENT_ENTITLEMENT_LOCKS_GUARD:
+            return _REPLACEMENT_ENTITLEMENT_LOCKS.setdefault(lock_key, threading.Lock())
 
     def _load(self) -> dict:
         if self._db_enabled():
@@ -1108,7 +1149,11 @@ class DurableGridBotLifecycle:
         reason_codes: list[str],
         normalized_price: Decimal | None = None,
         source_fill_id: str | None = None,
+        raw_gridbot: dict | None = None,
     ) -> dict:
+        gridbot_raw = dict(raw_gridbot or {})
+        if source_fill_id:
+            gridbot_raw.setdefault("source_fill_id", source_fill_id)
         record = {
             "order_key": proposal.client_order_id,
             "run_id": run["run_id"],
@@ -1125,6 +1170,7 @@ class DurableGridBotLifecycle:
             "config_version": run["config"]["config_version"],
             "rejection_reason": ",".join(reason_codes),
             "source_fill_id": source_fill_id,
+            "raw": {"gridbot": gridbot_raw} if gridbot_raw else {},
             "created_at": utc_now(),
         }
         run.setdefault("deferred_orders", {})[proposal.client_order_id] = record
@@ -1132,6 +1178,40 @@ class DurableGridBotLifecycle:
             self.db.persist_order_proposal(run, proposal, order_kind, source_fill_id)
             self.db.persist_order(run, record)
         return record
+
+    def _mark_order_non_current_retry(self, run: dict, order: dict, status: str = "retried", reason: str = "replacement_entitlement_retry") -> None:
+        order["status"] = status
+        order["terminal_reason"] = reason
+        order["remaining_quantity"] = "0"
+        order["current_retry_attempt"] = False
+        raw = order.get("raw") or {}
+        gridbot = {**(raw.get("gridbot") or {}), "current_retry_attempt": False, "terminal_reason": reason}
+        order["raw"] = {**raw, "gridbot": gridbot}
+        run.setdefault("orders", {})[order.get("client_order_id")] = order
+        run.setdefault("deferred_orders", {}).pop(order.get("client_order_id"), None)
+        if self._db_enabled():
+            self.db.persist_order(run, order)
+
+    def _terminalize_non_current_replacement_retries(self, run: dict, group_key: str, current_client_order_id: str | None = None) -> int:
+        terminalized = 0
+        candidates = list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
+        seen: set[str] = set()
+        for order in candidates:
+            client_order_id = str(order.get("client_order_id") or order.get("order_key") or "")
+            if not client_order_id or client_order_id in seen or client_order_id == current_client_order_id:
+                continue
+            seen.add(client_order_id)
+            if order.get("order_kind") != "replacement":
+                continue
+            if order.get("replacement_group_key") != group_key:
+                continue
+            if order.get("exchange_order_id"):
+                continue
+            if str(order.get("status") or "").lower() not in DEFERRED_ORDER_STATUSES:
+                continue
+            self._mark_order_non_current_retry(run, order)
+            terminalized += 1
+        return terminalized
 
     def _terminalize_never_submitted_orders(self, run: dict, status: str = "abandoned_by_stop", reason: str = "run_stop_before_submission") -> int:
         count = 0
@@ -1655,6 +1735,36 @@ class DurableGridBotLifecycle:
                 )
                 if stale_post_only:
                     return stale_post_only
+                deterministic_rejection = _classify_exchange_rejection(exc) if order_kind == "replacement" else None
+                if deterministic_rejection:
+                    context = {
+                        "deterministic_exchange_rejection": True,
+                        "exchange_error_status": _exchange_error_status(exc),
+                        "exchange_error_code": deterministic_rejection,
+                        "exchange_error_body": _safe_exchange_error_body(exc),
+                        "request_operation": order_kind,
+                        "level_id": proposal.level_id,
+                        "side": proposal.side.value,
+                        "price": str(proposal.price),
+                        "normalized_price": str(normalized_price),
+                        "quantity": str(proposal.quantity),
+                    }
+                    self._record_lifecycle_timing(
+                        run,
+                        str(run.get("lifecycle_progress", {}).get("operation") or order_kind).upper(),
+                        "deterministic_exchange_rejection",
+                        0,
+                        **context,
+                    )
+                    return self._defer_proposal(
+                        run,
+                        proposal,
+                        order_kind,
+                        [deterministic_rejection],
+                        normalized_price,
+                        source_fill_id,
+                        raw_gridbot=context,
+                    )
                 last_error = exc
                 if not self._is_temporary_exchange_error(exc) or attempt >= max(1, LIFECYCLE_RETRY_ATTEMPTS):
                     break
@@ -1884,11 +1994,16 @@ class DurableGridBotLifecycle:
         inventory = _decimal(operational_inventory_value, str(_position_size(self.client, product_id)))
         outcome["skipped"] = int(run.pop("_replacement_refresh_skipped", 0) or 0)
         for group_key, group in sorted((run.get("replacement_entitlements") or {}).items()):
-            result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory)
+            with self._replacement_entitlement_lock(run["run_id"], group_key):
+                self._refresh_replacement_entitlements(run)
+                group = (run.get("replacement_entitlements") or {}).get(group_key) or group
+                result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory)
             if result:
                 outcome[result["state"]] = outcome.get(result["state"], 0) + 1
                 if result.get("cancel_replaced"):
                     outcome["cancel_replaced"] += 1
+                if result.get("retried_attempts"):
+                    outcome["retried_attempts"] = outcome.get("retried_attempts", 0) + int(result.get("retried_attempts") or 0)
                 outcome["items"].append(result)
         outcome["metrics"] = self._replacement_metrics(run)
         return outcome
@@ -2054,16 +2169,7 @@ class DurableGridBotLifecycle:
         filled = _decimal(group.get("replacement_qty_already_filled"))
         open_qty = _decimal(group.get("replacement_qty_currently_open"))
         deficit = max(Decimal("0"), entitlement - filled - open_qty)
-        related_deferred = [
-            order
-            for order in (run.get("deferred_orders") or {}).values()
-            if order.get("replacement_group_key") == group_key and not order.get("exchange_order_id")
-        ]
-        for order in related_deferred:
-            run.setdefault("orders", {}).pop(order.get("client_order_id"), None)
-            run.setdefault("deferred_orders", {}).pop(order.get("client_order_id"), None)
-            order["status"] = "superseded"
-            order["terminal_reason"] = "replacement_entitlement_retry"
+        retried_attempts = self._terminalize_non_current_replacement_retries(run, group_key)
         related_open = [
             order
             for order in (run.get("orders") or {}).values()
@@ -2073,12 +2179,16 @@ class DurableGridBotLifecycle:
         if deficit <= 0:
             return {"state": "existing", "replacement_group_key": group_key, "entitlement": str(entitlement), "open": str(open_qty), "filled": str(filled)}
         if related_open:
-            for order in related_open:
-                self._cancel_order_safely(product_id, order)
-                order["remaining_quantity"] = "0"
-                order["cancel_replace_reason"] = "replacement_entitlement_increased"
-            open_qty = Decimal("0")
-            deficit = max(Decimal("0"), entitlement - filled)
+            return {
+                "state": "existing",
+                "replacement_group_key": group_key,
+                "entitlement": str(entitlement),
+                "open": str(open_qty),
+                "filled": str(filled),
+                "residual": str(deficit),
+                "reason": "accepted_replacement_order_already_current",
+                "retried_attempts": retried_attempts,
+            }
 
         target = {
             "level_id": group["target_level_id"],
@@ -2115,10 +2225,25 @@ class DurableGridBotLifecycle:
         created["replacement_group_key"] = group_key
         created["source_order_key"] = group["source_order_key"]
         created["source_fill_ids"] = list(group.get("source_fill_ids") or [])
+        created["current_retry_attempt"] = True
+        raw = created.get("raw") or {}
+        created["raw"] = {
+            **raw,
+            "gridbot": {
+                **(raw.get("gridbot") or {}),
+                "replacement_group_key": group_key,
+                "source_order_key": group["source_order_key"],
+                "source_fill_ids": list(group.get("source_fill_ids") or []),
+                "replacement_entitlement_id": group_key,
+                "current_retry_attempt": True,
+            },
+        }
         if self._db_enabled():
             self.db.persist_order(run, created)
         if created.get("status") == "deferred":
             run.setdefault("deferred_orders", {})[created["client_order_id"]]["replacement_group_key"] = group_key
+            run.setdefault("deferred_orders", {})[created["client_order_id"]]["current_retry_attempt"] = True
+            run["sequence"] = int(run.get("sequence", 0)) + 1
             state = "deferred"
         else:
             state = "created"
@@ -2135,6 +2260,7 @@ class DurableGridBotLifecycle:
             "quantity": str(deficit),
             "entitlement": str(entitlement),
             "cancel_replaced": bool(related_open),
+            "retried_attempts": retried_attempts,
         }
 
     def _place_replacement_for_fill(

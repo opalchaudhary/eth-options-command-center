@@ -1,7 +1,15 @@
 from dataclasses import dataclass
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - dotenv is optional outside the app runtime.
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 GRIDBOT_VERSION = "0.1"
 STRATEGY_VERSION = "grid-strategy-v0.1"
