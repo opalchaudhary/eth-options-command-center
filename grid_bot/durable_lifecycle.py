@@ -2671,23 +2671,30 @@ class DurableGridBotLifecycle:
         account_risk_state = telemetry.as_dict()
 
         product_id = int(run["product"]["product_id"])
+        edit_state = run.get("edit_state") or {}
+        config_already_persisted = bool(edit_state.get("config_persisted")) and int((run.get("config") or {}).get("config_version") or 0) == int(new_config["config_version"])
         cancelled = 0
-        self._update_lifecycle_progress(
-            run,
-            "EDIT",
-            "CANCELLING_OBSOLETE_ORDERS",
-            message="Editing Grid: cancelling obsolete orders",
-            expected_orders=len([order for order in (run.get("orders") or {}).values() if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"]),
-        )
-        for order in list((run.get("orders") or {}).values()):
-            if order.get("status") in START_TERMINAL_ORDER_STATUSES or order.get("order_kind") == "safety_flatten":
-                continue
-            self._cancel_order_safely(product_id, order)
-            order["superseded_by_config_version"] = new_config["config_version"]
-            cancelled += 1
-            self._update_lifecycle_progress(run, "EDIT", "CANCELLING_OBSOLETE_ORDERS", message=f"Editing Grid: {cancelled} obsolete orders cancelled", cancelled_orders=cancelled)
-        deferred_superseded = self._terminalize_never_submitted_orders(run, status="superseded", reason="edit_grid_new_config")
-        self._save(state)
+        deferred_superseded = 0
+        if not config_already_persisted:
+            self._update_lifecycle_progress(
+                run,
+                "EDIT",
+                "CANCELLING_OBSOLETE_ORDERS",
+                message="Editing Grid: cancelling obsolete orders",
+                expected_orders=len([order for order in (run.get("orders") or {}).values() if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"]),
+            )
+            for order in list((run.get("orders") or {}).values()):
+                if order.get("status") in START_TERMINAL_ORDER_STATUSES or order.get("order_kind") == "safety_flatten":
+                    continue
+                self._cancel_order_safely(product_id, order)
+                order["superseded_by_config_version"] = new_config["config_version"]
+                cancelled += 1
+                self._update_lifecycle_progress(run, "EDIT", "CANCELLING_OBSOLETE_ORDERS", message=f"Editing Grid: {cancelled} obsolete orders cancelled", cancelled_orders=cancelled)
+            deferred_superseded = self._terminalize_never_submitted_orders(run, status="superseded", reason="edit_grid_new_config")
+            self._save(state)
+        else:
+            cancelled = int(edit_state.get("cancelled_orders") or 0)
+            deferred_superseded = int(edit_state.get("deferred_superseded") or 0)
 
         state = self._load()
         latest = state.get("runs", {}).get(run["run_id"])
