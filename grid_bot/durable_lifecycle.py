@@ -603,6 +603,32 @@ class DurableGridBotLifecycle:
         temporary_markers = ("timeout", "timed out", "429", "too many", "temporar", "connection", "network", "502", "503", "504")
         return any(marker in text for marker in temporary_markers)
 
+    def _defer_if_stale_post_only_rejection(
+        self,
+        run: dict,
+        product_id: int,
+        proposal: OrderProposal,
+        order_kind: str,
+        exc: Exception,
+        *,
+        source_fill_id: str | None = None,
+    ) -> dict | None:
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) != 400:
+            return None
+        try:
+            symbol = run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD"
+            fresh_spec = self.client.product_spec(symbol)
+            normalized_price = round_price_for_side(proposal.price, fresh_spec.tick_size, proposal.side)
+            post_only = validate_post_only_price(proposal.side, normalized_price, fresh_spec.best_bid, fresh_spec.best_ask)
+        except Exception:
+            return None
+        if post_only.allowed:
+            return None
+        reasons = [*post_only.reason_codes, "EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE"]
+        self._record_lifecycle_retry(run, str(exc), 0)
+        return self._defer_proposal(run, proposal, order_kind, reasons, normalized_price, source_fill_id)
+
     def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
         completeness = self._deployment_completeness(run, reconciliation)
         run["deployment_completeness"] = completeness
@@ -1619,6 +1645,16 @@ class DurableGridBotLifecycle:
                     attempt=attempt,
                     temporary=self._is_temporary_exchange_error(exc),
                 )
+                stale_post_only = self._defer_if_stale_post_only_rejection(
+                    run,
+                    product_id,
+                    proposal,
+                    order_kind,
+                    exc,
+                    source_fill_id=source_fill_id,
+                )
+                if stale_post_only:
+                    return stale_post_only
                 last_error = exc
                 if not self._is_temporary_exchange_error(exc) or attempt >= max(1, LIFECYCLE_RETRY_ATTEMPTS):
                     break

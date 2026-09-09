@@ -501,6 +501,38 @@ class _FakeLifecycleClient:
         return {"success": True, "result": {"symbol": symbol, "mark_price": "2500", "spot_price": "2500"}}
 
 
+class _PostOnlyReject(Exception):
+    def __init__(self):
+        super().__init__("400 Client Error: Bad Request for url: /orders")
+        self.response = type("Response", (), {"status_code": 400, "text": "post_only order would be taker"})()
+
+
+class _StartBookMoveClient(_FakeLifecycleClient):
+    def __init__(self):
+        super().__init__()
+        self.rejected_once = False
+
+    def product_spec(self, symbol):
+        spec = super().product_spec(symbol)
+        if self.rejected_once:
+            return ProductSpec(
+                **{
+                    **spec.__dict__,
+                    "mark_price": Decimal("2424"),
+                    "last_price": Decimal("2424"),
+                    "best_bid": Decimal("2423.95"),
+                    "best_ask": Decimal("2424.05"),
+                }
+            )
+        return spec
+
+    def place_order(self, payload):
+        if not self.rejected_once and payload["post_only"] and payload["side"] == "buy":
+            self.rejected_once = True
+            raise _PostOnlyReject()
+        return super().place_order(payload)
+
+
 class _FlattenFillsClient(_FakeLifecycleClient):
     def __init__(self, flatten_chunks=None):
         super().__init__()
@@ -607,6 +639,22 @@ def test_durable_lifecycle_pause_resume_regrid_stop_summary(tmp_path):
     assert summary["immutable"] is True
     assert summary["stray_gridbot_orders"] == 0
     assert DurableGridBotLifecycle(client, lifecycle.state_path).status()["active_run_id"] is None
+
+
+def test_start_defers_stale_post_only_rejection_after_book_move(tmp_path):
+    client = _StartBookMoveClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json")
+
+    started = lifecycle.start_operator_grid(_edit_payload())
+    run = started["run"]
+
+    assert run["status"] == "RUNNING"
+    assert len(run["deferred_orders"]) == 1
+    deferred = next(iter(run["deferred_orders"].values()))
+    assert deferred["status"] == "deferred"
+    assert "EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE" in deferred["rejection_reason"]
+    assert run["deployment_completeness"]["complete"] is True
+    assert run["deployment_completeness"]["deferred"] == 1
 
 
 def _edit_payload(**updates):
