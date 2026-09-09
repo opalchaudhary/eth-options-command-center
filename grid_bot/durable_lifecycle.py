@@ -1719,8 +1719,9 @@ class DurableGridBotLifecycle:
         if run.get("status") != GridStatus.RESUMING.value:
             return None
         progress = run.get("lifecycle_progress") or {}
-        started_at = _utc_datetime(progress.get("started_at") or run.get("status_updated_at") or run.get("updated_at"))
-        last_progress_at = _utc_datetime(progress.get("last_progress_at") or run.get("updated_at"))
+        resume_progress = str(progress.get("operation") or "").upper() == "RESUME"
+        started_at = _utc_datetime((progress.get("started_at") if resume_progress else None) or run.get("status_updated_at") or run.get("updated_at"))
+        last_progress_at = _utc_datetime((progress.get("last_progress_at") if resume_progress else None) or run.get("status_updated_at") or run.get("updated_at"))
         now = datetime.now(timezone.utc)
         if started_at and (now - started_at).total_seconds() > RESUME_MAX_SECONDS:
             return "resume_elapsed_budget_exhausted"
@@ -2553,6 +2554,14 @@ class DurableGridBotLifecycle:
                     return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run.get("summary") or {})}
                 if run.get("status") != GridStatus.RESUMING.value:
                     return {"ok": True, "run": deepcopy(run), "reconciliation": reconciliation}
+                budget_reason = self._resume_budget_exhausted(run)
+                if budget_reason:
+                    return self._resume_blocked(
+                        state,
+                        run,
+                        budget_reason,
+                        {"lifecycle_progress": deepcopy(run.get("lifecycle_progress") or {})},
+                    )
                 existing_open = [
                     order
                     for order in run.get("orders", {}).values()
@@ -2590,6 +2599,14 @@ class DurableGridBotLifecycle:
                         retry_wait_seconds=(run.get("lifecycle_retry") or {}).get("backoff_seconds", 0),
                     )
                     self._save(state)
+                    budget_reason = self._resume_budget_exhausted(run)
+                    if budget_reason:
+                        return self._resume_blocked(
+                            state,
+                            run,
+                            budget_reason,
+                            {"lifecycle_progress": deepcopy(run.get("lifecycle_progress") or {})},
+                        )
         except Exception as exc:
             return self._resume_blocked(state, run, "placement_failed", {"error": str(exc)[:500]})
 
@@ -2602,6 +2619,14 @@ class DurableGridBotLifecycle:
             return self.stop(run["run_id"], reason=run.get("stop_reason") or "stop_preempted_resume")
         if run.get("status") == GridStatus.STOPPED.value:
             return {"ok": True, "run": deepcopy(run), "summary": deepcopy(run.get("summary") or {})}
+        budget_reason = self._resume_budget_exhausted(run)
+        if budget_reason:
+            return self._resume_blocked(
+                state,
+                run,
+                budget_reason,
+                {"lifecycle_progress": deepcopy(run.get("lifecycle_progress") or {}), "reconciliation": verified.get("reconciliation") or {}},
+            )
         errors = verified["reconciliation"].get("errors") or []
         unresolved = int(verified["reconciliation"].get("unresolved_orders") or 0)
         mismatches = int(verified["reconciliation"].get("position_mismatches") or 0)

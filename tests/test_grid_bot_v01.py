@@ -1576,6 +1576,31 @@ def test_resume_no_progress_budget_pauses_and_cleans_partial_deployment(tmp_path
     assert client.open_orders(1699)["result"] == []
 
 
+def test_resume_budget_ignores_stale_non_resume_progress(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run_id = lifecycle.start_tiny_grid()["run"]["run_id"]
+    lifecycle.pause(run_id)
+    state = lifecycle._load()
+    run = state["runs"][run_id]
+    run["status"] = GridStatus.RESUMING.value
+    run["status_updated_at"] = utc_now()
+    run["updated_at"] = run["status_updated_at"]
+    run["lifecycle_progress"] = {
+        "operation": "PAUSE",
+        "stage": "PAUSED",
+        "started_at": "2020-01-01T00:00:00+00:00",
+        "last_progress_at": "2020-01-01T00:00:00+00:00",
+    }
+    lifecycle._save(state)
+
+    resumed = DurableGridBotLifecycle(client, lifecycle.state_path, use_supabase=False).resume(run_id)
+
+    assert resumed["run"]["status"] == GridStatus.RUNNING.value
+    assert resumed["run"]["deployment_completeness"]["complete"] is True
+    assert not any(event["event_type"] == "GRID_RUN_RESUME_BLOCKED" for event in resumed["run"].get("events", []))
+
+
 def test_resume_external_partial_reduction_pauses_without_fake_fills_or_replacements(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
