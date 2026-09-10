@@ -513,6 +513,21 @@ class _DeterministicDelta400(Exception):
         self.response = type("Response", (), {"status_code": 400, "text": body})()
 
 
+class _ImmediateExecutionPostOnly400(Exception):
+    def __init__(self):
+        super().__init__("400 Client Error: Bad Request for url: /orders")
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "bad_request",
+                    "message": "Order cancelled because it would immediately execute as post-only.",
+                    "context": {"cancellation_reason": "immediate_execution_post_only"},
+                }
+            }
+        )
+        self.response = type("Response", (), {"status_code": 400, "text": body})()
+
+
 class _StartBookMoveClient(_FakeLifecycleClient):
     def __init__(self):
         super().__init__()
@@ -663,6 +678,50 @@ def test_start_defers_stale_post_only_rejection_after_book_move(tmp_path):
     assert run["deployment_completeness"]["deferred"] == 1
 
 
+def test_start_defers_immediate_execution_post_only_without_ambiguity(tmp_path):
+    class ImmediateRejectClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.rejected_once = False
+
+        def place_order(self, payload):
+            if not self.rejected_once and payload["post_only"] and payload["side"] == "buy":
+                self.rejected_once = True
+                raise _ImmediateExecutionPostOnly400()
+            return super().place_order(payload)
+
+    client = ImmediateRejectClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json")
+
+    started = lifecycle.start_operator_grid(_edit_payload())
+    run = started["run"]
+    deferred = next(iter(run["deferred_orders"].values()))
+
+    assert run["status"] == "RUNNING"
+    assert len(run["deferred_orders"]) == 1
+    assert deferred["status"] == "deferred"
+    assert "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" in deferred["rejection_reason"]
+    assert "immediate_execution_post_only" in deferred["raw"]["gridbot"]["exchange_error_body"]
+    assert not [order for order in run["orders"].values() if order.get("status") == "ambiguous_submission"]
+    assert run["deployment_completeness"]["complete"] is True
+
+
+def test_unrelated_start_400_is_not_moving_book_deferred(tmp_path):
+    class InvalidQuantityClient(_FakeLifecycleClient):
+        def place_order(self, payload):
+            raise _DeterministicDelta400("invalid quantity")
+
+    client = InvalidQuantityClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json")
+
+    with pytest.raises(_DeterministicDelta400):
+        lifecycle.start_operator_grid(_edit_payload())
+
+    run = next(iter(lifecycle._load()["runs"].values()))
+    assert run["status"] == "ERROR"
+    assert run.get("deferred_orders") == {}
+
+
 def _edit_payload(**updates):
     payload = {
         "grid_type": "neutral",
@@ -706,6 +765,105 @@ def test_edit_grid_parameter_changes_same_run_new_config_version(tmp_path, updat
     assert int(edited["run"]["config"]["config_version"]) == 2
     for key, value in updates.items():
         assert str(edited["run"]["config"][key]) == str(value)
+
+
+def test_edit_historical_post_only_immediate_execution_defers_l015_buy(tmp_path):
+    class HistoricalEditClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.rejected = False
+
+        def product_spec(self, symbol):
+            spec = super().product_spec(symbol)
+            return ProductSpec(
+                **{
+                    **spec.__dict__,
+                    "mark_price": Decimal("2466.80"),
+                    "last_price": Decimal("2466.80"),
+                    "best_bid": Decimal("2466.75"),
+                    "best_ask": Decimal("2466.85"),
+                }
+            )
+
+        def place_order(self, payload):
+            if (
+                not self.rejected
+                and payload.get("side") == "buy"
+                and Decimal(str(payload.get("limit_price"))) == Decimal("2461.95")
+                and Decimal(str(payload.get("size"))) == Decimal("5")
+                and "-L015-B-" in payload.get("client_order_id", "")
+            ):
+                self.rejected = True
+                raise _ImmediateExecutionPostOnly400()
+            return super().place_order(payload)
+
+    client = HistoricalEditClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(
+        _edit_payload(
+            lower_price="2266.80",
+            upper_price="2666.80",
+            grid_count=40,
+            lot_size="10",
+            max_inventory_lots="300",
+        )
+    )["run"]
+
+    edited = lifecycle.edit_grid(
+        run["run_id"],
+        {
+            "lower_price": "2326.80",
+            "upper_price": "2606.80",
+            "grid_count": 30,
+            "lot_size": "5",
+            "max_inventory_lots": "300",
+        },
+        reason="historical_l015_post_only_race",
+    )
+    deferred = [
+        order
+        for order in edited["run"].get("deferred_orders", {}).values()
+        if order.get("level_id") == "L015" and order.get("config_version") == 2
+    ]
+
+    assert client.rejected is True
+    assert edited["ok"] is True
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert deferred
+    assert deferred[0]["side"] == "buy"
+    assert deferred[0]["price"] == "2461.95"
+    assert deferred[0]["requested_quantity"] == "5"
+    assert "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" in deferred[0]["rejection_reason"]
+    assert not [order for order in edited["run"]["orders"].values() if order.get("status") == "ambiguous_submission"]
+
+
+def test_resume_defers_immediate_execution_post_only_and_reaches_running(tmp_path):
+    class ResumeRejectClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.reject_resume = False
+            self.rejected = False
+
+        def place_order(self, payload):
+            if self.reject_resume and not self.rejected and payload.get("post_only"):
+                self.rejected = True
+                raise _ImmediateExecutionPostOnly400()
+            return super().place_order(payload)
+
+    client = ResumeRejectClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+    lifecycle.pause(run["run_id"])
+    client.reject_resume = True
+
+    resumed = lifecycle.resume(run["run_id"])
+
+    assert client.rejected is True
+    assert resumed["run"]["status"] == GridStatus.RUNNING.value
+    assert len(resumed["run"]["deferred_orders"]) == 1
+    assert "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" in next(iter(resumed["run"]["deferred_orders"].values()))["rejection_reason"]
+    assert not [order for order in resumed["run"]["orders"].values() if order.get("status") == "ambiguous_submission"]
 
 
 def test_edit_preview_is_non_mutating(tmp_path):
@@ -3341,6 +3499,74 @@ def test_replacement_retry_terminalizes_old_attempts_after_ten_deterministic_rej
     assert current[0]["status"] == "open"
     assert len([order for order in replacement_orders if order.get("status") == "retried"]) == 10
     assert not [order for order in replacement_orders if order.get("status") == "ambiguous_submission"]
+
+
+def test_replacement_immediate_execution_post_only_defers_without_ambiguity(tmp_path):
+    class ReplacementRejectClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.rejected = False
+
+        def place_order(self, payload):
+            if not self.rejected and payload.get("client_order_id", "").startswith("DGB01-"):
+                self.rejected = True
+                raise _ImmediateExecutionPostOnly400()
+            return super().place_order(payload)
+
+    client = ReplacementRejectClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-replacement-race")
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "1"})
+    deferred = [order for order in run["deferred_orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert result["deferred"] == 1
+    assert result["created"] == 0
+    assert len(deferred) == 1
+    assert deferred[0]["current_retry_attempt"] is True
+    assert "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" in deferred[0]["rejection_reason"]
+    assert not [order for order in run["orders"].values() if order.get("status") == "ambiguous_submission"]
+    assert client.orders == []
+
+
+def test_repeated_replacement_immediate_execution_post_only_is_bounded_and_auditable(tmp_path):
+    class RejectThenAcceptClient(_FakeLifecycleClient):
+        def __init__(self, rejects):
+            super().__init__()
+            self.rejects = rejects
+
+        def place_order(self, payload):
+            if payload.get("client_order_id", "").startswith("DGB01-") and self.rejects:
+                self.rejects -= 1
+                raise _ImmediateExecutionPostOnly400()
+            return super().place_order(payload)
+
+    client = RejectThenAcceptClient(10)
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L002", source_side="buy", fill_id="fill-post-only-10", fill_size="10")
+    source_order_id = next(order["client_order_id"] for order in run["orders"].values() if order.get("order_kind") == "initial_grid")
+    run["orders"][source_order_id]["requested_quantity"] = "10"
+
+    for _ in range(10):
+        result = lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
+        assert result["deferred"] == 1
+        assert len([order for order in run["deferred_orders"].values() if order.get("current_retry_attempt")]) == 1
+
+    accepted = lifecycle.process_replacements(run, {"gridbot_inventory": "10"})
+    replacement_orders = [order for order in run["orders"].values() if order.get("order_kind") == "replacement"]
+    current = [order for order in replacement_orders if order.get("current_retry_attempt")]
+
+    assert len(run["replacement_entitlements"]) == 1
+    assert accepted["created"] == 1
+    assert len(client.orders) == 1
+    assert len(current) == 1
+    assert current[0]["status"] == "open"
+    assert len([order for order in replacement_orders if order.get("status") == "retried"]) == 10
+    assert not [order for order in replacement_orders if order.get("status") == "ambiguous_submission"]
+    assert all(
+        "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" in order.get("rejection_reason", "") or order.get("status") == "open"
+        for order in replacement_orders
+    )
 
 
 def test_concurrent_replacement_processing_submits_one_current_order(tmp_path):

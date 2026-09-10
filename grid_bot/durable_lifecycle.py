@@ -130,6 +130,14 @@ def _classify_exchange_rejection(exc: Exception) -> str | None:
     return "EXCHANGE_DETERMINISTIC_REJECTION"
 
 
+def _is_immediate_execution_post_only_rejection(exc: Exception) -> bool:
+    if _exchange_error_status(exc) != 400:
+        return False
+    body = _safe_exchange_error_body(exc).lower()
+    text = f"{str(exc).lower()} {body}"
+    return "immediate_execution_post_only" in text
+
+
 def _result_rows(payload: dict | None) -> list[dict]:
     result = (payload or {}).get("result") or []
     return result if isinstance(result, list) else []
@@ -657,18 +665,46 @@ class DurableGridBotLifecycle:
         response = getattr(exc, "response", None)
         if getattr(response, "status_code", None) != 400:
             return None
+        exact_immediate_execution = _is_immediate_execution_post_only_rejection(exc)
         try:
             symbol = run.get("product", {}).get("symbol") or run.get("config", {}).get("product_symbol") or "ETHUSD"
             fresh_spec = self.client.product_spec(symbol)
             normalized_price = round_price_for_side(proposal.price, fresh_spec.tick_size, proposal.side)
             post_only = validate_post_only_price(proposal.side, normalized_price, fresh_spec.best_bid, fresh_spec.best_ask)
         except Exception:
+            if not exact_immediate_execution:
+                return None
+            normalized_price = proposal.price
+            post_only = None
+        if not exact_immediate_execution and post_only.allowed:
             return None
-        if post_only.allowed:
-            return None
-        reasons = [*post_only.reason_codes, "EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE"]
+        reasons = [
+            *((post_only.reason_codes if post_only else []) or []),
+            "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" if exact_immediate_execution else "EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE",
+        ]
+        if exact_immediate_execution:
+            reasons.append("EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE")
+        context = {
+            "deterministic_exchange_rejection": True,
+            "exchange_error_status": _exchange_error_status(exc),
+            "exchange_error_code": "EXCHANGE_POST_ONLY_IMMEDIATE_EXECUTION" if exact_immediate_execution else "EXCHANGE_POST_ONLY_REJECTED_AFTER_BOOK_MOVE",
+            "exchange_error_body": _safe_exchange_error_body(exc),
+            "request_operation": order_kind,
+            "level_id": proposal.level_id,
+            "side": proposal.side.value,
+            "price": str(proposal.price),
+            "normalized_price": str(normalized_price),
+            "quantity": str(proposal.quantity),
+        }
+        self._record_lifecycle_timing(
+            run,
+            str(run.get("lifecycle_progress", {}).get("operation") or order_kind).upper(),
+            "post_only_moving_book_deferred",
+            0,
+            **context,
+        )
         self._record_lifecycle_retry(run, str(exc), 0)
-        return self._defer_proposal(run, proposal, order_kind, reasons, normalized_price, source_fill_id)
+        return self._defer_proposal(run, proposal, order_kind, reasons, normalized_price, source_fill_id, raw_gridbot=context)
 
     def _assert_deployment_complete(self, state: dict, run: dict, reconciliation: dict, operation: str) -> dict:
         completeness = self._deployment_completeness(run, reconciliation)
