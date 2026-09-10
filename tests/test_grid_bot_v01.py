@@ -4432,6 +4432,58 @@ def test_continuous_worker_recovers_same_run_when_persisted_status_changes(tmp_p
     assert db.stats()["select"] > 2
 
 
+def test_continuous_worker_advances_persisted_edit_after_client_disconnect(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_operator_grid(_edit_payload())["run"]
+    run_id = started["run_id"]
+
+    state = lifecycle._load()
+    run = state["runs"][run_id]
+    old_config = dict(run["config"])
+    target_config = {**old_config, "config_version": int(old_config["config_version"]) + 1, "grid_count": 6}
+    run["status"] = GridStatus.EDITING.value
+    run["status_updated_at"] = utc_now()
+    run["updated_at"] = utc_now()
+    run["edit_state"] = {
+        "operation_id": f"edit-{run_id}-1-2-worker-recovery",
+        "previous_status": GridStatus.RUNNING.value,
+        "from_config_version": int(old_config["config_version"]),
+        "to_config_version": int(target_config["config_version"]),
+        "fingerprint": [],
+        "stage": "FREEZE_PLACEMENT",
+        "reason": "client_disconnected_unit",
+        "started_at": utc_now(),
+        "source_config": old_config,
+        "target_config": target_config,
+        "config_persisted": False,
+    }
+    lifecycle._save(state)
+
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        recovered = None
+        while time.monotonic() < deadline:
+            recovered = db.load_run_state(run_id)
+            if recovered.get("status") in {GridStatus.RUNNING.value, GridStatus.PAUSED.value} and int(recovered["config"]["config_version"]) == 2:
+                break
+            time.sleep(0.05)
+    finally:
+        worker.stop()
+
+    assert recovered is not None
+    assert recovered["status"] in {GridStatus.RUNNING.value, GridStatus.PAUSED.value}
+    assert int(recovered["config"]["config_version"]) == 2
+    assert recovered.get("edit_state") is None
+    if recovered["status"] == GridStatus.RUNNING.value:
+        assert len(client.open_orders()["result"]) > 0
+    else:
+        assert len(client.open_orders()["result"]) == 0
+
+
 def test_supabase_order_source_fill_fallback_preserves_raw_link():
     class MissingSourceFillColumnRepository(_MemorySupabaseGridRepository):
         def upsert(self, table, payload, on_conflict=None):

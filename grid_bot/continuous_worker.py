@@ -20,7 +20,7 @@ from .supabase_repository import SupabaseGridRepository
 
 logger = logging.getLogger(__name__)
 
-EXECUTABLE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value}
+EXECUTABLE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.EDITING.value}
 POLL_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_POLL_SECONDS", "2"))
 SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS", "300"))
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
@@ -283,6 +283,35 @@ class ContinuousGridBotWorker:
                             run_id=recovered_run.get("run_id"),
                             last_poll_at=utc_now(),
                             last_error=(recovered_run.get("startup") or {}).get("last_error"),
+                            known_order_count=len(recovered_run.get("orders") or {}),
+                            known_fill_count=len(recovered_run.get("fills") or {}),
+                            open_gridbot_orders=len([
+                                order
+                                for order in (recovered_run.get("orders") or {}).values()
+                                if str(order.get("status") or "").lower() in {"open", "partially_filled", "pending", "submitted", "ambiguous_submission"}
+                            ]),
+                        )
+                        self._update_health(recovered_run, recovery.get("reconciliation") or {})
+                        self._stop.wait(self.poll_interval_seconds)
+                        continue
+                    run = recovered_run
+
+                if run.get("status") == GridStatus.EDITING.value:
+                    recovery = DurableGridBotLifecycle(client=self.client, db=self.db, use_supabase=self.db.enabled).edit_grid(
+                        run["run_id"],
+                        {},
+                        reason=(run.get("edit_state") or {}).get("reason") or "worker_resume_edit",
+                    )
+                    recovered_run = recovery.get("run") or run
+                    with self._lock:
+                        self._run = recovered_run
+                    if recovered_run.get("status") != GridStatus.RUNNING.value:
+                        diagnostics = recovery.get("diagnostics") or recovered_run.get("edit_diagnostics") or {}
+                        self._set_state(
+                            status="waiting",
+                            run_id=recovered_run.get("run_id"),
+                            last_poll_at=utc_now(),
+                            last_error=diagnostics.get("error"),
                             known_order_count=len(recovered_run.get("orders") or {}),
                             known_fill_count=len(recovered_run.get("fills") or {}),
                             open_gridbot_orders=len([
