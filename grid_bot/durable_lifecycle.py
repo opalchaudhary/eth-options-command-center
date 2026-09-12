@@ -1554,6 +1554,14 @@ class DurableGridBotLifecycle:
                 f"unresolved_orders={unresolved}, position_mismatches={mismatches}"
             )
 
+    def _pause_invariant_violated(self, reconciliation: dict) -> bool:
+        return bool(
+            (reconciliation.get("errors") or [])
+            or int(reconciliation.get("exchange_open_orders") or 0)
+            or int(reconciliation.get("unresolved_orders") or 0)
+            or int(reconciliation.get("position_mismatches") or 0)
+        )
+
     def _assert_resume_ready(self, run: dict, reconciliation: dict) -> Decimal:
         errors = reconciliation.get("errors") or []
         unresolved = int(reconciliation.get("unresolved_orders") or 0)
@@ -2724,7 +2732,8 @@ class DurableGridBotLifecycle:
 
     def _editing_blocked(self, state: dict, run: dict, reason: str, diagnostics: dict) -> dict:
         now = utc_now()
-        run["status"] = GridStatus.PAUSED.value
+        reconciliation = (diagnostics or {}).get("reconciliation") or {}
+        run["status"] = GridStatus.EDITING.value if self._pause_invariant_violated(reconciliation) else GridStatus.PAUSED.value
         run["status_updated_at"] = now
         run["updated_at"] = now
         run["edit_diagnostics"] = {"reason": reason, "updated_at": utc_now(), **diagnostics}
@@ -2738,7 +2747,7 @@ class DurableGridBotLifecycle:
         )
         self._event(state, run["run_id"], "GRID_RUN_EDIT_BLOCKED", run["edit_diagnostics"])
         self._save(state)
-        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"])}
+        return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run.get("edit_state") or {})}
 
     def edit_grid(self, run_id: str | None = None, payload: dict | None = None, reason: str = "manual_edit") -> dict:
         lock = self._edit_operation_lock(run_id)
@@ -2987,9 +2996,6 @@ class DurableGridBotLifecycle:
                     if order.get("order_kind") == "edit_grid" and order.get("status") not in START_TERMINAL_ORDER_STATUSES:
                         self._cancel_order_safely(product_id, order)
                 now = utc_now()
-                run["status"] = GridStatus.PAUSED.value
-                run["status_updated_at"] = now
-                run["updated_at"] = now
                 run["edit_state"] = {
                     **(run.get("edit_state") or {}),
                     "stage": "PLACEMENT_FAILED",
@@ -3003,7 +3009,26 @@ class DurableGridBotLifecycle:
                 run["edit_diagnostics"] = {"reason": "placement_failed", "error": str(exc)[:500], "updated_at": now}
                 self._event(state, run["run_id"], "GRID_RUN_EDIT_PLACEMENT_FAILED", run["edit_diagnostics"])
                 self._save(state)
-                return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run["edit_state"])}
+                fallback = self.reconcile(run["run_id"], process_replacements=False, persist_snapshot=True)
+                state = self._load()
+                run = state["runs"][run["run_id"]]
+                diagnostics = {
+                    "reason": "placement_failed",
+                    "error": str(exc)[:500],
+                    "updated_at": utc_now(),
+                    "reconciliation": fallback["reconciliation"],
+                }
+                if self._pause_invariant_violated(fallback["reconciliation"]):
+                    return self._editing_blocked(state, run, "placement_failed", diagnostics)
+                now = utc_now()
+                run["status"] = GridStatus.PAUSED.value
+                run["status_updated_at"] = now
+                run["updated_at"] = now
+                run["edit_diagnostics"] = diagnostics
+                self._update_lifecycle_progress(run, "EDIT", "PAUSED", message="Editing Grid: placement failed after safe pause verification")
+                self._event(state, run["run_id"], "GRID_RUN_EDIT_BLOCKED", run["edit_diagnostics"])
+                self._save(state)
+                return {"ok": False, "run": deepcopy(run), "requires_attention": True, "diagnostics": deepcopy(run["edit_diagnostics"]), "edit": deepcopy(run.get("edit_state") or {})}
         self._save(state)
 
         self._update_lifecycle_progress(run, "EDIT", "VERIFYING_ORDERS", message="Editing Grid: waiting for Delta verification", expected_orders=len(run.get("levels") or []), confirmed_orders=created, cancelled_orders=cancelled)

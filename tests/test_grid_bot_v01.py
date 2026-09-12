@@ -1293,7 +1293,7 @@ def test_restart_after_target_config_persisted_with_stale_flag_does_not_cancel_t
     assert recovered_edit_ids == edit_order_ids
 
 
-def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
+def test_edit_grid_placement_failure_does_not_pause_with_unresolved_submission(tmp_path):
     class FailEditPlacementClient(_FakeLifecycleClient):
         def __init__(self):
             super().__init__()
@@ -1313,8 +1313,9 @@ def test_edit_grid_placement_failure_fails_closed_to_paused(tmp_path):
 
     assert edited["ok"] is False
     assert edited["requires_attention"] is True
-    assert edited["run"]["status"] == GridStatus.PAUSED.value
+    assert edited["run"]["status"] == GridStatus.EDITING.value
     assert edited["edit"]["stage"] == "PLACEMENT_FAILED"
+    assert edited["diagnostics"]["reconciliation"]["unresolved_orders"] == 1
     assert client.open_orders(1699)["result"] == []
 
 
@@ -5195,6 +5196,80 @@ def test_stale_unresolved_order_is_reconciled_from_delta_cancel_history(tmp_path
     assert updated["status"] == "manual_cancelled"
     assert updated["remaining_quantity"] == "0"
     assert reconciled["reconciliation"]["unresolved_orders"] == 0
+
+
+def test_edit_placement_failure_does_not_finalize_paused_with_open_orders(tmp_path):
+    class FailedEditFallbackClient(_FakeLifecycleClient):
+        def __init__(self):
+            super().__init__()
+            self.edit_orders_seen = 0
+
+        def place_order(self, payload):
+            if str(payload.get("client_order_id") or "").endswith("-E2"):
+                self.edit_orders_seen += 1
+                if self.edit_orders_seen == 3:
+                    raise _DeterministicDelta400("invalid parameter")
+            return super().place_order(payload)
+
+        def cancel_order(self, product_id, order_id):
+            self.cancelled.append(str(order_id))
+            for row in self.orders:
+                if str(row["id"]) == str(order_id) and not str(row.get("client_order_id") or "").endswith("-E2"):
+                    row["state"] = "cancelled"
+                    row["unfilled_size"] = "0"
+            return {"success": True, "result": {"id": order_id, "state": "cancelled"}}
+
+    client = FailedEditFallbackClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    edited = lifecycle.edit_grid(run["run_id"], {"grid_count": 6}, reason="unit_edit_failure")
+
+    assert edited["ok"] is False
+    assert edited["run"]["status"] == "EDITING"
+    assert edited["diagnostics"]["reconciliation"]["exchange_open_orders"] > 0
+    assert any(order["state"] == "open" and str(order.get("client_order_id") or "").endswith("-E2") for order in client.orders)
+
+
+def test_paused_worker_reconciles_transition_fill_without_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _MemorySupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", db=db, use_supabase=True)
+    run = lifecycle.start_tiny_grid()["run"]
+    order = next(iter(run["orders"].values()))
+    exchange = next(row for row in client.orders if row["client_order_id"] == order["client_order_id"])
+    exchange["state"] = "closed"
+    exchange["unfilled_size"] = "0"
+    client.fill_rows = [
+        {
+            "id": "fill-paused-transition",
+            "order_id": exchange["id"],
+            "client_order_id": order["client_order_id"],
+            "side": order["side"],
+            "price": order["price"],
+            "size": "1",
+            "created_at": utc_now(),
+        }
+    ]
+    client.position_size = "1" if order["side"] == "buy" else "-1"
+    state = lifecycle._load()
+    paused_run = state["runs"][run["run_id"]]
+    paused_run["status"] = GridStatus.PAUSED.value
+    lifecycle._save(state)
+
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    result = worker._poll_paused_once(paused_run)
+
+    fills = list(db.tables["grid_fills"].values())
+    replacements = [row for row in db.tables.get("grid_orders", {}).values() if row.get("order_kind") == "replacement"]
+    assert result["new_fills"] == 1
+    assert result["gridbot_inventory"] == client.position_size
+    assert result["delta_position"] == client.position_size
+    assert result["position_mismatches"] == 0
+    assert result["unresolved_orders"] == 0
+    assert len([fill for fill in fills if fill["exchange_fill_id"] == "fill-paused-transition"]) == 1
+    assert paused_run["orders"][order["client_order_id"]]["status"] == "filled"
+    assert replacements == []
 
 
 def test_gridbot_health_reports_healthy_running_state(tmp_path):

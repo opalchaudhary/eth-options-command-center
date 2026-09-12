@@ -21,6 +21,8 @@ from .supabase_repository import SupabaseGridRepository
 logger = logging.getLogger(__name__)
 
 EXECUTABLE_STATUSES = {GridStatus.STARTING.value, GridStatus.RUNNING.value, GridStatus.EDITING.value}
+PAUSED_RECONCILE_STATUSES = {GridStatus.PAUSED.value}
+WORKER_ACTIVE_STATUSES = EXECUTABLE_STATUSES | PAUSED_RECONCILE_STATUSES
 POLL_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_POLL_SECONDS", "2"))
 SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_SNAPSHOT_SECONDS", "300"))
 ACTIVE_RUN_REFRESH_SECONDS = float(os.getenv("GRIDBOT_V01_WORKER_ACTIVE_REFRESH_SECONDS", "10"))
@@ -243,7 +245,7 @@ class ContinuousGridBotWorker:
             return self._run
         now = time.monotonic()
         run = self._run
-        if run and run.get("status") in EXECUTABLE_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
+        if run and run.get("status") in WORKER_ACTIVE_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
             return run
         self._last_active_refresh_monotonic = now
         active = self.db.active_run()
@@ -255,7 +257,7 @@ class ContinuousGridBotWorker:
             run
             and active.get("run_id") == run.get("run_id")
             and active.get("status") == run.get("status")
-            and active.get("status") in EXECUTABLE_STATUSES
+            and active.get("status") in WORKER_ACTIVE_STATUSES
         ):
             return run
         return self._recover_active_run()
@@ -267,9 +269,39 @@ class ContinuousGridBotWorker:
             started = time.monotonic()
             try:
                 run = self._refresh_active_run_if_due()
-                if not run or run.get("status") not in EXECUTABLE_STATUSES:
+                if not run or run.get("status") not in WORKER_ACTIVE_STATUSES:
                     self._set_idle_state()
                     self._stop.wait(self.poll_interval_seconds)
+                    continue
+
+                if run.get("status") == GridStatus.PAUSED.value:
+                    result = self._poll_paused_once(run)
+                    duration = time.monotonic() - started
+                    poll_count = self._state["poll_count"] + 1
+                    previous_average = _decimal(self._state.get("average_loop_duration_seconds"), "0")
+                    average = duration if poll_count == 1 else ((float(previous_average) * (poll_count - 1)) + duration) / poll_count
+                    self._set_state(
+                        status="waiting",
+                        poll_count=poll_count,
+                        successful_polls=self._state["successful_polls"] + 1,
+                        last_poll_at=utc_now(),
+                        last_successful_poll_at=utc_now(),
+                        last_successful_reconcile=run.get("last_reconciled_at"),
+                        last_loop_duration_seconds=round(duration, 4),
+                        average_loop_duration_seconds=round(average, 4),
+                        last_error=None,
+                        fill_derived_inventory=result.get("gridbot_inventory"),
+                        delta_position=result.get("delta_position"),
+                        open_gridbot_orders=result.get("exchange_open_orders"),
+                        known_fill_count=len(run.get("fills") or {}),
+                        known_order_count=len(run.get("orders") or {}),
+                        replacement_count=len(run.get("replacement_keys") or {}),
+                        deferred_replacement_count=len(run.get("deferred_orders") or {}),
+                        position_mismatches=result.get("position_mismatches"),
+                        fill_ledger_mismatches=result.get("fill_ledger_mismatches"),
+                    )
+                    elapsed = time.monotonic() - started
+                    self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
                     continue
 
                 if run.get("status") == GridStatus.STARTING.value:
@@ -443,6 +475,51 @@ class ContinuousGridBotWorker:
                 "replacements": replacement_result,
                 "account_risk_state": telemetry.as_dict(),
                 "snapshot_reason": "periodic_or_material_change",
+            }
+            run.setdefault("risk_snapshots", []).append(risk)
+            persisted = self.db.persist_snapshot(run, risk, run.get("summary"))
+            self._last_snapshot_monotonic = time.monotonic()
+            self._last_snapshot_signature = signature
+            if persisted is not False:
+                self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
+        self._set_state(
+            account_risk_state=telemetry.as_dict(),
+            accounting=build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=telemetry.position_lots).as_dict(),
+            account_telemetry_refresh_count=self._state["account_telemetry_refresh_count"] + (1 if telemetry_refreshed else 0),
+            delta_account_telemetry_request_counts=dict(self.account_telemetry.request_counts),
+            replacement_aggregation_metrics=replacement_result.get("metrics") or {},
+        )
+        with self._lock:
+            self._run = run
+        self._update_health(run, result)
+        return result
+
+    def _poll_paused_once(self, run: dict) -> dict:
+        before_fills = set((run.get("fills") or {}).keys())
+        result = reconcile_exchange_truth(run, self.client, self.db if self.db.enabled else None, persist_order_updates=True)
+        before_telemetry_counts = dict(self.account_telemetry.request_counts)
+        telemetry = self.account_telemetry.get("ETHUSD")
+        telemetry_refreshed = dict(self.account_telemetry.request_counts) != before_telemetry_counts
+        new_fill_ids = [fill_id for fill_id in (run.get("fills") or {}) if fill_id not in before_fills]
+        if new_fill_ids:
+            self._set_state(last_fill={"fill_id": new_fill_ids[-1], "raw": (run.get("fills") or {}).get(new_fill_ids[-1])})
+        replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "run_paused"}], "metrics": {}}
+        signature = self._snapshot_signature(run, result, replacement_result, telemetry)
+        should_snapshot = bool(new_fill_ids) or self._snapshot_materially_changed(signature)
+        if time.monotonic() - self._last_snapshot_monotonic >= self.snapshot_interval_seconds:
+            should_snapshot = True
+        if self.db.enabled and should_snapshot:
+            risk = {
+                "created_at": utc_now(),
+                "position": result.get("delta_position"),
+                "gridbot_inventory": result.get("gridbot_inventory"),
+                "open_gridbot_orders": result.get("exchange_open_orders"),
+                "position_mismatches": result.get("position_mismatches"),
+                "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
+                "reconciliation": result,
+                "replacements": replacement_result,
+                "account_risk_state": telemetry.as_dict(),
+                "snapshot_reason": "paused_reconcile",
             }
             run.setdefault("risk_snapshots", []).append(risk)
             persisted = self.db.persist_snapshot(run, risk, run.get("summary"))
