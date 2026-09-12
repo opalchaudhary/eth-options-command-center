@@ -9,17 +9,14 @@ from urllib.parse import urlencode, urlparse
 import requests
 
 from .config import (
-    PRIVATE_WS_URL,
-    PUBLIC_WS_URL,
-    REST_URL,
-    TESTNET_API_KEY,
-    TESTNET_API_SECRET,
-    TestnetEndpointConfig,
-    validate_testnet_endpoints,
+    DeltaEndpointConfig,
+    endpoint_config_for_environment,
+    gridbot_credentials,
+    validate_delta_endpoints,
 )
 from .models import ProductSpec
 
-USER_AGENT = "deltaforge-gridbot-v0.1-testnet"
+USER_AGENT = "deltaforge-gridbot-v0.1"
 
 
 def _safe_decimal(value: Any, default: str = "0") -> Decimal:
@@ -34,22 +31,35 @@ def _safe_decimal(value: Any, default: str = "0") -> Decimal:
 class DeltaTestnetClient:
     def __init__(
         self,
-        api_key: str = TESTNET_API_KEY,
-        api_secret: str = TESTNET_API_SECRET,
-        endpoints: TestnetEndpointConfig | None = None,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        endpoints: DeltaEndpointConfig | None = None,
+        environment: str | None = None,
         session: requests.Session | None = None,
     ):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.endpoints = endpoints or TestnetEndpointConfig()
-        validate_testnet_endpoints(self.endpoints)
+        if endpoints is None:
+            self.endpoints = endpoint_config_for_environment(environment)
+        else:
+            endpoint_environment = environment or endpoints.environment
+            self.endpoints = DeltaEndpointConfig(
+                endpoints.rest_url,
+                endpoints.private_ws_url,
+                endpoints.public_ws_url,
+                endpoint_environment,
+            )
+        validate_delta_endpoints(self.endpoints)
+        credential_key, credential_secret = gridbot_credentials(self.endpoints.environment)
+        self.api_key = api_key if api_key is not None else credential_key
+        self.api_secret = api_secret if api_secret is not None else credential_secret
+        self.environment = self.endpoints.environment
         self.rest_url = self.endpoints.rest_url.rstrip("/")
         self.session = session or requests.Session()
 
     def _validate_rest_host(self) -> None:
-        validate_testnet_endpoints(self.endpoints)
-        if (urlparse(self.rest_url).hostname or "") != "cdn-ind.testnet.deltaex.org":
-            raise ValueError("DeltaGridBot execution refused: REST host is not approved Testnet.")
+        validate_delta_endpoints(self.endpoints)
+        approved_host = urlparse(self.endpoints.rest_url).hostname or ""
+        if (urlparse(self.rest_url).hostname or "") != approved_host:
+            raise ValueError(f"DeltaGridBot execution refused: REST host is not approved {self.environment}.")
 
     def _query(self, params: dict | None) -> str:
         cleaned = {k: v for k, v in (params or {}).items() if v not in [None, ""]}
@@ -113,7 +123,7 @@ class DeltaTestnetClient:
         return response.json()
 
     def websocket_auth_payload(self) -> dict:
-        validate_testnet_endpoints(TestnetEndpointConfig(REST_URL, PRIVATE_WS_URL, PUBLIC_WS_URL))
+        validate_delta_endpoints(self.endpoints)
         timestamp = str(int(time.time()))
         signature_data = "GET" + timestamp + "/live"
         signature = hmac.new(self.api_secret.encode("utf-8"), signature_data.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -130,7 +140,7 @@ class DeltaTestnetClient:
         tickers = {item.get("symbol"): item for item in self.get_tickers()}
         product = next((item for item in products if item.get("symbol") == symbol), None)
         if not product:
-            raise ValueError(f"Delta Testnet product not found: {symbol}")
+            raise ValueError(f"Delta {self.environment} product not found: {symbol}")
         ticker = tickers.get(symbol) or {}
         quotes = ticker.get("quotes") or {}
         return ProductSpec(

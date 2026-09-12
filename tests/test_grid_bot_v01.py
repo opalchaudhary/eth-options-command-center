@@ -1,12 +1,27 @@
 from decimal import Decimal
 import json
+import os
 import threading
 import time
 
 import pytest
 
 from grid_bot.accounting import ExchangeCost, build_run_accounting, gross_cycle_pnl, summarize_pnl
-from grid_bot.config import REST_URL, TestnetEndpointConfig, validate_testnet_endpoints
+from grid_bot.config import (
+    LIVE_PRIVATE_WS_URL,
+    LIVE_PUBLIC_WS_URL,
+    LIVE_REST_URL,
+    REST_URL,
+    TESTNET_PRIVATE_WS_URL,
+    TESTNET_PUBLIC_WS_URL,
+    TESTNET_REST_URL,
+    DeltaEndpointConfig,
+    TestnetEndpointConfig,
+    endpoint_config_for_environment,
+    gridbot_credentials,
+    validate_delta_endpoints,
+    validate_testnet_endpoints,
+)
 import grid_bot.continuous_worker as continuous_worker_module
 from grid_bot.continuous_worker import ContinuousGridBotWorker
 from grid_bot.delta_testnet_client import DeltaTestnetClient
@@ -16,13 +31,22 @@ from grid_bot.execution import make_client_order_id
 from grid_bot.exchange_truth import inventory_from_fills, reconcile_exchange_truth
 from grid_bot.health import HealthIssueTracker, evaluate_gridbot_health
 from grid_bot.grid_builder import build_grid_levels, generate_prices, nearest_valid_neutral_range, neutral_grid_balance
-from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType, utc_now
+from grid_bot.models import FillRecord, GridConfig, GridStatus, GridType, ProductSpec, Side, SpacingType, product_metadata, utc_now
 from grid_bot.reconciliation import reconcile_orders
 from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
 from grid_bot.risk import GridRiskController, RiskInputs, RiskState, grid_risk_ratio, inventory_utilisation
 from grid_bot.semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
 from grid_bot.supabase_repository import SupabaseGridRepository, SupabasePersistenceError, _reconstructed_deployment_completeness
+
+
+@pytest.fixture(autouse=True)
+def _explicit_gridbot_testnet_env(monkeypatch):
+    monkeypatch.setenv("GRIDBOT_ENV", "testnet")
+    monkeypatch.setenv("GRIDBOT_TESTNET_API_KEY", "testnet-key")
+    monkeypatch.setenv("GRIDBOT_TESTNET_API_SECRET", "testnet-secret")
+    monkeypatch.delenv("GRIDBOT_LIVE_API_KEY", raising=False)
+    monkeypatch.delenv("GRIDBOT_LIVE_API_SECRET", raising=False)
 
 
 def _config(bot_id="bot_a", grid_type=GridType.NEUTRAL, spacing=SpacingType.ARITHMETIC):
@@ -60,6 +84,92 @@ def test_hard_testnet_endpoint_guard_accepts_only_india_testnet():
 def test_client_construct_rejects_live_execution_hosts():
     with pytest.raises(ValueError):
         DeltaTestnetClient(endpoints=TestnetEndpointConfig(rest_url="https://api.india.delta.exchange"))
+
+
+def test_gridbot_environment_selects_testnet_endpoints(monkeypatch):
+    monkeypatch.setenv("GRIDBOT_ENV", "testnet")
+    endpoints = endpoint_config_for_environment()
+    assert endpoints.environment == "testnet"
+    assert endpoints.rest_url == TESTNET_REST_URL
+    assert endpoints.private_ws_url == TESTNET_PRIVATE_WS_URL
+    assert endpoints.public_ws_url == TESTNET_PUBLIC_WS_URL
+
+
+def test_gridbot_environment_selects_live_endpoints(monkeypatch):
+    monkeypatch.setenv("GRIDBOT_ENV", "live")
+    endpoints = endpoint_config_for_environment()
+    assert endpoints.environment == "live"
+    assert endpoints.rest_url == LIVE_REST_URL
+    assert endpoints.private_ws_url == LIVE_PRIVATE_WS_URL
+    assert endpoints.public_ws_url == LIVE_PUBLIC_WS_URL
+
+
+def test_gridbot_environment_missing_or_invalid_fails_closed(monkeypatch):
+    monkeypatch.delenv("GRIDBOT_ENV", raising=False)
+    with pytest.raises(ValueError, match="GRIDBOT_ENV"):
+        endpoint_config_for_environment()
+    monkeypatch.setenv("GRIDBOT_ENV", "paper")
+    with pytest.raises(ValueError, match="GRIDBOT_ENV"):
+        endpoint_config_for_environment()
+
+
+def test_environment_host_guard_rejects_crossed_hosts():
+    with pytest.raises(ValueError, match="REST endpoint"):
+        validate_delta_endpoints(DeltaEndpointConfig(rest_url=TESTNET_REST_URL, private_ws_url=LIVE_PRIVATE_WS_URL, public_ws_url=LIVE_PUBLIC_WS_URL, environment="live"))
+    with pytest.raises(ValueError, match="REST endpoint"):
+        validate_delta_endpoints(DeltaEndpointConfig(rest_url=LIVE_REST_URL, private_ws_url=TESTNET_PRIVATE_WS_URL, public_ws_url=TESTNET_PUBLIC_WS_URL, environment="testnet"))
+
+
+def test_environment_credentials_are_not_cross_loaded(monkeypatch):
+    monkeypatch.setenv("GRIDBOT_TESTNET_API_KEY", "testnet-key")
+    monkeypatch.setenv("GRIDBOT_TESTNET_API_SECRET", "testnet-secret")
+    monkeypatch.setenv("GRIDBOT_LIVE_API_KEY", "live-key")
+    monkeypatch.setenv("GRIDBOT_LIVE_API_SECRET", "live-secret")
+    monkeypatch.setenv("DELTA_API_KEY", "generic-key")
+    monkeypatch.setenv("DELTA_API_SECRET", "generic-secret")
+
+    assert gridbot_credentials("testnet") == ("testnet-key", "testnet-secret")
+    assert gridbot_credentials("live") == ("live-key", "live-secret")
+
+    monkeypatch.delenv("GRIDBOT_LIVE_API_KEY", raising=False)
+    monkeypatch.delenv("GRIDBOT_LIVE_API_SECRET", raising=False)
+    assert gridbot_credentials("live") == ("", "")
+
+
+def test_environment_specific_ethusd_product_metadata(monkeypatch):
+    monkeypatch.setenv("GRIDBOT_ENV", "testnet")
+    assert product_metadata("ETHUSD")["product_id"] == 1699
+    monkeypatch.setenv("GRIDBOT_ENV", "live")
+    assert product_metadata("ETHUSD")["product_id"] == 3136
+
+
+def test_mock_orders_route_only_to_selected_environment(monkeypatch):
+    class Response:
+        def json(self):
+            return {"success": True, "result": {"id": 1}}
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, headers=None, data=None, timeout=None):
+            self.posts.append(url)
+            return Response()
+
+    monkeypatch.setenv("GRIDBOT_LIVE_API_KEY", "live-key")
+    monkeypatch.setenv("GRIDBOT_LIVE_API_SECRET", "live-secret")
+    live_session = Session()
+    live_client = DeltaTestnetClient(environment="live", session=live_session)
+    live_client.place_order({"product_id": 3136, "size": 1})
+    assert live_session.posts == [f"{LIVE_REST_URL}/v2/orders"]
+
+    testnet_session = Session()
+    testnet_client = DeltaTestnetClient(environment="testnet", session=testnet_session)
+    testnet_client.place_order({"product_id": 1699, "size": 1})
+    assert testnet_session.posts == [f"{TESTNET_REST_URL}/v2/orders"]
 
 
 def test_private_post_sends_exact_compact_json_that_was_signed():

@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
+import os
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -83,6 +84,23 @@ class ProductSpec:
 
 
 KNOWN_PRODUCT_METADATA = {
+    "testnet": {
+        "ETHUSD": {
+            "product_id": 1699,
+            "symbol": "ETHUSD",
+            "contract_multiplier": Decimal("0.01"),
+        }
+    },
+    "live": {
+        "ETHUSD": {
+            "product_id": 3136,
+            "symbol": "ETHUSD",
+            "contract_multiplier": Decimal("0.01"),
+        }
+    },
+}
+
+LEGACY_KNOWN_PRODUCT_METADATA = {
     "ETHUSD": {
         "product_id": 1699,
         "symbol": "ETHUSD",
@@ -91,9 +109,17 @@ KNOWN_PRODUCT_METADATA = {
 }
 
 
-def product_metadata(symbol: str = "ETHUSD", product_id: int | str | None = None, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+def product_metadata(
+    symbol: str = "ETHUSD",
+    product_id: int | str | None = None,
+    existing: dict[str, Any] | None = None,
+    environment: str | None = None,
+) -> dict[str, Any]:
     symbol = str(symbol or (existing or {}).get("symbol") or "ETHUSD").upper()
-    known = KNOWN_PRODUCT_METADATA.get(symbol, {})
+    selected_environment = (environment or os.getenv("GRIDBOT_ENV") or "").strip().lower()
+    known = KNOWN_PRODUCT_METADATA.get(selected_environment, {}).get(symbol, {})
+    if not known:
+        known = LEGACY_KNOWN_PRODUCT_METADATA.get(symbol, {})
     metadata = {
         "product_id": product_id or (existing or {}).get("product_id") or known.get("product_id"),
         "symbol": symbol,
