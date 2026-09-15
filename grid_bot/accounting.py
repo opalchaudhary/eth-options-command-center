@@ -587,6 +587,9 @@ def build_run_accounting(
     unrealized = calculate_unrealized_pnl(remaining_lots, remaining_basis, mark_price, contract_multiplier, attribution_clean)
     if unrealized is None and remaining_lots != 0:
         warnings.append("RUN_ACCOUNTING_INCOMPLETE")
+    external_attribution_proven = account_position_lots is not None and attribution_clean and unrealized is not None
+    if external_resolution and external_attribution_proven:
+        warnings = [warning for warning in warnings if warning != "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED"]
     net_realized = gross - realized_trading_fees + funding_net - other_costs + other_credits
     live_net = None if unrealized is None else net_realized + unrealized - open_inventory_trading_fees
     fee_ratio = None if gross <= 0 else trading_fees / gross
@@ -622,7 +625,7 @@ def build_run_accounting(
         maker_fees=maker_fees,
         taker_fees=taker_fees,
         unknown_role_fees=unknown_role_fees,
-        funding_attribution_status=FUNDING_ATTRIBUTED if attribution_clean and not external_resolution else FUNDING_PARTIALLY_ATTRIBUTED,
+        funding_attribution_status=FUNDING_ATTRIBUTED if attribution_clean and (not external_resolution or external_attribution_proven) else FUNDING_PARTIALLY_ATTRIBUTED,
     )
 
 

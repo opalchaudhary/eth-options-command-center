@@ -6269,6 +6269,32 @@ def test_accounting_incomplete_remains_data_quality_degraded_not_attention():
     assert health["operator_attention_required"] is False
 
 
+def test_accounting_external_incident_clears_when_live_position_is_attributed():
+    run = {
+        "run_id": "run-accounting-recovered",
+        "status": GridStatus.RUNNING.value,
+        "product": {"contract_multiplier": "0.01"},
+        "config": {"grid_type": "neutral", "max_inventory_lots": "10"},
+        "orders": {},
+        "fills": {"fill-1": {"id": "fill-1", "side": "buy", "size": "1", "price": "100", "commission": "0.01", "role": "maker", "created_at": "2026-01-01T00:00:00+00:00"}},
+        "external_position_adjustment": {
+            "classification": "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION",
+            "ledger_inventory": "2",
+            "delta_position": "1",
+            "external_adjustment_lots": "-1",
+        },
+    }
+
+    unproven = build_run_accounting(run, mark_price=Decimal("101"), account_position_lots=Decimal("0")).as_dict()
+    proven = build_run_accounting(run, mark_price=Decimal("101"), account_position_lots=Decimal("1")).as_dict()
+
+    assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" in unproven["warnings"]
+    assert unproven["accounting_status"] == "PARTIAL"
+    assert "EXTERNAL_POSITION_CLOSE_UNATTRIBUTED" not in proven["warnings"]
+    assert proven["accounting_status"] == "COMPLETE"
+    assert proven["funding_attribution_status"] == "ATTRIBUTED"
+
+
 def test_continuous_worker_live_state_includes_health_without_no_change_health_writes(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
