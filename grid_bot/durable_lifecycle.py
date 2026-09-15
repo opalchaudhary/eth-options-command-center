@@ -2252,6 +2252,16 @@ class DurableGridBotLifecycle:
             if self._order_represents_replacement_entitlement(order, group_key, group)
             and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
         ]
+        related_deferred = [
+            order
+            for order in list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
+            if order.get("client_order_id") != group.get("source_order_key")
+            and order.get("order_kind") != "safety_flatten"
+            and order.get("level_id") == group.get("target_level_id")
+            and order.get("side") == group.get("target_side")
+            and _decimal(order.get("price")) == _decimal(group.get("target_price"))
+            and str(order.get("status") or "").lower() in DEFERRED_ORDER_STATUSES
+        ]
         if deficit <= 0:
             return {"state": "existing", "replacement_group_key": group_key, "entitlement": str(entitlement), "open": str(open_qty), "filled": str(filled)}
         if related_open:
@@ -2263,6 +2273,17 @@ class DurableGridBotLifecycle:
                 "filled": str(filled),
                 "residual": str(deficit),
                 "reason": "accepted_replacement_order_already_current",
+                "retried_attempts": retried_attempts,
+            }
+        if related_deferred:
+            return {
+                "state": "deferred",
+                "replacement_group_key": group_key,
+                "entitlement": str(entitlement),
+                "open": str(open_qty),
+                "filled": str(filled),
+                "residual": str(deficit),
+                "reason": "target_level_deferred_by_inventory_reservation",
                 "retried_attempts": retried_attempts,
             }
 
