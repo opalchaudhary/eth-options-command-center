@@ -139,10 +139,6 @@ def _reconstructed_deployment_completeness(config: dict, levels: list[dict], ord
         reasons.append("AMBIGUOUS_SUBMISSIONS")
     if counts["terminal"]:
         reasons.append("TERMINAL_INTENDED_ORDERS")
-    expected_sides = {str(level.get("side") or "") for level in levels}
-    if config.get("grid_type") == "neutral" and {"buy", "sell"}.issubset(expected_sides):
-        if buy_valid == 0 or sell_valid == 0:
-            reasons.append("NEUTRAL_DEPLOYMENT_ONE_SIDED")
     return {
         **counts,
         "complete": not reasons,

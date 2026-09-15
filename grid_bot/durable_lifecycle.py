@@ -18,14 +18,11 @@ from .delta_testnet_client import DeltaTestnetClient
 from .execution import make_client_order_id, order_payload
 from .exchange_truth import reconcile_exchange_truth
 from .grid_builder import (
-    NEUTRAL_RANGE_ERROR_MESSAGE,
     NeutralGridRangeValidationError,
     build_grid_levels,
-    neutral_range_invalid_details,
     preview_grid,
     quantize_price,
     validate_grid_config,
-    validate_neutral_grid_suitability,
 )
 from .models import GridConfig, GridStatus, GridType, OrderProposal, Side, SpacingType, new_id, to_record_dict, utc_now
 from .semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
@@ -559,11 +556,6 @@ class DurableGridBotLifecycle:
             reasons.append("UNRESOLVED_EXCHANGE_TRUTH")
         if int(reconciliation.get("position_mismatches") or 0) or int(reconciliation.get("fill_ledger_mismatches") or 0):
             reasons.append("RECONCILIATION_MISMATCH")
-        expected_sides = {str(level.get("side") or "") for level in run.get("levels") or []}
-        grid_type = str((run.get("config") or {}).get("grid_type") or "")
-        if grid_type == GridType.NEUTRAL.value and {Side.BUY.value, Side.SELL.value}.issubset(expected_sides):
-            if buy_valid == 0 or sell_valid == 0:
-                reasons.append("NEUTRAL_DEPLOYMENT_ONE_SIDED")
         complete = not reasons
         return {
             **counts,
@@ -844,12 +836,6 @@ class DurableGridBotLifecycle:
             risk_thresholds=DEFAULT_RISK_THRESHOLDS,
         )
         validate_grid_config(config, spec.min_quantity)
-        try:
-            validate_neutral_grid_suitability(config, reference, spec.tick_size)
-        except ValueError as exc:
-            if str(exc) == NEUTRAL_RANGE_ERROR_MESSAGE:
-                raise NeutralGridRangeValidationError(neutral_range_invalid_details(config, reference, spec.tick_size)) from exc
-            raise
         return config
 
     def preview_operator_grid(self, payload: dict) -> dict:
@@ -1249,7 +1235,14 @@ class DurableGridBotLifecycle:
             terminalized += 1
         return terminalized
 
-    def _terminalize_never_submitted_orders(self, run: dict, status: str = "abandoned_by_stop", reason: str = "run_stop_before_submission") -> int:
+    def _terminalize_never_submitted_orders(
+        self,
+        run: dict,
+        status: str = "abandoned_by_stop",
+        reason: str = "run_stop_before_submission",
+        *,
+        obsolete_before_config_version: int | None = None,
+    ) -> int:
         count = 0
         now = utc_now()
         candidates = list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
@@ -1260,6 +1253,8 @@ class DurableGridBotLifecycle:
                 continue
             seen.add(client_order_id)
             order_status = str(order.get("status") or "").lower()
+            if obsolete_before_config_version is not None and int(order.get("config_version") or 0) >= obsolete_before_config_version:
+                continue
             if order.get("exchange_order_id") or order_status not in DEFERRED_ORDER_STATUSES:
                 continue
             order["status"] = status
@@ -1272,6 +1267,36 @@ class DurableGridBotLifecycle:
                 self.db.persist_order(run, order)
             count += 1
         return count
+
+    def _cancel_obsolete_config_orders(self, run: dict, product_id: int, target_config_version: int) -> int:
+        cancelled = 0
+        obsolete_orders = [
+            order
+            for order in list((run.get("orders") or {}).values())
+            if int(order.get("config_version") or 0) < target_config_version
+            and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
+            and order.get("order_kind") != "safety_flatten"
+        ]
+        if obsolete_orders:
+            self._update_lifecycle_progress(
+                run,
+                "EDIT",
+                "CANCELLING_OBSOLETE_ORDERS",
+                message="Editing Grid: cancelling obsolete orders",
+                expected_orders=len(obsolete_orders),
+            )
+        for order in obsolete_orders:
+            if self._cancel_order_safely(product_id, order):
+                cancelled += 1
+            order["superseded_by_config_version"] = target_config_version
+            self._update_lifecycle_progress(
+                run,
+                "EDIT",
+                "CANCELLING_OBSOLETE_ORDERS",
+                message=f"Editing Grid: {cancelled} obsolete orders cancelled",
+                cancelled_orders=cancelled,
+            )
+        return cancelled
 
     def _open_order_records(self, run: dict) -> list[dict]:
         return [
@@ -2773,10 +2798,15 @@ class DurableGridBotLifecycle:
         health = self.product_account_health(product_symbol)
         spec = self.client.product_spec(product_symbol)
         reference = _decimal(health["market"]["reference_price"] or run.get("reference_price"))
-        previous_status = (run.get("edit_state") or {}).get("previous_status") or run.get("status")
+        edit_state = run.get("edit_state") or {}
+        previous_status = edit_state.get("previous_status") or run.get("status")
         old_config = deepcopy(run.get("config") or {})
-        proposed = self._edit_config_from_payload(run, payload, spec, reference, health)
-        new_config = to_record_dict(proposed)
+        if run.get("status") == GridStatus.EDITING.value and edit_state.get("target_config"):
+            old_config = deepcopy(edit_state.get("source_config") or old_config)
+            new_config = deepcopy(edit_state["target_config"])
+        else:
+            proposed = self._edit_config_from_payload(run, payload, spec, reference, health)
+            new_config = to_record_dict(proposed)
         if _config_fingerprint(old_config) == _config_fingerprint(new_config) and run.get("status") != GridStatus.EDITING.value:
             return {"ok": True, "run": deepcopy(run), "idempotent": True, "preview": self.preview_edit_grid(run["run_id"], payload)}
 
@@ -2852,25 +2882,23 @@ class DurableGridBotLifecycle:
         cancelled = 0
         deferred_superseded = 0
         if not config_already_persisted:
-            self._update_lifecycle_progress(
+            cancelled = self._cancel_obsolete_config_orders(run, product_id, int(new_config["config_version"]))
+            deferred_superseded = self._terminalize_never_submitted_orders(
                 run,
-                "EDIT",
-                "CANCELLING_OBSOLETE_ORDERS",
-                message="Editing Grid: cancelling obsolete orders",
-                expected_orders=len([order for order in (run.get("orders") or {}).values() if order.get("status") not in START_TERMINAL_ORDER_STATUSES and order.get("order_kind") != "safety_flatten"]),
+                status="superseded",
+                reason="edit_grid_new_config",
+                obsolete_before_config_version=int(new_config["config_version"]),
             )
-            for order in list((run.get("orders") or {}).values()):
-                if order.get("status") in START_TERMINAL_ORDER_STATUSES or order.get("order_kind") == "safety_flatten":
-                    continue
-                self._cancel_order_safely(product_id, order)
-                order["superseded_by_config_version"] = new_config["config_version"]
-                cancelled += 1
-                self._update_lifecycle_progress(run, "EDIT", "CANCELLING_OBSOLETE_ORDERS", message=f"Editing Grid: {cancelled} obsolete orders cancelled", cancelled_orders=cancelled)
-            deferred_superseded = self._terminalize_never_submitted_orders(run, status="superseded", reason="edit_grid_new_config")
             self._save(state)
         else:
             cancelled = int(edit_state.get("cancelled_orders") or 0)
             deferred_superseded = int(edit_state.get("deferred_superseded") or 0)
+            newly_cancelled = self._cancel_obsolete_config_orders(run, product_id, int(new_config["config_version"]))
+            if newly_cancelled:
+                cancelled += newly_cancelled
+                run["edit_state"] = {**edit_state, "cancelled_orders": cancelled}
+                edit_state = run["edit_state"]
+                self._save(state)
             if not edit_state.get("config_persisted"):
                 run["edit_state"] = {**edit_state, "config_persisted": True, "stage": "CONFIG_PERSISTED", "persisted_at": utc_now()}
                 self._save(state, include_children=False)

@@ -64,7 +64,6 @@ OPERATOR_REASON_MESSAGES = {
     "DEPLOYMENT_INCOMPLETE": "The deployed grid is incomplete.",
     "EXCHANGE_TRUTH_UNAVAILABLE": "Delta verification is temporarily unavailable.",
     "MISSING_INTENDED_ORDERS": "Some intended grid orders are still waiting.",
-    "NEUTRAL_DEPLOYMENT_ONE_SIDED": "Neutral grid deployment is not balanced yet.",
     "TERMINAL_INTENDED_ORDERS": "Some intended orders reached a terminal state before the grid completed.",
     "TRUTH_UNAVAILABLE": "Delta verification is temporarily unavailable.",
     "UNRESOLVED_EXCHANGE_TRUTH": "Some Delta orders could not be verified yet.",

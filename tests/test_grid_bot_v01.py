@@ -877,6 +877,48 @@ def test_edit_grid_parameter_changes_same_run_new_config_version(tmp_path, updat
         assert str(edited["run"]["config"][key]) == str(value)
 
 
+def test_edit_grid_accepts_asymmetric_neutral_target(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+    run = lifecycle.start_operator_grid(_edit_payload())["run"]
+
+    edited = lifecycle.edit_grid(
+        run["run_id"],
+        {"lower_price": "2400", "upper_price": "2490", "grid_count": 6},
+        reason="asymmetric_neutral_edit",
+    )
+    sides = [level["side"] for level in edited["run"]["levels"]]
+
+    assert edited["ok"] is True
+    assert edited["run"]["status"] == GridStatus.RUNNING.value
+    assert int(edited["run"]["config"]["config_version"]) == 2
+    assert sides.count("buy") > sides.count("sell")
+
+
+def test_neutral_preview_with_inherited_inventory_at_max_defers_buys_and_allows_sells(tmp_path):
+    client = _FakeLifecycleClient()
+    client.position_size = "100"
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
+
+    preview = lifecycle.preview_operator_grid(
+        {
+            "bot_name": "Inherited Max Inventory",
+            "product_symbol": "ETHUSD",
+            "grid_type": "neutral",
+            "lower_price": "2265.70",
+            "upper_price": "2565.70",
+            "grid_count": 30,
+            "spacing_type": "arithmetic",
+            "lot_size": "10",
+            "max_inventory_lots": "100",
+        }
+    )["preview"]
+
+    assert preview["opening_buy_orders_eligible"] == 0
+    assert preview["opening_sell_orders_eligible"] > 0
+    assert {level["side"] for level in preview["deferred_levels"]} == {"buy"}
+
+
 def test_edit_historical_post_only_immediate_execution_defers_l015_buy(tmp_path):
     class HistoricalEditClient(_FakeLifecycleClient):
         def __init__(self):
@@ -1237,6 +1279,7 @@ def test_restart_after_edit_config_persisted_does_not_cancel_target_orders(tmp_p
         "target_config": edited["run"]["config"],
         "config_persisted": True,
         "stage": "CONFIG_PERSISTED",
+        "cancelled_orders": cancel_count,
     }
     lifecycle._save(state)
 
@@ -1250,6 +1293,71 @@ def test_restart_after_edit_config_persisted_does_not_cancel_target_orders(tmp_p
     assert recovered["run"]["status"] == GridStatus.RUNNING.value
     assert len(client.cancelled) == cancel_count
     assert recovered_edit_ids == edit_order_ids
+
+
+def test_restart_after_edit_config_persisted_cancels_stale_source_orders_only(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    started = lifecycle.start_operator_grid(_edit_payload())["run"]
+    edited = lifecycle.edit_grid(started["run_id"], {"grid_count": 6}, reason="initial_edit")
+    cancel_count = len(client.cancelled)
+    target_exchange_ids = {
+        str(order["exchange_order_id"])
+        for order in edited["run"]["orders"].values()
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    }
+    stale_client_order_id = f"{started['run_id']}-stale-v1"
+    stale_exchange_id = "stale-v1-exchange"
+    client.orders.append(
+        {
+            "id": stale_exchange_id,
+            "client_order_id": stale_client_order_id,
+            "side": "sell",
+            "size": "1",
+            "unfilled_size": "1",
+            "limit_price": "2550",
+            "state": "open",
+        }
+    )
+
+    state = lifecycle._load()
+    run = state["runs"][started["run_id"]]
+    run["orders"][stale_client_order_id] = {
+        "order_key": stale_client_order_id,
+        "client_order_id": stale_client_order_id,
+        "exchange_order_id": stale_exchange_id,
+        "level_id": "L999",
+        "side": "sell",
+        "price": "2550",
+        "requested_quantity": "1",
+        "remaining_quantity": "1",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 1,
+    }
+    run["status"] = GridStatus.EDITING.value
+    run["edit_state"] = {
+        "operation_id": "edit-restart-stale-source-open",
+        "previous_status": GridStatus.RUNNING.value,
+        "from_config_version": 1,
+        "to_config_version": 2,
+        "source_config": started["config"],
+        "target_config": edited["run"]["config"],
+        "config_persisted": True,
+        "stage": "CONFIG_PERSISTED",
+        "cancelled_orders": cancel_count,
+    }
+    lifecycle._save(state)
+
+    recovered = DurableGridBotLifecycle(client, path, use_supabase=False).edit_grid(started["run_id"], {}, reason="recover_edit")
+    cancelled_now = set(client.cancelled[cancel_count:])
+
+    assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert cancelled_now == {stale_exchange_id}
+    assert target_exchange_ids.isdisjoint(cancelled_now)
+    assert recovered["run"]["orders"][stale_client_order_id]["status"] == "cancelled"
+    assert recovered["edit"]["cancelled_orders"] == cancel_count + 1
 
 
 def test_restart_after_target_config_persisted_with_stale_flag_does_not_cancel_target_orders(tmp_path):
@@ -2123,27 +2231,26 @@ def test_operator_preview_is_non_mutating_and_repeatable(tmp_path):
 
 
 @pytest.mark.parametrize("spacing", ["arithmetic", "geometric"])
-def test_neutral_grid_requires_approximately_balanced_two_sided_ladder(tmp_path, spacing):
+def test_neutral_grid_allows_asymmetric_operator_ladder(tmp_path, spacing):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
     preview = lifecycle.preview_operator_grid(
         {
-            "bot_name": "Balanced Neutral Grid",
+            "bot_name": "Asymmetric Neutral Grid",
             "product_symbol": "ETHUSD",
             "grid_type": "neutral",
             "lower_price": "2400",
-            "upper_price": "2600",
-            "grid_count": 5,
+            "upper_price": "2490",
+            "grid_count": 6,
             "spacing_type": spacing,
             "lot_size": "1",
-            "max_inventory_lots": "3",
+            "max_inventory_lots": "6",
         }
     )["preview"]
     sides = [level["side"] for level in preview["levels"]]
 
-    assert sides.count("buy") >= 1
-    assert sides.count("sell") >= 1
-    assert abs(sides.count("buy") - sides.count("sell")) <= 1
+    assert sides.count("buy") > sides.count("sell")
+    assert abs(sides.count("buy") - sides.count("sell")) > 1
 
 
 @pytest.mark.parametrize(
@@ -2153,7 +2260,7 @@ def test_neutral_grid_requires_approximately_balanced_two_sided_ladder(tmp_path,
         ("2400", "2490", 5),
     ],
 )
-def test_neutral_grid_rejects_unsuitable_range_without_replacing_operator_range(tmp_path, lower_price, upper_price, grid_count):
+def test_neutral_grid_accepts_asymmetric_range_without_replacing_operator_range(tmp_path, lower_price, upper_price, grid_count):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
     payload = {
@@ -2171,8 +2278,10 @@ def test_neutral_grid_rejects_unsuitable_range_without_replacing_operator_range(
 
     preview = lifecycle.preview_operator_grid(payload)
 
-    assert preview["ok"] is False
-    assert preview["neutral_range"]["message"].startswith("Selected range is not suitable")
+    assert preview["ok"] is True
+    assert preview["config"]["lower_price"] == lower_price
+    assert preview["config"]["upper_price"] == upper_price
+    assert "neutral_range" not in preview
     assert payload == before
 
 
@@ -2197,7 +2306,7 @@ def test_valid_neutral_range_produces_no_unnecessary_suggestion(tmp_path):
     assert "neutral_range" not in preview
 
 
-def test_invalid_arithmetic_neutral_preview_returns_nearest_width_preserved_suggestion(tmp_path):
+def test_asymmetric_arithmetic_neutral_preview_returns_no_centering_suggestion(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
     payload = {
@@ -2214,19 +2323,13 @@ def test_invalid_arithmetic_neutral_preview_returns_nearest_width_preserved_sugg
     before = dict(payload)
 
     preview = lifecycle.preview_operator_grid(payload)
-    suggestion = preview["neutral_range"]
 
-    assert preview["ok"] is False
+    assert preview["ok"] is True
     assert payload == before
-    assert suggestion["entered_lower"] == "2400"
-    assert suggestion["entered_upper"] == "2490"
-    assert suggestion["width_preserved"] is True
-    assert Decimal(suggestion["suggested_upper"]) - Decimal(suggestion["suggested_lower"]) == Decimal("90")
-    assert suggestion["suggested_buy_count"] == 3
-    assert suggestion["suggested_sell_count"] == 3
+    assert "neutral_range" not in preview
 
 
-def test_invalid_geometric_neutral_suggestion_uses_generated_geometric_levels():
+def test_geometric_neutral_balance_reports_asymmetric_ladder_valid():
     config = GridConfig(
         bot_id="bot_geo",
         config_version=1,
@@ -2244,21 +2347,14 @@ def test_invalid_geometric_neutral_suggestion_uses_generated_geometric_levels():
     )
 
     suggestion = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
-    suggested = GridConfig(
-        **{
-            **config.__dict__,
-            "lower_price": suggestion["suggested_lower"],
-            "upper_price": suggestion["suggested_upper"],
-        }
-    )
-    balance = neutral_grid_balance(suggested, Decimal("2500"), Decimal("0.05"))
+    balance = neutral_grid_balance(config, Decimal("2500"), Decimal("0.05"))
 
-    assert suggestion["width_preserved"] is True
+    assert suggestion is None
     assert balance["valid"] is True
-    assert balance["prices"] == suggestion["suggested_levels"]
+    assert balance["buy_count"] > balance["sell_count"]
 
 
-def test_nearest_neutral_suggestion_preserves_tick_rounding_and_odd_balance():
+def test_nearest_neutral_suggestion_is_not_needed_for_asymmetry():
     config = GridConfig(
         bot_id="bot_tick",
         config_version=1,
@@ -2276,22 +2372,13 @@ def test_nearest_neutral_suggestion_preserves_tick_rounding_and_odd_balance():
     )
 
     suggestion = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
-    suggested = GridConfig(
-        **{
-            **config.__dict__,
-            "lower_price": suggestion["suggested_lower"],
-            "upper_price": suggestion["suggested_upper"],
-        }
-    )
-    balance = neutral_grid_balance(suggested, Decimal("2500"), Decimal("0.05"))
+    balance = neutral_grid_balance(config, Decimal("2500"), Decimal("0.05"))
 
-    assert suggestion["suggested_lower"] % Decimal("0.05") == 0
-    assert suggestion["suggested_upper"] % Decimal("0.05") == 0
+    assert suggestion is None
     assert balance["valid"] is True
-    assert abs(suggestion["suggested_buy_count"] - suggestion["suggested_sell_count"]) <= 1
 
 
-def test_neutral_suggestion_changes_when_reference_price_changes():
+def test_neutral_suggestion_remains_absent_when_reference_price_changes():
     config = GridConfig(
         bot_id="bot_move",
         config_version=1,
@@ -2311,10 +2398,11 @@ def test_neutral_suggestion_changes_when_reference_price_changes():
     first = nearest_valid_neutral_range(config, Decimal("2500"), Decimal("0.05"))
     second = nearest_valid_neutral_range(config, Decimal("2520"), Decimal("0.05"))
 
-    assert (first["suggested_lower"], first["suggested_upper"]) != (second["suggested_lower"], second["suggested_upper"])
+    assert first is None
+    assert second is None
 
 
-def test_edit_neutral_suggestion_does_not_modify_active_run_config(tmp_path):
+def test_edit_asymmetric_neutral_preview_does_not_modify_active_run_config(tmp_path):
     client = _FakeLifecycleClient()
     lifecycle = DurableGridBotLifecycle(client, tmp_path / "grid_state.json", use_supabase=False)
     run = lifecycle.start_operator_grid(
@@ -2343,9 +2431,8 @@ def test_edit_neutral_suggestion_does_not_modify_active_run_config(tmp_path):
     )
     after = lifecycle.status()["active_run"]
 
-    assert preview["ok"] is False
-    assert preview["neutral_range"]["entered_lower"] == "2400"
-    assert preview["neutral_range"]["entered_upper"] == "2490"
+    assert preview["ok"] is True
+    assert "neutral_range" not in preview
     assert after["config"] == before_config
     assert after["status"] == GridStatus.RUNNING.value
 
@@ -2721,7 +2808,7 @@ def test_running_incomplete_deployment_is_not_healthy(tmp_path):
         "deferred": 0,
         "ambiguous": 0,
         "missing": 3,
-        "reasons": ["MISSING_INTENDED_ORDERS", "NEUTRAL_DEPLOYMENT_ONE_SIDED"],
+        "reasons": ["MISSING_INTENDED_ORDERS"],
     }
 
     health = evaluate_gridbot_health(
