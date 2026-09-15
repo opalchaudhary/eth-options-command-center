@@ -1038,7 +1038,7 @@ class SupabaseGridRepository:
                 "order": "level_index.asc",
             },
         )
-        orders = self.select("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "submitted_at.asc"})
+        orders = self.select("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "config_version.desc,submitted_at.asc"})
         fills = self.select("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
         exchange_costs = self.select("grid_exchange_costs", {"select": "*", "run_id": f"eq.{run_id}", "order": "created_at.asc"})
         snapshots = self.select("grid_risk_snapshots", {"select": "*", "run_id": f"eq.{run_id}", "order": "timestamp.asc", "limit": 50})
