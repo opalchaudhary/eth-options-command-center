@@ -2108,11 +2108,16 @@ class DurableGridBotLifecycle:
         entitlements: dict[str, dict] = {}
         fill_links: dict[str, dict] = {}
         skipped = 0
+        current_config_version = int((run.get("config") or {}).get("config_version") or 1)
         for fill_id, fill_record in sorted((run.get("fills") or {}).items()):
             fill = fill_record.get("raw") if isinstance(fill_record, dict) and isinstance(fill_record.get("raw"), dict) else fill_record
             source_order = self._find_order_for_fill(run, fill)
             if not source_order or source_order.get("order_kind") == "safety_flatten":
                 run.setdefault("replacement_keys", {})[f"{fill_id}:replacement"] = {"skipped": True, "reason": "source_order_not_found"}
+                skipped += 1
+                continue
+            if int(source_order.get("config_version") or current_config_version) != current_config_version:
+                run.setdefault("replacement_keys", {})[f"{fill_id}:replacement"] = {"skipped": True, "reason": "source_order_obsolete_config"}
                 skipped += 1
                 continue
             try:
