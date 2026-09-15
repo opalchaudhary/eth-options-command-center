@@ -410,6 +410,8 @@ class DurableGridBotLifecycle:
                 continue
             if int(order.get("config_version") or 0) != config_version:
                 continue
+            if str(order.get("status") or "").lower() not in RUNNING_VALID_ORDER_STATUSES | START_UNRESOLVED_ORDER_STATUSES:
+                continue
             if str(order.get("level_id") or "") == level_id and str(order.get("side") or "") == side:
                 return order
         return None

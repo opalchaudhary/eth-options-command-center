@@ -1360,6 +1360,60 @@ def test_restart_after_edit_config_persisted_cancels_stale_source_orders_only(tm
     assert recovered["edit"]["cancelled_orders"] == cancel_count + 1
 
 
+def test_edit_recovery_replaces_cancelled_target_obligation_once(tmp_path):
+    client = _FakeLifecycleClient()
+    path = tmp_path / "grid_state.json"
+    lifecycle = DurableGridBotLifecycle(client, path, use_supabase=False)
+    started = lifecycle.start_operator_grid(_edit_payload())["run"]
+    edited = lifecycle.edit_grid(started["run_id"], {"grid_count": 6}, reason="initial_edit")
+    target = next(
+        order
+        for order in edited["run"]["orders"].values()
+        if order.get("order_kind") == "edit_grid" and int(order.get("config_version") or 0) == 2
+    )
+    target_level = target["level_id"]
+    target_side = target["side"]
+    target_exchange_id = str(target["exchange_order_id"])
+    cancel_count = len(client.cancelled)
+    for row in client.orders:
+        if str(row["id"]) == target_exchange_id:
+            row["state"] = "cancelled"
+            row["unfilled_size"] = "0"
+
+    state = lifecycle._load()
+    run = state["runs"][started["run_id"]]
+    run["status"] = GridStatus.EDITING.value
+    run["edit_state"] = {
+        "operation_id": "edit-restart-cancelled-target",
+        "previous_status": GridStatus.RUNNING.value,
+        "from_config_version": 1,
+        "to_config_version": 2,
+        "source_config": started["config"],
+        "target_config": edited["run"]["config"],
+        "config_persisted": True,
+        "stage": "CONFIG_PERSISTED",
+        "cancelled_orders": cancel_count,
+    }
+    run["orders"][target["client_order_id"]]["status"] = "cancelled"
+    run["orders"][target["client_order_id"]]["remaining_quantity"] = "0"
+    lifecycle._save(state)
+
+    recovered = DurableGridBotLifecycle(client, path, use_supabase=False).edit_grid(started["run_id"], {}, reason="recover_edit")
+    active_same_level = [
+        order
+        for order in recovered["run"]["orders"].values()
+        if int(order.get("config_version") or 0) == 2
+        and order.get("order_kind") == "edit_grid"
+        and order.get("level_id") == target_level
+        and order.get("side") == target_side
+        and str(order.get("status") or "").lower() in {"open", "partially_filled", "filled"}
+    ]
+
+    assert recovered["run"]["status"] == GridStatus.RUNNING.value
+    assert len(active_same_level) == 1
+    assert active_same_level[0]["exchange_order_id"] != target_exchange_id
+
+
 def test_restart_after_target_config_persisted_with_stale_flag_does_not_cancel_target_orders(tmp_path):
     client = _FakeLifecycleClient()
     path = tmp_path / "grid_state.json"
