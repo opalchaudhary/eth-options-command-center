@@ -6080,6 +6080,195 @@ def test_gridbot_health_event_dedupe_and_resolution_tracking(tmp_path):
     assert {issue["code"] for issue in recovered["recent_resolved_issues"]} == {"POSITION_MISMATCH", "POSITION_ATTRIBUTION_UNSAFE"}
 
 
+def test_gridbot_health_resolves_historical_external_change_after_clean_authoritative_reconcile():
+    run = {
+        "run_id": "run-external-recovered",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "100"},
+        "orders": {},
+        "fills": {},
+        "external_position_adjustment": {
+            "classification": "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION",
+            "ledger_inventory": "100",
+            "delta_position": "80",
+            "external_adjustment_lots": "-20",
+        },
+    }
+    active = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "100", "delta_position": "80", "position_mismatches": 1, "exchange_open_orders": 0})
+    recovered = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "60", "delta_position": "60", "position_mismatches": 0, "unresolved_orders": 0, "fill_ledger_mismatches": 0, "exchange_open_orders": 0})
+
+    assert "EXTERNAL_POSITION_CHANGE" in {issue["code"] for issue in active["active_issues"]}
+    assert "EXTERNAL_POSITION_CHANGE" not in {issue["code"] for issue in recovered["active_issues"]}
+
+
+def test_gridbot_health_sync_resolves_stale_persisted_rows_and_preserves_history():
+    db = _CountingSupabaseGridRepository()
+    run_id = "run-stale-health"
+    stale_codes = ["EXTERNAL_POSITION_CHANGE", "LIFECYCLE_STUCK", "LIFECYCLE_RECOVERY_REQUIRED", "DELTA_API_ERROR", "TELEMETRY_STALE"]
+    for code in stale_codes:
+        db.upsert(
+            "grid_health_events",
+            {"issue_key": f"{run_id}:{code}:", "run_id": run_id, "code": code, "active": True, "created_at": "2026-01-01T00:00:00+00:00"},
+            on_conflict="issue_key",
+        )
+    run = {"run_id": run_id, "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "100"}, "orders": {}, "fills": {}}
+
+    health = HealthIssueTracker().update(
+        evaluate_gridbot_health(
+            {"running": True, "thread_alive": True, "account_risk_state": client_health_state()},
+            run,
+            {"gridbot_inventory": "0", "delta_position": "0", "position_mismatches": 0, "unresolved_orders": 0, "fill_ledger_mismatches": 0, "exchange_open_orders": 0},
+        ),
+        db,
+    )
+    rows = {row["code"]: row for row in db.tables["grid_health_events"].values()}
+
+    assert health["active_issues"] == []
+    assert set(rows) == set(stale_codes)
+    assert all(rows[code]["active"] is False and rows[code]["resolved_at"] for code in stale_codes)
+
+
+def _replacement_health_run(**updates):
+    run = {
+        "run_id": "run-replacement-health",
+        "status": GridStatus.RUNNING.value,
+        "config": {"config_version": 2, "grid_type": "neutral", "max_inventory_lots": "10", "lot_size": "1"},
+        "levels": [
+            {"level_id": "L001", "side": "buy", "price": "99", "quantity": "1"},
+            {"level_id": "L002", "side": "sell", "price": "100", "quantity": "1"},
+        ],
+        "orders": {
+            "source-buy": {
+                "client_order_id": "source-buy",
+                "exchange_order_id": "ex-source",
+                "level_id": "L001",
+                "side": "buy",
+                "price": "99",
+                "requested_quantity": "1",
+                "remaining_quantity": "0",
+                "status": "filled",
+                "order_kind": "initial_grid",
+                "config_version": 2,
+            }
+        },
+        "fills": {"fill-1": {"id": "fill-1", "client_order_id": "source-buy", "order_id": "ex-source", "side": "buy", "size": "1", "price": "99"}},
+    }
+    run.update(updates)
+    return run
+
+
+def test_gridbot_health_missing_replacement_classification_current_actionable_cases():
+    run = _replacement_health_run()
+    health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "1", "delta_position": "1", "exchange_open_orders": 0})
+
+    assert "MISSING_REPLACEMENT" in {issue["code"] for issue in health["active_issues"]}
+    assert health["overall_status"] == "ATTENTION_REQUIRED"
+
+
+def test_gridbot_health_missing_replacement_ignores_existing_filled_deferred_and_retired_cases():
+    resting = _replacement_health_run(
+        orders={
+            **_replacement_health_run()["orders"],
+            "replacement-sell": {
+                "client_order_id": "replacement-sell",
+                "exchange_order_id": "ex-replacement",
+                "level_id": "L002",
+                "side": "sell",
+                "price": "100",
+                "requested_quantity": "1",
+                "remaining_quantity": "1",
+                "status": "open",
+                "order_kind": "replacement",
+                "config_version": 2,
+                "source_fill_id": "fill-1",
+            },
+        }
+    )
+    filled = _replacement_health_run(
+        orders={
+            **_replacement_health_run()["orders"],
+            "replacement-sell": {
+                "client_order_id": "replacement-sell",
+                "exchange_order_id": "ex-replacement",
+                "level_id": "L002",
+                "side": "sell",
+                "price": "100",
+                "requested_quantity": "1",
+                "remaining_quantity": "0",
+                "status": "filled",
+                "order_kind": "replacement",
+                "config_version": 2,
+                "source_fill_id": "fill-1",
+            },
+        }
+    )
+    deferred = _replacement_health_run(
+        deferred_orders={
+            "replacement-sell": {
+                "client_order_id": "replacement-sell",
+                "level_id": "L002",
+                "side": "sell",
+                "price": "100",
+                "requested_quantity": "1",
+                "remaining_quantity": "1",
+                "status": "deferred",
+                "order_kind": "replacement",
+                "config_version": 2,
+                "source_fill_id": "fill-1",
+            }
+        }
+    )
+    retired = _replacement_health_run(
+        orders={
+            "source-buy": {
+                **_replacement_health_run()["orders"]["source-buy"],
+                "config_version": 1,
+            }
+        }
+    )
+
+    for run in [resting, filled, deferred, retired]:
+        health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "1", "delta_position": "1", "exchange_open_orders": 1})
+        assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
+
+
+def test_gridbot_health_missing_replacement_ignores_max_inventory_blocked_target():
+    run = _replacement_health_run(
+        orders={
+            "source-sell": {
+                "client_order_id": "source-sell",
+                "exchange_order_id": "ex-source",
+                "level_id": "L002",
+                "side": "sell",
+                "price": "100",
+                "requested_quantity": "1",
+                "remaining_quantity": "0",
+                "status": "filled",
+                "order_kind": "initial_grid",
+                "config_version": 2,
+            }
+        },
+        fills={"fill-1": {"id": "fill-1", "client_order_id": "source-sell", "order_id": "ex-source", "side": "sell", "size": "1", "price": "100"}},
+    )
+
+    health = evaluate_gridbot_health({"running": True, "thread_alive": True}, run, {"gridbot_inventory": "10", "delta_position": "10", "exchange_open_orders": 0})
+
+    assert "MISSING_REPLACEMENT" not in {issue["code"] for issue in health["active_issues"]}
+
+
+def test_accounting_incomplete_remains_data_quality_degraded_not_attention():
+    run = {"run_id": "run-accounting-warning", "status": GridStatus.RUNNING.value, "config": {"grid_type": "neutral", "max_inventory_lots": "10"}, "orders": {}, "fills": {"fill-1": {"id": "fill-1", "side": "buy", "size": "1"}}}
+    health = evaluate_gridbot_health(
+        {"running": True, "thread_alive": True, "account_risk_state": client_health_state(), "accounting": {"accounting_status": "PARTIAL", "warnings": ["EXTERNAL_POSITION_CLOSE_UNATTRIBUTED"]}},
+        run,
+        {"gridbot_inventory": "1", "delta_position": "1", "exchange_open_orders": 0},
+    )
+
+    assert [issue["code"] for issue in health["active_issues"]] == ["ACCOUNTING_INCOMPLETE"]
+    assert health["overall_status"] == "DEGRADED"
+    assert health["operator_attention_required"] is False
+
+
 def test_continuous_worker_live_state_includes_health_without_no_change_health_writes(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()

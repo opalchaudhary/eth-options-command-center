@@ -139,22 +139,147 @@ def _open_orders(run: dict | None) -> list[dict]:
     ]
 
 
-def _replacement_missing(run: dict | None) -> list[str]:
-    fills = set(((run or {}).get("fills") or {}).keys())
+def _fresh_reconciliation_clean(reconciliation: dict | None) -> bool:
+    reconciliation = reconciliation or {}
+    if not reconciliation or reconciliation.get("errors"):
+        return False
+    required = {"gridbot_inventory", "delta_position"}
+    if not required <= set(reconciliation):
+        return False
+    blocking_event_types = {"ORDER_UNRESOLVED", "FILL_LEDGER_MISMATCH", "POSITION_MISMATCH", "GRID_NATURE_INVENTORY_VIOLATION"}
+    return (
+        _decimal(reconciliation.get("gridbot_inventory")) == _decimal(reconciliation.get("delta_position"))
+        and int(reconciliation.get("position_mismatches") or 0) == 0
+        and int(reconciliation.get("unresolved_orders") or 0) == 0
+        and int(reconciliation.get("fill_ledger_mismatches") or 0) == 0
+        and not any((event or {}).get("event_type") in blocking_event_types for event in reconciliation.get("events") or [])
+    )
+
+
+def _fill_payload(fill_record: Any) -> dict:
+    if isinstance(fill_record, dict) and isinstance(fill_record.get("raw"), dict):
+        return fill_record["raw"]
+    return fill_record if isinstance(fill_record, dict) else {}
+
+
+def _order_matches_fill(order: dict, fill: dict) -> bool:
+    fill_client_id = str(fill.get("client_order_id") or "")
+    fill_order_id = str(fill.get("order_id") or fill.get("exchange_order_id") or "")
+    return bool(
+        (fill_client_id and fill_client_id == str(order.get("client_order_id") or ""))
+        or (fill_order_id and fill_order_id == str(order.get("exchange_order_id") or ""))
+        or (fill_order_id and fill_order_id == str(order.get("order_key") or ""))
+    )
+
+
+def _source_order_for_fill(run: dict | None, fill: dict) -> dict | None:
+    orders = (run or {}).get("orders") or {}
+    fill_client_id = str(fill.get("client_order_id") or "")
+    if fill_client_id and fill_client_id in orders:
+        return orders[fill_client_id]
+    return next((order for order in orders.values() if _order_matches_fill(order, fill)), None)
+
+
+def _replacement_target(run: dict | None, source_order: dict, fill: dict) -> dict | None:
+    levels = (run or {}).get("levels") or []
+    current_index = next((index for index, level in enumerate(levels) if level.get("level_id") == source_order.get("level_id")), None)
+    if current_index is None:
+        return None
+    side = str(fill.get("side") or "").lower()
+    if side not in {"buy", "sell"}:
+        return None
+    target_index = current_index + 1 if side == "buy" else current_index - 1
+    if target_index < 0 or target_index >= len(levels):
+        return None
+    target = dict(levels[target_index])
+    target["side"] = "sell" if side == "buy" else "buy"
+    return target
+
+
+def _order_represents_target(order: dict, target: dict) -> bool:
+    if order.get("order_kind") == "safety_flatten":
+        return False
+    if order.get("level_id") != target.get("level_id") or str(order.get("side") or "").lower() != str(target.get("side") or "").lower():
+        return False
+    target_price = target.get("price")
+    if target_price not in [None, ""] and order.get("price") not in [None, ""] and _decimal(order.get("price")) != _decimal(target_price):
+        return False
+    return True
+
+
+def _target_blocked_by_max_inventory(run: dict | None, target: dict, inventory: Decimal) -> bool:
+    config = (run or {}).get("config") or {}
+    max_inventory = abs(_decimal(config.get("max_inventory_lots")))
+    if max_inventory <= 0:
+        return False
+    side = str(target.get("side") or "").lower()
+    quantity = _decimal(target.get("quantity") or config.get("lot_size") or "0")
+    if quantity <= 0:
+        return False
+    open_same_side = sum(
+        (
+            _decimal(order.get("remaining_quantity"), str(order.get("requested_quantity") or "0"))
+            for order in _open_orders(run)
+            if str(order.get("side") or "").lower() == side
+        ),
+        Decimal("0"),
+    )
+    projected = inventory + open_same_side + quantity if side == "buy" else inventory - open_same_side - quantity
+    return abs(projected) > max_inventory
+
+
+def _replacement_missing(run: dict | None, reconciliation: dict | None = None) -> list[str]:
+    fills = (run or {}).get("fills") or {}
     replaced = {
         str(order.get("source_fill_id") or ((order.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"))
         for order in ((run or {}).get("orders") or {}).values()
         if order.get("order_kind") == "replacement"
     }
+    replacement_records = [
+        order
+        for order in list(((run or {}).get("orders") or {}).values()) + list(((run or {}).get("deferred_orders") or {}).values())
+        if order.get("order_kind") == "replacement"
+    ]
+    for order in replacement_records:
+        replaced.update(str(fill_id) for fill_id in order.get("source_fill_ids") or [])
     for entitlement in ((run or {}).get("replacement_entitlements") or {}).values():
-        replaced.update(str(fill_id) for fill_id in entitlement.get("source_fill_ids") or [])
+        if _decimal(entitlement.get("replacement_deficit_qty")) <= 0 or _decimal(entitlement.get("replacement_qty_currently_open")) > 0:
+            replaced.update(str(fill_id) for fill_id in entitlement.get("source_fill_ids") or [])
     for key, replacement in ((run or {}).get("replacement_keys") or {}).items():
+        fill_id = str(key).rsplit(":replacement", 1)[0] if str(key).endswith(":replacement") else str(replacement.get("source_fill_id") or "")
         if replacement.get("state") == "aggregated":
             replaced.add(str(replacement.get("source_fill_id") or ""))
-            if str(key).endswith(":replacement"):
-                replaced.add(str(key).rsplit(":replacement", 1)[0])
+            replaced.add(fill_id)
+        if replacement.get("skipped") and replacement.get("reason") in {"source_order_not_found", "source_order_obsolete_config", "source_level_not_found", "edge_level", "invalid_fill_side"}:
+            replaced.add(fill_id)
     deferred = set(((run or {}).get("deferred_orders") or {}).keys())
-    return sorted(fill_id for fill_id in fills if fill_id and fill_id not in replaced and fill_id not in deferred)
+    for order in (run or {}).get("deferred_orders", {}).values():
+        deferred.add(str(order.get("source_fill_id") or ""))
+        deferred.update(str(fill_id) for fill_id in order.get("source_fill_ids") or [])
+
+    current_config_version = int(((run or {}).get("config") or {}).get("config_version") or 1)
+    inventory = _decimal((reconciliation or {}).get("gridbot_inventory"))
+    missing: list[str] = []
+    for fill_id, fill_record in sorted(fills.items()):
+        fill_id = str(fill_id)
+        if not fill_id or fill_id in replaced or fill_id in deferred:
+            continue
+        fill = _fill_payload(fill_record)
+        source_order = _source_order_for_fill(run, fill)
+        if not source_order or source_order.get("order_kind") == "safety_flatten":
+            continue
+        if int(source_order.get("config_version") or current_config_version) != current_config_version:
+            continue
+        target = _replacement_target(run, source_order, fill)
+        if not target:
+            continue
+        related = [order for order in list(((run or {}).get("orders") or {}).values()) + list(((run or {}).get("deferred_orders") or {}).values()) if _order_represents_target(order, target)]
+        if related:
+            continue
+        if _target_blocked_by_max_inventory(run, target, inventory):
+            continue
+        missing.append(fill_id)
+    return missing
 
 
 def _reservation_mismatches(run: dict | None) -> list[str]:
@@ -230,9 +355,11 @@ def evaluate_gridbot_health(
     inventory = _decimal(reconciliation.get("gridbot_inventory") or state.get("fill_derived_inventory"))
     position = _decimal(reconciliation.get("delta_position") or state.get("delta_position"))
     external_adjustment = (run or {}).get("external_position_adjustment") or (run or {}).get("external_position_resolution")
-    operational_inventory = position if external_adjustment else inventory
+    clean_authoritative_reconciliation = _fresh_reconciliation_clean(reconciliation)
+    external_adjustment_active = bool(external_adjustment and not clean_authoritative_reconciliation)
+    operational_inventory = position if external_adjustment_active else inventory
     transient_fill_position_catchup = bool(new_fills and abs(position - inventory) <= new_fills)
-    if external_adjustment:
+    if external_adjustment_active:
         classification = str(external_adjustment.get("classification") or "")
         code = "FORCED_LIQUIDATION" if classification == "FORCED_LIQUIDATION_OR_REDUCTION" else "EXTERNAL_POSITION_CHANGE"
         issues.append(_issue(code, HealthSeverity.CRITICAL, "Delta position changed outside the GridBot.", run_for_issue, external_position_adjustment=external_adjustment))
@@ -273,7 +400,7 @@ def evaluate_gridbot_health(
                 **violation,
             )
         )
-    if not external_adjustment and abs(position - inventory) > 0 and not transient_fill_position_catchup:
+    if not external_adjustment_active and abs(position - inventory) > 0 and not transient_fill_position_catchup:
         issues.append(_issue("POSITION_ATTRIBUTION_UNSAFE", HealthSeverity.CRITICAL, "Account exposure cannot be safely attributed to this GridBot.", run_for_issue, delta_position=str(position), gridbot_inventory=str(inventory)))
 
     open_orders = _open_orders(run)
@@ -335,7 +462,7 @@ def evaluate_gridbot_health(
         if status_age is not None and status_age > threshold:
             issues.append(_issue("LIFECYCLE_STUCK", HealthSeverity.CRITICAL, f"{status} lifecycle state appears stuck.", run_for_issue, lifecycle_state=status, age_seconds=status_age))
 
-    missing_replacements = _replacement_missing(run)
+    missing_replacements = _replacement_missing(run, reconciliation)
     if status == GridStatus.RUNNING.value and missing_replacements:
         issues.append(_issue("MISSING_REPLACEMENT", HealthSeverity.CRITICAL, "Filled orders have no active, existing, or deferred replacement.", run_for_issue, missing_fill_ids=missing_replacements[:10]))
     reservation_mismatches = _reservation_mismatches(run)
@@ -401,6 +528,7 @@ def evaluate_gridbot_health(
     }
     return {
         "overall_status": overall,
+        "run_id": run_id,
         "safe_for_risk_increase": safe_for_risk_increase,
         "safe_for_risk_reduce": safe_for_risk_reduce,
         "operator_attention_required": operator_attention_required,
@@ -485,7 +613,7 @@ class HealthIssueTracker:
         health["active_issues"] = [issue.as_dict() for issue in current.values()]
         health["recent_resolved_issues"] = self.recent_resolved
         signature = tuple(sorted((issue.key, issue.severity, issue.message) for issue in current.values()))
-        if db and getattr(db, "enabled", False) and (signature != self._last_persisted_signature or resolved):
-            db.sync_health_issues(list(current.values()), resolved)
+        if db and getattr(db, "enabled", False) and (signature != self._last_persisted_signature or resolved or (health.get("run_id") and not current)):
+            db.sync_health_issues(list(current.values()), resolved, run_id=health.get("run_id"))
             self._last_persisted_signature = signature
         return health

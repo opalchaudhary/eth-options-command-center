@@ -884,9 +884,15 @@ class SupabaseGridRepository:
             on_conflict="event_id",
         )
 
-    def sync_health_issues(self, active_issues: list[HealthIssue], resolved_issues: list[HealthIssue] | None = None) -> None:
+    def sync_health_issues(self, active_issues: list[HealthIssue], resolved_issues: list[HealthIssue] | None = None, *, run_id: str | None = None) -> None:
         now = utc_now()
         try:
+            current_keys = {issue.key for issue in active_issues}
+            resolved_keys = {issue.key for issue in resolved_issues or []}
+            run_ids = {issue.run_id for issue in active_issues if issue.run_id}
+            run_ids.update(issue.run_id for issue in (resolved_issues or []) if issue.run_id)
+            if run_id:
+                run_ids.add(run_id)
             for issue in active_issues:
                 payload = {
                     "issue_key": issue.key,
@@ -919,6 +925,30 @@ class SupabaseGridRepository:
                     "updated_at": now,
                 }
                 self.upsert("grid_health_events", payload, on_conflict="issue_key")
+            for run_id in run_ids:
+                stale_rows = self.select(
+                    "grid_health_events",
+                    {
+                        "select": "issue_key,active",
+                        "run_id": f"eq.{run_id}",
+                        "limit": 200,
+                    },
+                )
+                for row in stale_rows:
+                    if row.get("active") is not True:
+                        continue
+                    issue_key = row.get("issue_key")
+                    if not issue_key or issue_key in current_keys or issue_key in resolved_keys:
+                        continue
+                    self.patch(
+                        "grid_health_events",
+                        {"issue_key": issue_key},
+                        {
+                            "active": False,
+                            "resolved_at": now,
+                            "updated_at": now,
+                        },
+                    )
             for issue in resolved_issues or []:
                 self.patch(
                     "grid_health_events",
