@@ -178,7 +178,9 @@ class DeltaTestnetClient:
         return self.private_delete("/orders", {"product_id": product_id, "id": order_id})
 
     def open_orders(self, product_id: int | None = None) -> dict:
-        params = {"product_id": product_id} if product_id else None
+        params = {"page_size": 100}
+        if product_id:
+            params["product_id"] = product_id
         return self.private_get("/orders", params=params)
 
     def get_order(self, order_id: str | int) -> dict:
