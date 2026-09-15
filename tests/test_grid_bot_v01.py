@@ -4300,12 +4300,58 @@ def test_gridbot_live_state_refreshes_latest_persisted_transitional_progress(mon
     assert state["health"]["overall_status"] != "HEALTHY"
 
 
-def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(monkeypatch):
+def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monkeypatch):
+    stale_run = {
+        "run_id": "run-compact",
+        "status": GridStatus.RUNNING.value,
+        "config": {
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "10",
+            "product_symbol": "ETHUSD",
+            "config_version": 1,
+        },
+        "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
+        "orders": {
+            "old-buy": {"client_order_id": "old-buy", "side": "buy", "status": "open", "remaining_quantity": "1"},
+            "old-sell": {"client_order_id": "old-sell", "side": "sell", "status": "open", "remaining_quantity": "1"},
+        },
+        "fills": {"old": {"id": "old", "side": "buy", "size": "5", "price": "2500", "commission": "0"}},
+        "deployment_completeness": {"expected": 4, "confirmed_open": 3, "filled": 1, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
+        "external_position_adjustment": {
+            "classification": "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION",
+            "ledger_inventory": "100",
+            "delta_position": "80",
+            "external_adjustment_lots": "-20",
+        },
+    }
+    latest_run = {
+        **stale_run,
+        "orders": {
+            "buy-open": {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
+            "sell-open-a": {"client_order_id": "sell-open-a", "side": "sell", "status": "open", "remaining_quantity": "1"},
+            "sell-open-b": {"client_order_id": "sell-open-b", "side": "sell", "status": "open", "remaining_quantity": "1"},
+            "filled": {"client_order_id": "filled", "side": "buy", "status": "filled", "remaining_quantity": "0"},
+        },
+        "fills": {
+            "old": {"id": "old", "side": "buy", "size": "5", "price": "2500", "commission": "0"},
+            "fresh": {"id": "fresh", "side": "buy", "size": "5", "price": "2490", "commission": "0"},
+        },
+        "lifecycle_progress": {"operation": "RUNNING", "stage": "RUNNING", "message": "Grid running", "expected_orders": 4, "confirmed_orders": 3, "filled_orders": 1},
+    }
+
     class DB:
         enabled = True
+        load_calls = 0
 
-        def load_run_state(self, _run_id):
-            raise AssertionError("compact live state must not reload full Supabase run state")
+        def load_run_state(self, run_id):
+            assert run_id == "run-compact"
+            self.load_calls += 1
+            return latest_run
 
         def stats(self):
             return {"select": 99}
@@ -4322,33 +4368,19 @@ def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(m
                 "run_id": "run-compact",
                 "status": "running",
                 "lifecycle_state": GridStatus.RUNNING.value,
-                "config": {
-                    "grid_type": "neutral",
-                    "lower_price": "2400",
-                    "upper_price": "2600",
-                    "grid_count": 4,
-                    "spacing_type": "arithmetic",
-                    "lot_size": "1",
-                    "max_inventory_lots": "2",
-                    "product_symbol": "ETHUSD",
-                    "config_version": 1,
-                },
-                "deployment_completeness": {"expected": 4, "confirmed_open": 3, "filled": 1, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
-                "lifecycle_progress": {"operation": "RUNNING", "stage": "RUNNING", "message": "Grid running", "expected_orders": 4, "confirmed_orders": 3, "filled_orders": 1},
-                "known_gridbot_orders": [
-                    {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
-                    {"client_order_id": "sell-open", "side": "sell", "status": "open", "remaining_quantity": "1"},
-                    {"client_order_id": "filled", "side": "sell", "status": "filled", "remaining_quantity": "0"},
-                ],
-                "fill_derived_inventory": "-1",
-                "delta_position": "-1",
+                "active_run": stale_run,
+                "config": stale_run["config"],
+                "deployment_completeness": stale_run["deployment_completeness"],
+                "known_gridbot_orders": list(stale_run["orders"].values()),
+                "fill_derived_inventory": "5",
+                "delta_position": "5",
                 "known_fill_count": 1,
                 "accounting": {"net_realized_pnl": "0", "unrealized_pnl": "-1", "live_net_pnl": "-1", "trading_fees": "0.01", "cycles_completed": 0, "accounting_status": "COMPLETE"},
-                "account_risk_state": {"telemetry_status": "HEALTHY", "mark_price": "2500", "account_equity": "1000", "available_margin": "990", "used_margin": "10", "margin_utilisation_pct": "1", "position_lots": "-1"},
-                "health": {"overall_status": "HEALTHY", "active_issues": [], "position_inventory_agreement": {"gridbot_inventory": "-1", "delta_position": "-1", "matches": True, "difference": "0"}},
-                "last_poll_at": "2026-01-01T00:00:00+00:00",
-                "last_successful_poll_at": "2026-01-01T00:00:00+00:00",
-                "last_successful_reconcile": "2026-01-01T00:00:00+00:00",
+                "account_risk_state": {"telemetry_status": "HEALTHY", "mark_price": "2500", "account_equity": "1000", "available_margin": "990", "used_margin": "10", "margin_utilisation_pct": "1", "position_lots": "10"},
+                "health": {"overall_status": "ATTENTION_REQUIRED", "active_issues": [{"code": "EXTERNAL_POSITION_CHANGE"}], "position_inventory_agreement": {"gridbot_inventory": "5", "delta_position": "5", "matches": True, "difference": "0"}},
+                "last_poll_at": utc_now(),
+                "last_successful_poll_at": utc_now(),
+                "last_successful_reconcile": utc_now(),
             }
 
     monkeypatch.setattr(continuous_worker_module, "worker", Worker())
@@ -4357,9 +4389,15 @@ def test_gridbot_compact_live_state_uses_worker_memory_without_supabase_reload(m
 
     assert compact["source"] == "worker_memory_compact"
     assert compact["run_id"] == "run-compact"
+    assert compact["fill_derived_inventory"] == "10"
+    assert compact["delta_position"] == "10"
     assert compact["deployment_completeness"]["accounted"] == 4
-    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
+    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 2, "open_order_count": 3}
     assert compact["account_risk_state"]["mark_price"] == "2500"
+    assert compact["health"]["overall_status"] == "HEALTHY"
+    assert compact["health"]["active_issues"] == []
+    assert compact["health"]["safe_for_risk_increase"] is True
+    assert compact["health"]["operator_attention_required"] is False
     assert "known_gridbot_orders" not in compact
     assert "active_run" not in compact
     assert "risk_snapshots" not in compact

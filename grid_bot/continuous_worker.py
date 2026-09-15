@@ -48,6 +48,54 @@ def _fresh_open_order_count(telemetry: dict) -> int | None:
     return max(int(telemetry.get("open_order_count") or 0), side_total)
 
 
+def _reconciliation_from_state(state: dict) -> dict:
+    payload = {
+        "gridbot_inventory": state.get("fill_derived_inventory"),
+        "delta_position": state.get("delta_position") or (state.get("account_risk_state") or {}).get("position_lots"),
+        "exchange_open_orders": state.get("open_gridbot_orders"),
+        "position_mismatches": state.get("position_mismatches") or 0,
+        "unresolved_orders": state.get("unresolved_orders") or 0,
+        "fill_ledger_mismatches": state.get("fill_ledger_mismatches") or 0,
+        "last_successful_reconcile": state.get("last_successful_reconcile"),
+        "errors": [],
+    }
+    return {key: value for key, value in payload.items() if value not in [None, ""]}
+
+
+def _apply_run_to_live_state(state: dict, run: dict) -> dict:
+    state.update(
+        {
+            "active_run": deepcopy(run),
+            "run_id": run.get("run_id"),
+            "lifecycle_state": run.get("status"),
+            "config": run.get("config") or {},
+            "config_version": (run.get("config") or {}).get("config_version"),
+            "grid_nature": (run.get("config") or {}).get("grid_type"),
+            "grid_levels": run.get("levels") or [],
+            "deployment_completeness": run.get("deployment_completeness") or {},
+            "lifecycle_progress": run.get("lifecycle_progress") or run.get("startup") or {},
+            "lifecycle_timing": run.get("lifecycle_timing") or {},
+            "known_gridbot_orders": list((run.get("orders") or {}).values()),
+            "known_fill_ids": list((run.get("fills") or {}).keys()),
+            "known_order_count": len(run.get("orders") or {}),
+            "known_fill_count": len(run.get("fills") or {}),
+            "replacement_count": len(run.get("replacement_keys") or {}),
+            "deferred_replacement_count": len(run.get("deferred_orders") or {}),
+            "replacement_state": run.get("replacement_keys") or {},
+        }
+    )
+    fill_inventory = inventory_from_fills([fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill for fill in (run.get("fills") or {}).values()])
+    state["fill_derived_inventory"] = str(fill_inventory)
+    telemetry = state.get("account_risk_state") or {}
+    if telemetry.get("position_lots") not in [None, ""]:
+        state["delta_position"] = str(_decimal(telemetry.get("position_lots")))
+    mark_price = _decimal(telemetry.get("mark_price")) if telemetry.get("mark_price") not in [None, ""] else None
+    account_position = _decimal(telemetry.get("position_lots")) if telemetry.get("position_lots") not in [None, ""] else None
+    state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
+    state["health"] = evaluate_gridbot_health(state, run, _reconciliation_from_state(state), state.get("accounting"))
+    return state
+
+
 class ContinuousGridBotWorker:
     def __init__(
         self,
@@ -179,17 +227,9 @@ class ContinuousGridBotWorker:
                 if open_order_count is not None:
                     state["open_gridbot_orders"] = open_order_count
             if run:
-                fill_inventory = inventory_from_fills([fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill for fill in (run.get("fills") or {}).values()])
-                state["fill_derived_inventory"] = str(fill_inventory)
-                state["known_fill_count"] = len(run.get("fills") or {})
-                state["known_order_count"] = len(run.get("orders") or {})
-                if cached and (cached or {}).get("position_lots") not in [None, ""]:
-                    state["delta_position"] = str(_decimal((cached or {}).get("position_lots")))
-                mark_price = _decimal((cached or {}).get("mark_price")) if cached and (cached or {}).get("mark_price") not in [None, ""] else None
-                account_position = _decimal((cached or {}).get("position_lots")) if cached and (cached or {}).get("position_lots") not in [None, ""] else None
-                state["accounting"] = build_run_accounting(run, mark_price=mark_price, account_position_lots=account_position).as_dict()
+                state = _apply_run_to_live_state(state, run)
             state["recent_resolved_health_issues"] = self._health_tracker.recent_resolved
-            state["health"] = evaluate_gridbot_health(state, run)
+            state["health"] = evaluate_gridbot_health(state, run, _reconciliation_from_state(state), state.get("accounting"))
             return state
 
     def ensure_active_worker(self) -> dict:
@@ -620,26 +660,7 @@ def gridbot_live_state() -> dict:
             latest_run = worker.db.load_run_state(state["run_id"])
             if latest_run:
                 health_run = latest_run
-                state.update(
-                    {
-                        "active_run": deepcopy(latest_run),
-                        "lifecycle_state": latest_run.get("status"),
-                        "config": latest_run.get("config") or {},
-                        "config_version": (latest_run.get("config") or {}).get("config_version"),
-                        "grid_nature": (latest_run.get("config") or {}).get("grid_type"),
-                        "grid_levels": latest_run.get("levels") or [],
-                        "deployment_completeness": latest_run.get("deployment_completeness") or {},
-                        "lifecycle_progress": latest_run.get("lifecycle_progress") or latest_run.get("startup") or {},
-                        "lifecycle_timing": latest_run.get("lifecycle_timing") or {},
-                        "known_gridbot_orders": list((latest_run.get("orders") or {}).values()),
-                        "known_fill_ids": list((latest_run.get("fills") or {}).keys()),
-                        "known_order_count": len(latest_run.get("orders") or {}),
-                        "known_fill_count": len(latest_run.get("fills") or {}),
-                        "replacement_count": len(latest_run.get("replacement_keys") or {}),
-                        "deferred_replacement_count": len(latest_run.get("deferred_orders") or {}),
-                        "replacement_state": latest_run.get("replacement_keys") or {},
-                    }
-                )
+                state = _apply_run_to_live_state(state, latest_run)
     except Exception as exc:
         state["active_run_refresh_error"] = str(exc)[:300]
     try:
@@ -653,7 +674,10 @@ def gridbot_live_state() -> dict:
             state["open_gridbot_orders"] = open_order_count
     except Exception as exc:
         state["account_risk_state_error"] = str(exc)[:300]
-    state["health"] = evaluate_gridbot_health(state, health_run)
+    if health_run:
+        state = _apply_run_to_live_state(state, health_run)
+    else:
+        state["health"] = evaluate_gridbot_health(state, health_run, _reconciliation_from_state(state), state.get("accounting"))
     return state
 
 
@@ -669,6 +693,13 @@ def _compact_order_counts(rows: list[dict]) -> dict:
 
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
+    if state.get("run_id") and worker.db.enabled:
+        try:
+            latest_run = worker.db.load_run_state(state["run_id"])
+            if latest_run:
+                state = _apply_run_to_live_state(state, latest_run)
+        except Exception as exc:
+            state["active_run_refresh_error"] = str(exc)[:300]
     if not state.get("run_id"):
         try:
             telemetry = account_telemetry_cache.get("ETHUSD").as_dict()
@@ -676,7 +707,7 @@ def gridbot_compact_live_state() -> dict:
             open_order_count = _fresh_open_order_count(telemetry)
             if open_order_count is not None:
                 state["open_gridbot_orders"] = open_order_count
-            state["health"] = evaluate_gridbot_health(state)
+            state["health"] = evaluate_gridbot_health(state, reconciliation=_reconciliation_from_state(state), accounting=state.get("accounting"))
         except Exception as exc:
             state["account_risk_state_error"] = str(exc)[:300]
     run = state.get("active_run") if isinstance(state.get("active_run"), dict) else {}

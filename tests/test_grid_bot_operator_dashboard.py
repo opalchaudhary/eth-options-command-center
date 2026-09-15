@@ -230,6 +230,46 @@ def test_lifecycle_compact_summary_separates_obligations_from_resting_orders() -
     assert lifecycle_details_should_expand(live) is False
 
 
+def test_operator_helpers_render_current_compact_payload_after_resolved_external_event() -> None:
+    live = {
+        "lifecycle_state": "RUNNING",
+        "fill_derived_inventory": "60",
+        "delta_position": "60",
+        "config": {"max_inventory_lots": "100"},
+        "deployment_completeness": {"expected": 30, "confirmed_open": 17, "filled": 8, "deferred": 5},
+        "known_gridbot_orders": [
+            *[{"side": "buy", "price": "2400", "remaining_quantity": "10", "status": "open"} for _ in range(4)],
+            *[{"side": "sell", "price": "2450", "remaining_quantity": "10", "status": "open"} for _ in range(13)],
+            {"side": "buy", "price": "2431.2", "remaining_quantity": "0", "status": "filled"},
+        ],
+        "health": {
+            "overall_status": "HEALTHY",
+            "safe_for_risk_increase": True,
+            "safe_for_risk_reduce": True,
+            "operator_attention_required": False,
+            "active_issues": [],
+            "position_inventory_agreement": {
+                "gridbot_inventory": "60",
+                "delta_position": "60",
+                "matches": True,
+                "difference": "0",
+            },
+        },
+    }
+
+    message, details = health_plain_text(live["health"])
+    inventory = inventory_summary(live)
+
+    assert message == "Everything is working normally."
+    assert details == []
+    assert lifecycle_compact_summary(live) == "Running | Healthy | 30/30 accounted | Current resting orders: 4 BUY / 13 SELL"
+    assert inventory["label"] == "Long 60 lots"
+    assert inventory["delta_label"] == "Long 60 lots"
+    assert inventory["difference"] == "0"
+    assert live["health"]["safe_for_risk_increase"] is True
+    assert live["health"]["operator_attention_required"] is False
+
+
 def test_lifecycle_details_auto_expand_for_transition_or_attention() -> None:
     assert lifecycle_details_should_expand({"lifecycle_state": "STARTING", "health": {"overall_status": "HEALTHY"}}) is True
     assert lifecycle_details_should_expand({"lifecycle_state": "RUNNING", "health": {"overall_status": "ATTENTION_REQUIRED"}}) is True
