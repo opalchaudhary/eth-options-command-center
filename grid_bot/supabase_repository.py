@@ -216,6 +216,19 @@ class SupabaseGridRepository:
         self._count("select", table)
         return self._request("GET", table, params=params or {"select": "*"}) or []
 
+    def select_all(self, table: str, params: dict | None = None, page_size: int = 1000) -> list[dict]:
+        rows: list[dict] = []
+        offset = 0
+        base_params = dict(params or {"select": "*"})
+        while True:
+            page_params = {**base_params, "limit": page_size, "offset": offset}
+            page = self.select(table, page_params)
+            rows.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return rows
+
     def upsert(self, table: str, payload: dict | list[dict], on_conflict: str | None = None) -> None:
         self._count("upsert_rows", table, len(payload if isinstance(payload, list) else [payload]))
         params = {"on_conflict": on_conflict} if on_conflict else None
@@ -1068,9 +1081,9 @@ class SupabaseGridRepository:
                 "order": "level_index.asc",
             },
         )
-        orders = self.select("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "config_version.desc,submitted_at.asc"})
-        fills = self.select("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
-        exchange_costs = self.select("grid_exchange_costs", {"select": "*", "run_id": f"eq.{run_id}", "order": "created_at.asc"})
+        orders = self.select_all("grid_orders", {"select": "*", "run_id": f"eq.{run_id}", "order": "config_version.desc,submitted_at.asc"})
+        fills = self.select_all("grid_fills", {"select": "*", "run_id": f"eq.{run_id}", "order": "detected_at.asc"})
+        exchange_costs = self.select_all("grid_exchange_costs", {"select": "*", "run_id": f"eq.{run_id}", "order": "created_at.asc"})
         snapshots = self.select("grid_risk_snapshots", {"select": "*", "run_id": f"eq.{run_id}", "order": "timestamp.asc", "limit": 50})
         summary_rows = self.select("grid_run_summaries", {"select": "summary", "run_id": f"eq.{run_id}", "limit": 1})
         event_rows = self.select(

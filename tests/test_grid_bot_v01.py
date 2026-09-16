@@ -3285,6 +3285,32 @@ def test_exchange_truth_manual_cancel_no_fill_and_disappeared_unresolved():
     assert unresolved["unresolved_orders"] == 1
 
 
+def test_exchange_truth_uses_ethusd_futures_position_when_options_share_portfolio():
+    class PortfolioModeClient(_TruthClient):
+        def positions(self, underlying_asset_symbol="ETH"):
+            return {
+                "success": True,
+                "result": [
+                    {"product_id": 149853, "product_symbol": "P-ETH-2300-180926", "size": "50"},
+                    {"product_id": 149854, "product_symbol": "C-ETH-2700-180926", "size": "-20"},
+                    {"product_id": 1699, "product_symbol": "ETHUSD", "symbol": "ETHUSD", "size": "80"},
+                ],
+            }
+
+    run = _truth_run(quantity="80")
+    order = run["orders"]["DGB01-truth-L001-B-1"]
+    order["status"] = "filled"
+    order["filled_quantity"] = "80"
+    order["remaining_quantity"] = "0"
+    run["fills"] = {"grid-fill": _fill("grid-fill", "80")}
+
+    result = reconcile_exchange_truth(run, PortfolioModeClient(position="ignored"))
+
+    assert result["gridbot_inventory"] == "80"
+    assert result["delta_position"] == "80"
+    assert result["position_mismatches"] == 0
+
+
 def test_exchange_truth_position_and_fill_ledger_mismatches():
     run = _truth_run()
     position_mismatch = reconcile_exchange_truth(run, _TruthClient(fill_pages=[[_fill()]], position="10"))
@@ -4075,7 +4101,7 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
         rows = list(self.tables.get(table, {}).values())
         params = params or {}
         for key, value in params.items():
-            if key in {"select", "order", "limit"}:
+            if key in {"select", "order", "limit", "offset"}:
                 continue
             if isinstance(value, str) and value.startswith("eq."):
                 expected = value[3:]
@@ -4088,7 +4114,8 @@ class _CountingSupabaseGridRepository(SupabaseGridRepository):
             reverse = params["order"].endswith(".desc")
             rows = sorted(rows, key=lambda row: str(row.get(key) or ""), reverse=reverse)
         if "limit" in params:
-            rows = rows[: int(params["limit"])]
+            offset = int(params.get("offset") or 0)
+            rows = rows[offset : offset + int(params["limit"])]
         return rows
 
     def upsert(self, table, payload, on_conflict=None):
@@ -5018,6 +5045,74 @@ def test_worker_reattach_ingests_down_fill_without_immediate_replacement(tmp_pat
     loaded = db.load_run_state(run_id)
     assert "fill-worker-down" in loaded["fills"]
     assert loaded["orders"][buy_order["client_order_id"]]["status"] == "filled"
+
+
+def test_reattach_reconciles_stale_open_order_beyond_supabase_first_page(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    run = started["run"]
+    run_id = run["run_id"]
+    filler_rows = []
+    for index in range(1001):
+        cid = f"DGB01-paged-L{index:04d}-B-FILLER"
+        filler_rows.append(
+            {
+                "order_id": cid,
+                "run_id": run_id,
+                "bot_id": run["bot_id"],
+                "config_version": 1,
+                "level_id": "L001",
+                "client_order_id": cid,
+                "exchange_order_id": f"filler-{index}",
+                "side": "buy",
+                "price": "2400",
+                "requested_quantity": "1",
+                "filled_quantity": "0",
+                "remaining_quantity": "0",
+                "status": "manual_cancelled",
+                "submitted_at": f"2026-01-01T00:{index % 60:02d}:00+00:00",
+                "raw": {"state": "cancelled"},
+            }
+        )
+    stale_cid = "DGB01-paged-L999-S-Rstale"
+    filler_rows.append(
+        {
+            "order_id": stale_cid,
+            "run_id": run_id,
+            "bot_id": run["bot_id"],
+            "config_version": 1,
+            "level_id": "L999",
+            "client_order_id": stale_cid,
+            "exchange_order_id": "stale-ex",
+            "side": "sell",
+            "price": "2500",
+            "requested_quantity": "1",
+            "filled_quantity": "0",
+            "remaining_quantity": "1",
+            "status": "open",
+            "submitted_at": "2026-01-01T02:00:00+00:00",
+            "raw": {"state": "open"},
+        }
+    )
+    db.upsert("grid_orders", filler_rows, on_conflict="client_order_id")
+
+    loaded = db.load_run_state(run_id)
+    assert stale_cid in loaded["orders"]
+    assert len(loaded["orders"]) > 1000
+
+    result = reconcile_exchange_truth(
+        loaded,
+        _TruthClient(order_pages=[[{"id": "stale-ex", "client_order_id": stale_cid, "state": "cancelled", "size": "1", "unfilled_size": "1"}]], position="0"),
+        db,
+        persist_order_updates=True,
+    )
+    reloaded = db.load_run_state(run_id)
+
+    assert result["manual_cancelled_orders"] == 1
+    assert reloaded["orders"][stale_cid]["status"] == "manual_cancelled"
+    assert reloaded["orders"][stale_cid]["remaining_quantity"] == "0"
 
 
 def test_continuous_worker_advances_persisted_edit_after_client_disconnect(tmp_path):
