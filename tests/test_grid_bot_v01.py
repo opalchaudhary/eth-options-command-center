@@ -4415,6 +4415,7 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
     compact = continuous_worker_module.gridbot_compact_live_state()
 
     assert compact["source"] == "worker_memory_compact"
+    assert compact["freshness"] == "fresh"
     assert compact["run_id"] == "run-compact"
     assert compact["fill_derived_inventory"] == "10"
     assert compact["delta_position"] == "10"
@@ -4589,7 +4590,8 @@ def test_gridbot_compact_live_state_refreshes_idle_telemetry_without_supabase_re
     compact = continuous_worker_module.gridbot_compact_live_state()
 
     assert telemetry_cache.calls == 1
-    assert compact["source"] == "worker_memory_compact"
+    assert compact["source"] == "no_active_run"
+    assert compact["freshness"] == "authoritative_no_active"
     assert compact["run_id"] is None
     assert compact["account_risk_state"]["mark_price"] == "2500"
     assert compact["account_risk_state"]["telemetry_status"] == "HEALTHY"
@@ -5058,6 +5060,83 @@ def test_continuous_worker_recovers_same_run_when_persisted_status_changes(tmp_p
     assert db.stats()["select"] > 2
 
 
+def test_continuous_worker_retains_known_run_on_transient_empty_active_lookup(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    class TransientEmptyDB(_CountingSupabaseGridRepository):
+        def __init__(self, tables):
+            super().__init__()
+            self.tables = tables
+            self.empty_once = True
+
+        def active_run(self):
+            if self.empty_once:
+                self.empty_once = False
+                return None
+            return super().active_run()
+
+    transient_db = TransientEmptyDB(db.tables)
+    worker = ContinuousGridBotWorker(client=client, db=transient_db)
+    worker._run = started["run"]
+
+    refreshed = worker._refresh_active_run_if_due()
+
+    assert refreshed["run_id"] == started["run"]["run_id"]
+    assert worker.state()["run_id"] == started["run"]["run_id"]
+    assert worker.state()["active_run_freshness"] == "stale"
+
+
+def test_continuous_worker_retains_known_run_on_transient_active_lookup_error(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    class TransientErrorDB(_CountingSupabaseGridRepository):
+        def __init__(self, tables):
+            super().__init__()
+            self.tables = tables
+            self.error_once = True
+
+        def active_run(self):
+            if self.error_once:
+                self.error_once = False
+                raise RuntimeError("temporary supabase timeout")
+            return super().active_run()
+
+    transient_db = TransientErrorDB(db.tables)
+    worker = ContinuousGridBotWorker(client=client, db=transient_db)
+    worker._run = started["run"]
+
+    refreshed = worker._refresh_active_run_if_due()
+
+    assert refreshed["run_id"] == started["run"]["run_id"]
+    state = worker.state()
+    assert state["run_id"] == started["run"]["run_id"]
+    assert state["active_run_freshness"] == "unavailable"
+    assert "temporary supabase timeout" in state["active_run_refresh_error"]
+
+
+def test_continuous_worker_clears_known_run_when_persisted_run_is_terminal(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    db.tables["grid_active_run_locks"] = {}
+    db.tables["grid_runs"][(run_id,)]["status"] = "STOPPED"
+
+    worker = ContinuousGridBotWorker(client=client, db=db)
+    worker._run = started["run"]
+
+    assert worker._refresh_active_run_if_due() is None
+    assert worker.state()["run_id"] is None
+    assert worker.state()["active_run_freshness"] == "authoritative_no_active"
+
+
 def test_compact_recovers_persisted_active_run_when_worker_memory_empty(tmp_path, monkeypatch):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()
@@ -5088,6 +5167,8 @@ def test_compact_recovers_persisted_active_run_when_worker_memory_empty(tmp_path
 
     assert compact["run_id"] == started["run"]["run_id"]
     assert compact["status"] == "reattach_pending"
+    assert compact["source"] == "persisted_active_run_compact"
+    assert compact["freshness"] == "fresh"
     assert compact["config"]["config_version"] == 1
     assert compact["current_orders"]["open_order_count"] == len(started["run"]["orders"])
 

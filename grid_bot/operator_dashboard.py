@@ -167,6 +167,11 @@ def position_label(lots: Any) -> str:
 
 def health_plain_text(health: dict | None) -> tuple[str, list[str]]:
     health = health or {}
+    status = str(health.get("overall_status") or "").upper()
+    if status == "UNKNOWN":
+        return "Unable to establish current bot health.", []
+    if status == "DEGRADED":
+        return "Current state is partially unavailable or stale.", []
     issues = health.get("active_issues") or []
     if not issues:
         return "Everything is working normally.", []

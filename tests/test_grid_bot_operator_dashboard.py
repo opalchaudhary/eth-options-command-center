@@ -40,6 +40,11 @@ def test_operator_health_text_hides_internal_codes() -> None:
     assert "POSITION_MISMATCH" not in details[0]
 
 
+def test_unknown_and_degraded_health_do_not_claim_normal() -> None:
+    assert health_plain_text({"overall_status": "UNKNOWN", "active_issues": []}) == ("Unable to establish current bot health.", [])
+    assert health_plain_text({"overall_status": "DEGRADED", "active_issues": []}) == ("Current state is partially unavailable or stale.", [])
+
+
 def test_pending_orders_are_split_sorted_and_operator_safe() -> None:
     live = {
         "known_gridbot_orders": [
@@ -419,7 +424,8 @@ def test_active_telemetry_failure_preserves_operator_controls_and_blocks_false_c
     assert 'if not live.get("ok", True):' in remember_body
     assert 'coalesced_live_warning(live)' in remember_body
     assert 'st.session_state["gridbot_live_authority"] = "UNKNOWN"' in remember_body
-    assert 'st.session_state["gridbot_last_good_active_live_state"] = live' in remember_body
+    assert 'degraded_live_from_failure(live)' in remember_body
+    assert 'live.update(degraded)' in remember_body
     assert 'st.session_state.get("gridbot_last_good_active_live_state")' in unknown_fallback_body
     assert 'render_actions(live)' in operator_panel_body
     assert 'render_pending_operator_forms(live)' in operator_panel_body
@@ -428,6 +434,23 @@ def test_active_telemetry_failure_preserves_operator_controls_and_blocks_false_c
     assert '"gridbot_edit_preview"' in edit_body
     assert '"edit_lower"' in edit_body
     assert '"edit_upper"' in edit_body
+
+
+def test_dashboard_auth_and_backend_failures_render_unavailable_not_false_flat() -> None:
+    text = PAGE.read_text()
+    safe_get_body = text.split("def safe_get", maxsplit=1)[1].split("def safe_post", maxsplit=1)[0]
+    degraded_body = text.split("def degraded_live_from_failure", maxsplit=1)[1].split("def remember_live_state", maxsplit=1)[0]
+    idle_body = text.split("def render_idle", maxsplit=1)[1].split("def render_create_grid", maxsplit=1)[0]
+    sidebar_body = text.split("with st.sidebar:", maxsplit=1)[1].split("live_status_fragment()", maxsplit=1)[0]
+
+    assert "requests.HTTPError" in safe_get_body
+    assert '"failure_kind": "auth"' in safe_get_body
+    assert 'previous = st.session_state.get("gridbot_last_good_active_live_state")' in degraded_body
+    assert 'unavailable_health("DEGRADED")' in degraded_body
+    assert 'unavailable_health("UNKNOWN")' in degraded_body
+    assert '"Live state unavailable"' in idle_body
+    assert 'render_card("Position", "Unavailable" if unavailable else "Flat")' in idle_body
+    assert "fetch_compact_live_state.clear()" in sidebar_body
 
 
 def test_dashboard_lifecycle_panel_is_compact_and_expandable() -> None:

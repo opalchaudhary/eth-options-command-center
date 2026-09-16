@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
@@ -155,9 +156,17 @@ def safe_get(path: str, params: dict | None = None, timeout: int = 15) -> dict:
     try:
         return api_get(path, params=params, timeout=timeout)
     except requests.Timeout:
-        return {"ok": False, "error": "timeout", "status_class": "UNKNOWN"}
+        return {"ok": False, "error": "timeout", "status_class": "UNKNOWN", "failure_kind": "timeout"}
+    except requests.HTTPError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        message = str(exc)
+        try:
+            message = exc.response.json().get("detail") or message
+        except Exception:
+            pass
+        return {"ok": False, "error": str(message), "status_code": status_code, "status_class": "UNKNOWN", "failure_kind": "auth" if status_code in {401, 403} else "backend"}
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "status_class": "UNKNOWN"}
+        return {"ok": False, "error": str(exc), "status_class": "UNKNOWN", "failure_kind": "backend"}
 
 
 def safe_post(path: str, payload: dict | None = None, timeout: int = 15) -> dict:
@@ -248,6 +257,8 @@ def status_class(status: str) -> str:
 
 
 def lifecycle_label(live: dict) -> str:
+    if live.get("authority_state") == "UNKNOWN" and not live.get("run_id") and not live.get("lifecycle_state"):
+        return "Live state unavailable"
     lifecycle = live.get("lifecycle_state")
     if lifecycle:
         return human_lifecycle(lifecycle)
@@ -268,7 +279,7 @@ def clear_preview() -> None:
 
 
 def render_health(health: dict) -> None:
-    status = health.get("overall_status") or "HEALTHY"
+    status = health.get("overall_status") or "UNKNOWN"
     message, details = health_plain_text(health)
     if status == "HEALTHY":
         st.success(f"[OK] {message}")
@@ -428,6 +439,9 @@ def render_live_status(live: dict) -> None:
         )
 
     render_lifecycle_progress(live)
+    if live.get("authority_state") == "UNKNOWN" or live.get("freshness") in {"stale", "unavailable"}:
+        generated_at = live.get("generated_at") or (live.get("timestamps") or {}).get("last_successful_poll_at")
+        st.warning(f"Live state could not be refreshed. Showing last-known values from {time_label(generated_at)}.")
 
     st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
     render_health(health)
@@ -505,12 +519,48 @@ def coalesced_live_warning(live: dict) -> None:
     st.warning(f"GridBot live status is temporarily unknown: {message}")
 
 
+def unavailable_health(status: str = "UNKNOWN") -> dict:
+    return {
+        "overall_status": status,
+        "safe_for_risk_increase": False,
+        "safe_for_risk_reduce": False,
+        "operator_attention_required": False,
+        "active_issues": [],
+    }
+
+
+def degraded_live_from_failure(live: dict) -> dict:
+    previous = st.session_state.get("gridbot_last_good_active_live_state")
+    if previous:
+        degraded = deepcopy(previous)
+        degraded["ok"] = False
+        degraded["authority_state"] = "UNKNOWN"
+        degraded["freshness"] = "unavailable"
+        degraded["stale_reason"] = live.get("failure_kind") or "backend"
+        degraded["stale_error"] = live.get("error")
+        degraded["health"] = unavailable_health("DEGRADED")
+        return degraded
+    return {
+        "ok": False,
+        "authority_state": "UNKNOWN",
+        "freshness": "unavailable",
+        "stale_reason": live.get("failure_kind") or "backend",
+        "stale_error": live.get("error"),
+        "health": unavailable_health("UNKNOWN"),
+        "account_risk_state": {},
+    }
+
+
 def remember_live_state(live: dict) -> bool:
     if not live.get("ok", True):
         st.session_state["gridbot_live_authority"] = "UNKNOWN"
         st.session_state["gridbot_live_unknown_at"] = datetime.now(timezone.utc).isoformat()
         coalesced_live_warning(live)
-        return False
+        degraded = degraded_live_from_failure(live)
+        st.session_state["gridbot_last_live_state"] = degraded
+        live.clear()
+        live.update(degraded)
+        return True
     st.session_state["gridbot_last_live_warning"] = None
     if live.get("run_id") or live.get("lifecycle_state"):
         live["authority_state"] = "CONFIRMED_ACTIVE"
@@ -693,15 +743,17 @@ def live_activity_fragment() -> None:
 def render_idle(live: dict) -> None:
     health = live.get("health") or {}
     telemetry = live.get("account_risk_state") or {}
+    unavailable = live.get("authority_state") == "UNKNOWN"
     top = st.columns([3, 1])
     with top[0]:
+        label = "Live state unavailable" if unavailable else "No active grid"
         st.markdown(
             "<div class='operator-top'><div class='operator-title'>DELTA GRID BOT</div>"
-            f"<div class='operator-sub'>ETH {fmt_money(telemetry.get('mark_price'))} | No active grid</div></div>",
+            f"<div class='operator-sub'>ETH {fmt_money(telemetry.get('mark_price'))} | {label}</div></div>",
             unsafe_allow_html=True,
         )
     with top[1]:
-        status = health.get("overall_status") or "HEALTHY"
+        status = health.get("overall_status") or "UNKNOWN"
         st.markdown(
             f"<div class='operator-top'><div class='operator-status {status_class(status)}'>[{status.replace('_', ' ')}]</div>"
             f"<div class='operator-sub'>{health_plain_text(health)[0]}</div></div>",
@@ -709,11 +761,11 @@ def render_idle(live: dict) -> None:
         )
     c1, c2, c3 = st.columns(3)
     with c1:
-        render_card("Position", "Flat")
+        render_card("Position", "Unavailable" if unavailable else "Flat")
     with c2:
-        render_card("Account", fmt_money(telemetry.get("account_equity")), f"Available {fmt_money(telemetry.get('available_margin'))}")
+        render_card("Account", "Unavailable" if unavailable else fmt_money(telemetry.get("account_equity")), f"Available {fmt_money(telemetry.get('available_margin'))}" if not unavailable else "")
     with c3:
-        render_card("Margin", fmt_pct(telemetry.get("margin_utilisation_pct")))
+        render_card("Margin", "Unavailable" if unavailable else fmt_pct(telemetry.get("margin_utilisation_pct")))
     render_health(health)
 
 
@@ -871,6 +923,8 @@ def render_history() -> None:
 with st.sidebar:
     st.caption(f"Backend: {backend_url()}")
     if st.button("Refresh Live Now", use_container_width=True):
+        fetch_compact_live_state.clear()
+        fetch_detailed_live_state.clear()
         st.rerun()
 
 live_status_fragment()

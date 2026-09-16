@@ -167,6 +167,9 @@ class ContinuousGridBotWorker:
             "recent_resolved_health_issues": [],
             "reattach_reconciliation_pending": False,
             "last_reattach_reconciliation": None,
+            "active_run_freshness": "unknown",
+            "active_run_source": None,
+            "active_run_refresh_error": None,
         }
 
     def start(self) -> dict:
@@ -247,6 +250,16 @@ class ContinuousGridBotWorker:
         self._set_state(
             status="idle",
             run_id=None,
+            active_run=None,
+            lifecycle_state=None,
+            config={},
+            grid_levels=[],
+            known_gridbot_orders=[],
+            known_fill_ids=[],
+            replacement_state={},
+            deployment_completeness={},
+            lifecycle_progress={},
+            lifecycle_timing={},
             open_gridbot_orders=0,
             known_order_count=0,
             known_fill_count=0,
@@ -260,10 +273,17 @@ class ContinuousGridBotWorker:
             last_fill=None,
             last_replacement=None,
             reattach_reconciliation_pending=False,
+            active_run_freshness="authoritative_no_active",
+            active_run_source="persisted_no_active_run",
+            active_run_refresh_error=None,
         )
 
     def _recover_active_run(self) -> dict | None:
-        active = self.db.active_run() if self.db.enabled else None
+        try:
+            active = self.db.active_run() if self.db.enabled else None
+        except Exception as exc:
+            self._set_state(active_run_freshness="unavailable", active_run_refresh_error=str(exc)[:300])
+            raise
         if not active:
             with self._lock:
                 self._run = None
@@ -280,8 +300,21 @@ class ContinuousGridBotWorker:
                     "known_order_count": len(run.get("orders") or {}),
                     "replacement_count": len(run.get("replacement_keys") or {}),
                     "reattach_reconciliation_pending": run.get("status") == GridStatus.RUNNING.value,
+                    "active_run_freshness": "fresh",
+                    "active_run_source": "persisted_active_run",
+                    "active_run_refresh_error": None,
                 }
             )
+        return run
+
+    def _retain_known_active_run(self, run: dict, freshness: str, error: str | None = None) -> dict:
+        self._set_state(
+            run_id=run.get("run_id"),
+            status="running" if run.get("status") in EXECUTABLE_STATUSES else "waiting",
+            active_run_freshness=freshness,
+            active_run_source="last_known_good_active_run",
+            active_run_refresh_error=(error or "")[:300] or None,
+        )
         return run
 
     def _refresh_active_run_if_due(self) -> dict | None:
@@ -292,10 +325,25 @@ class ContinuousGridBotWorker:
         if run and run.get("status") in WORKER_ACTIVE_STATUSES and now - self._last_active_refresh_monotonic < self.active_run_refresh_seconds:
             return run
         self._last_active_refresh_monotonic = now
-        active = self.db.active_run()
+        try:
+            active = self.db.active_run()
+        except Exception as exc:
+            if run and run.get("status") in WORKER_ACTIVE_STATUSES:
+                return self._retain_known_active_run(run, "unavailable", str(exc))
+            raise
         if not active:
+            if run and run.get("status") in WORKER_ACTIVE_STATUSES:
+                try:
+                    persisted_run = self.db.load_run_state(run["run_id"])
+                except Exception as exc:
+                    return self._retain_known_active_run(run, "unavailable", str(exc))
+                if persisted_run and persisted_run.get("status") in WORKER_ACTIVE_STATUSES:
+                    with self._lock:
+                        self._run = persisted_run
+                    return self._retain_known_active_run(persisted_run, "stale")
             with self._lock:
                 self._run = None
+            self._set_idle_state()
             return None
         if (
             run
@@ -303,6 +351,7 @@ class ContinuousGridBotWorker:
             and active.get("status") == run.get("status")
             and active.get("status") in WORKER_ACTIVE_STATUSES
         ):
+            self._set_state(active_run_freshness="fresh", active_run_source="worker_memory_active_run", active_run_refresh_error=None)
             return run
         return self._recover_active_run()
 
@@ -814,13 +863,20 @@ def _compact_resting_orders(rows: list[dict]) -> list[dict]:
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
     db = getattr(worker, "db", None)
+    compact_source = state.get("active_run_source") or ("worker_memory_compact" if state.get("run_id") else "no_active_run")
+    freshness = state.get("active_run_freshness") or ("fresh" if state.get("run_id") else "authoritative_no_active")
     if state.get("run_id") and db and getattr(db, "enabled", False):
         try:
             latest_run = db.load_run_state(state["run_id"])
             if latest_run:
                 state = _apply_run_to_live_state(state, latest_run)
+                compact_source = "worker_memory_compact"
+                freshness = "fresh"
+                state["active_run_refresh_error"] = None
         except Exception as exc:
             state["active_run_refresh_error"] = str(exc)[:300]
+            compact_source = "last_known_good_compact"
+            freshness = "unavailable"
     elif db and getattr(db, "enabled", False) and hasattr(db, "active_run"):
         try:
             active = db.active_run()
@@ -829,9 +885,16 @@ def gridbot_compact_live_state() -> dict:
                 if latest_run:
                     state = _apply_run_to_live_state(state, latest_run)
                     state["status"] = "reattach_pending" if latest_run.get("status") == GridStatus.RUNNING.value else state.get("status")
-                    state["source"] = "persisted_active_run_compact"
+                    compact_source = "persisted_active_run_compact"
+                    freshness = "fresh"
+                    state["active_run_refresh_error"] = None
+            else:
+                compact_source = "no_active_run"
+                freshness = "authoritative_no_active"
         except Exception as exc:
             state["active_run_refresh_error"] = str(exc)[:300]
+            compact_source = "unavailable"
+            freshness = "unavailable"
     if not state.get("run_id"):
         try:
             telemetry = account_telemetry_cache.get("ETHUSD").as_dict()
@@ -842,6 +905,9 @@ def gridbot_compact_live_state() -> dict:
             state["health"] = evaluate_gridbot_health(state, reconciliation=_reconciliation_from_state(state), accounting=state.get("accounting"))
         except Exception as exc:
             state["account_risk_state_error"] = str(exc)[:300]
+            if compact_source == "no_active_run":
+                compact_source = "unavailable"
+                freshness = "unavailable"
     run = state.get("active_run") if isinstance(state.get("active_run"), dict) else {}
     config = state.get("config") or (run.get("config") if isinstance(run, dict) else {}) or {}
     telemetry = state.get("account_risk_state") or {}
@@ -858,7 +924,10 @@ def gridbot_compact_live_state() -> dict:
     deferred = int(progress.get("deferred_orders") or completeness.get("deferred") or 0)
     return {
         "ok": state.get("ok", True),
-        "source": "worker_memory_compact",
+        "source": compact_source,
+        "freshness": freshness,
+        "generated_at": utc_now(),
+        "active_run_refresh_error": state.get("active_run_refresh_error"),
         "worker_owner": state.get("worker_owner"),
         "running": state.get("running"),
         "thread_alive": state.get("thread_alive"),
