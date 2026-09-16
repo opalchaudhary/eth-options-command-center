@@ -471,6 +471,13 @@ def time_label(timestamp: Any) -> str:
         return "--:--"
 
 
+def stale_live_warning_text(timestamp: Any) -> str:
+    label = time_label(timestamp)
+    if label == "--:--":
+        return "Live state could not be refreshed. Showing last-known values."
+    return f"Live state could not be refreshed. Showing last-known values from {label}."
+
+
 def preview_edit_summary(preview: dict | None) -> list[str]:
     preview = preview or {}
     plan = preview.get("order_plan") or {}

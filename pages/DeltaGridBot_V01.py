@@ -31,6 +31,7 @@ from grid_bot.operator_dashboard import (
     preview_edit_summary,
     recent_activity,
     split_pending_orders,
+    stale_live_warning_text,
 )
 from streamlit_auth import require_authentication
 from ui_styles import load_css
@@ -441,7 +442,7 @@ def render_live_status(live: dict) -> None:
     render_lifecycle_progress(live)
     if live.get("authority_state") == "UNKNOWN" or live.get("freshness") in {"stale", "unavailable"}:
         generated_at = live.get("generated_at") or (live.get("timestamps") or {}).get("last_successful_poll_at")
-        st.warning(f"Live state could not be refreshed. Showing last-known values from {time_label(generated_at)}.")
+        st.warning(stale_live_warning_text(generated_at))
 
     st.markdown("<div class='section-label'>Health</div>", unsafe_allow_html=True)
     render_health(health)

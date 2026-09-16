@@ -15,6 +15,7 @@ from grid_bot.operator_dashboard import (
     pnl_values,
     preview_edit_summary,
     split_pending_orders,
+    stale_live_warning_text,
     time_label,
 )
 
@@ -534,3 +535,26 @@ def test_grid_recommendation_is_below_current_grid_and_above_health() -> None:
     assert "Current Grid" in metrics_body
     assert "Health" in status_body
     assert "render_grid_recommendation()" in operator_panel_body
+
+
+def test_stale_live_warning_formats_valid_generated_at() -> None:
+    assert stale_live_warning_text("2026-08-29T09:00:00+00:00") == (
+        "Live state could not be refreshed. Showing last-known values from 14:30 IST."
+    )
+
+
+def test_stale_live_warning_handles_missing_generated_at() -> None:
+    assert stale_live_warning_text(None) == "Live state could not be refreshed. Showing last-known values."
+
+
+def test_stale_live_warning_handles_malformed_generated_at() -> None:
+    assert stale_live_warning_text("not-a-timestamp") == "Live state could not be refreshed. Showing last-known values."
+
+
+def test_delta_gridbot_status_uses_stale_warning_helper_only_for_degraded_state() -> None:
+    text = PAGE.read_text()
+    status_body = text.split("def render_live_status", maxsplit=1)[1].split("def render_live_metrics", maxsplit=1)[0]
+
+    assert "stale_live_warning_text(generated_at)" in status_body
+    assert "time_label(generated_at)" not in status_body
+    assert 'live.get("authority_state") == "UNKNOWN" or live.get("freshness") in {"stale", "unavailable"}' in status_body
