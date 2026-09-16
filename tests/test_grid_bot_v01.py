@@ -4420,6 +4420,47 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
     assert compact["delta_position"] == "10"
     assert compact["deployment_completeness"]["accounted"] == 4
     assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 2, "open_order_count": 3}
+    assert compact["resting_orders"] == [
+        {
+            "level": None,
+            "side": "buy",
+            "price": None,
+            "quantity_lots": "1",
+            "status": "open",
+            "client_order_id": "buy-open",
+            "exchange_order_id": None,
+            "config_version": None,
+            "order_kind": None,
+            "source_fill_id": None,
+            "replacement_group_key": None,
+        },
+        {
+            "level": None,
+            "side": "sell",
+            "price": None,
+            "quantity_lots": "1",
+            "status": "open",
+            "client_order_id": "sell-open-a",
+            "exchange_order_id": None,
+            "config_version": None,
+            "order_kind": None,
+            "source_fill_id": None,
+            "replacement_group_key": None,
+        },
+        {
+            "level": None,
+            "side": "sell",
+            "price": None,
+            "quantity_lots": "1",
+            "status": "open",
+            "client_order_id": "sell-open-b",
+            "exchange_order_id": None,
+            "config_version": None,
+            "order_kind": None,
+            "source_fill_id": None,
+            "replacement_group_key": None,
+        },
+    ]
     assert compact["account_risk_state"]["mark_price"] == "2500"
     assert compact["health"]["overall_status"] == "HEALTHY"
     assert compact["health"]["active_issues"] == []
@@ -4429,6 +4470,48 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
     assert "active_run" not in compact
     assert "risk_snapshots" not in compact
     assert "fills" not in compact
+
+
+def test_gridbot_compact_resting_orders_survive_large_historical_order_set(monkeypatch):
+    historical = [
+        {"client_order_id": f"hist-{index}", "side": "buy", "status": "manual_cancelled", "remaining_quantity": "0", "price": "2400"}
+        for index in range(1005)
+    ]
+    current = [
+        {"client_order_id": "current-buy", "exchange_order_id": "ex-buy", "level_id": "L001", "side": "buy", "status": "open", "remaining_quantity": "10", "price": "2265.7", "config_version": 2},
+        {"client_order_id": "current-sell", "exchange_order_id": "ex-sell", "level_id": "L016", "side": "sell", "status": "open", "remaining_quantity": "10", "price": "2421.0", "config_version": 2},
+        {"client_order_id": "deferred-sell", "level_id": "L017", "side": "sell", "status": "deferred", "remaining_quantity": "10", "price": "2431.0", "config_version": 2},
+    ]
+
+    class DB:
+        enabled = False
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "running": True,
+                "thread_alive": True,
+                "run_id": "run-large-compact",
+                "status": "running",
+                "lifecycle_state": GridStatus.RUNNING.value,
+                "config": {"grid_type": "neutral", "config_version": 2},
+                "known_gridbot_orders": [*historical, *current],
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+                "account_risk_state": {},
+                "accounting": {},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
+    assert [row["client_order_id"] for row in compact["resting_orders"]] == ["current-buy", "current-sell"]
 
 
 def test_gridbot_compact_live_state_refreshes_idle_telemetry_without_supabase_reload(monkeypatch):

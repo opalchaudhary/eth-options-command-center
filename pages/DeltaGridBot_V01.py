@@ -25,6 +25,7 @@ from grid_bot.operator_dashboard import (
     lifecycle_progress_summary,
     live_config,
     orders_are_updating,
+    order_details_unavailable,
     pnl_values,
     preview_edit_summary,
     recent_activity,
@@ -374,14 +375,21 @@ def render_grid_recommendation() -> None:
 def render_orders(live: dict) -> None:
     buys, sells = split_pending_orders(live)
     updating = orders_are_updating(live)
+    unavailable = order_details_unavailable(live)
     left, right = st.columns(2)
     with left:
-        st.caption(f"{len(buys)} Buy Orders")
-        placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
+        st.caption("Buy Orders Unavailable" if unavailable else f"{len(buys)} Buy Orders")
+        if unavailable:
+            placeholder = [{"Price": "Unavailable", "Lots": "-", "Status": "Refresh pending"}]
+        else:
+            placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
         st.dataframe(pd.DataFrame(buys or placeholder), use_container_width=True, hide_index=True)
     with right:
-        st.caption(f"{len(sells)} Sell Orders")
-        placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
+        st.caption("Sell Orders Unavailable" if unavailable else f"{len(sells)} Sell Orders")
+        if unavailable:
+            placeholder = [{"Price": "Unavailable", "Lots": "-", "Status": "Refresh pending"}]
+        else:
+            placeholder = [{"Price": "Updating...", "Lots": "-", "Status": "Waiting for Delta"}] if updating else [{"Price": "-", "Lots": "-", "Status": "-"}]
         st.dataframe(pd.DataFrame(sells or placeholder), use_container_width=True, hide_index=True)
 
 

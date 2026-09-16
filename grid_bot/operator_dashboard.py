@@ -23,6 +23,15 @@ TERMINAL_ORDER_STATUSES = {
     "superseded",
 }
 
+NON_RESTING_ORDER_STATUSES = TERMINAL_ORDER_STATUSES | {
+    "deferred",
+    "blocked",
+    "not_submitted",
+    "never_submitted",
+    "unresolved",
+    "ambiguous_submission",
+}
+
 HEALTH_MESSAGES = {
     "POSITION_MISMATCH": "Delta position does not match the bot's records.",
     "EXTERNAL_POSITION_CHANGE": "Delta position changed outside the GridBot. Trading has been paused until the position is reconciled.",
@@ -193,17 +202,21 @@ def health_issue_text(issue: dict) -> str:
 
 def active_orders(live: dict | None) -> list[dict]:
     rows = live_order_rows(live)
-    return [row for row in rows if str(row.get("raw_status") or "").lower() not in TERMINAL_ORDER_STATUSES]
+    return [row for row in rows if str(row.get("raw_status") or "").lower() not in NON_RESTING_ORDER_STATUSES]
 
 
 def live_order_rows(live: dict | None) -> list[dict]:
     live = live or {}
-    rows = live.get("known_gridbot_orders") or list(((live.get("active_run") or {}).get("orders") or {}).values())
+    compact_rows = live.get("resting_orders")
+    if isinstance(compact_rows, list):
+        rows = compact_rows
+    else:
+        rows = live.get("known_gridbot_orders") or list(((live.get("active_run") or {}).get("orders") or {}).values())
     normalized = []
     for row in rows:
         status = str(row.get("status") or "").lower()
-        remaining = decimal_value(row.get("remaining_quantity"), str(row.get("requested_quantity") or "0"))
-        if status in TERMINAL_ORDER_STATUSES or remaining <= 0:
+        remaining = decimal_value(row.get("quantity_lots") or row.get("remaining_quantity"), str(row.get("requested_quantity") or "0"))
+        if status in NON_RESTING_ORDER_STATUSES or remaining <= 0:
             continue
         normalized.append(
             {
@@ -223,6 +236,14 @@ def split_pending_orders(live: dict | None) -> tuple[list[dict], list[dict]]:
     buys = sorted([display_order(row) for row in rows if row.get("side") == "buy"], key=lambda row: row["_price"], reverse=True)
     sells = sorted([display_order(row) for row in rows if row.get("side") == "sell"], key=lambda row: row["_price"])
     return strip_private_keys(buys), strip_private_keys(sells)
+
+
+def order_details_unavailable(live: dict | None) -> bool:
+    live = live or {}
+    if isinstance(live.get("resting_orders"), list) or live.get("known_gridbot_orders") or (live.get("active_run") or {}).get("orders"):
+        return False
+    current = live.get("current_orders") or {}
+    return int(current.get("open_order_count") or live.get("open_order_count") or 0) > 0
 
 
 def display_order(row: dict) -> dict:

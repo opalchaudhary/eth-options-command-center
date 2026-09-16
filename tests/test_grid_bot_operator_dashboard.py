@@ -11,6 +11,7 @@ from grid_bot.operator_dashboard import (
     lifecycle_progress_summary,
     live_config,
     orders_are_updating,
+    order_details_unavailable,
     pnl_values,
     preview_edit_summary,
     split_pending_orders,
@@ -77,7 +78,53 @@ def test_pending_orders_exclude_terminal_rows() -> None:
     buys, sells = split_pending_orders(live)
 
     assert buys == [{"Price": "$2,400.00", "Lots": "1", "Status": "Open"}]
-    assert sells == [{"Price": "$2,500.00", "Lots": "1", "Status": "Waiting"}]
+    assert sells == []
+
+
+def test_pending_orders_render_compact_resting_rows_and_asymmetric_counts() -> None:
+    live = {
+        "current_orders": {"open_buy_count": 2, "open_sell_count": 15, "open_order_count": 17},
+        "resting_orders": [
+            *[
+                {"side": "buy", "price": price, "quantity_lots": "10", "status": "open", "level": f"L00{index}"}
+                for index, price in enumerate(["2265.7", "2276.04"], start=1)
+            ],
+            *[
+                {"side": "sell", "price": str(2421 + index), "quantity_lots": "10", "status": "open", "level": f"L{16 + index:03d}"}
+                for index in range(15)
+            ],
+        ],
+    }
+
+    buys, sells = split_pending_orders(live)
+
+    assert len(buys) == live["current_orders"]["open_buy_count"]
+    assert len(sells) == live["current_orders"]["open_sell_count"]
+    assert buys[0]["Price"] == "$2,276.04"
+    assert sells[0]["Price"] == "$2,421.00"
+    assert all(row["Status"] == "Open" for row in buys + sells)
+    assert order_details_unavailable(live) is False
+
+
+def test_pending_orders_hide_deferred_cancelled_filled_and_show_replacements() -> None:
+    live = {
+        "resting_orders": [
+            {"side": "sell", "price": "2500", "quantity_lots": "10", "status": "open", "order_kind": "replacement", "source_fill_id": "fill-1"},
+            {"side": "sell", "price": "2510", "quantity_lots": "10", "status": "deferred"},
+            {"side": "buy", "price": "2400", "quantity_lots": "10", "status": "manual_cancelled"},
+            {"side": "buy", "price": "2390", "quantity_lots": "10", "status": "filled"},
+        ]
+    }
+
+    buys, sells = split_pending_orders(live)
+
+    assert buys == []
+    assert sells == [{"Price": "$2,500.00", "Lots": "10", "Status": "Open"}]
+
+
+def test_order_details_unavailable_does_not_report_false_zero() -> None:
+    assert order_details_unavailable({"current_orders": {"open_order_count": 17, "open_buy_count": 2, "open_sell_count": 15}}) is True
+    assert order_details_unavailable({"current_orders": {"open_order_count": 0}, "resting_orders": []}) is False
 
 
 def test_transitional_order_board_reports_updating_instead_of_false_zero() -> None:

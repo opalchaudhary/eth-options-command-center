@@ -774,6 +774,43 @@ def _compact_order_counts(rows: list[dict]) -> dict:
     }
 
 
+def _compact_resting_orders(rows: list[dict]) -> list[dict]:
+    open_statuses = {"open", "submitted", "partially_filled", "pending"}
+    resting = []
+    for row in rows:
+        status = str(row.get("status") or "").lower()
+        if status not in open_statuses:
+            continue
+        try:
+            remaining = _decimal(row.get("remaining_quantity") or row.get("requested_quantity"))
+        except Exception:
+            remaining = Decimal("0")
+        if remaining <= 0:
+            continue
+        resting.append(
+            {
+                "level": row.get("level_id"),
+                "side": str(row.get("side") or "").lower(),
+                "price": str(row.get("price")) if row.get("price") not in [None, ""] else None,
+                "quantity_lots": str(remaining),
+                "status": status,
+                "client_order_id": row.get("client_order_id"),
+                "exchange_order_id": row.get("exchange_order_id"),
+                "config_version": row.get("config_version"),
+                "order_kind": row.get("order_kind"),
+                "source_fill_id": row.get("source_fill_id") or ((row.get("raw") or {}).get("gridbot") or {}).get("source_fill_id"),
+                "replacement_group_key": row.get("replacement_group_key") or ((row.get("raw") or {}).get("gridbot") or {}).get("replacement_group_key"),
+            }
+        )
+    return sorted(
+        resting,
+        key=lambda item: (
+            0 if item.get("side") == "buy" else 1,
+            -float(_decimal(item.get("price"))) if item.get("side") == "buy" else float(_decimal(item.get("price"))),
+        ),
+    )
+
+
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
     db = getattr(worker, "db", None)
@@ -814,6 +851,7 @@ def gridbot_compact_live_state() -> dict:
     progress = state.get("lifecycle_progress") or (run.get("lifecycle_progress") if isinstance(run, dict) else {}) or {}
     orders = state.get("known_gridbot_orders") or list((run.get("orders") or {}).values()) if isinstance(run, dict) else []
     counts = _compact_order_counts(orders)
+    resting_orders = _compact_resting_orders(orders)
     expected = int(progress.get("expected_orders") or completeness.get("expected") or 0)
     confirmed = int(progress.get("confirmed_orders") or completeness.get("confirmed_open") or 0)
     filled = int(progress.get("filled_orders") or completeness.get("filled") or 0)
@@ -870,6 +908,7 @@ def gridbot_compact_live_state() -> dict:
             "waiting_orders": progress.get("waiting_orders"),
         },
         "current_orders": counts,
+        "resting_orders": resting_orders,
         **counts,
         "fill_derived_inventory": state.get("fill_derived_inventory"),
         "delta_position": state.get("delta_position") or telemetry.get("position_lots"),
