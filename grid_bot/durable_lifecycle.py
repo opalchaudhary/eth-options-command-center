@@ -1237,6 +1237,17 @@ class DurableGridBotLifecycle:
             terminalized += 1
         return terminalized
 
+    def _deferred_order_should_be_reconsidered(self, order: dict, proposal: OrderProposal, product_spec) -> bool:
+        raw = order.get("raw") or {}
+        gridbot = raw.get("gridbot") or {}
+        reason = str(order.get("rejection_reason") or gridbot.get("exchange_error_code") or gridbot.get("terminal_reason") or "")
+        if any(token in reason for token in ["OPENING_RESERVATION", "MAX_", "INVENTORY"]):
+            return True
+        post_only = validate_post_only_price(proposal.side, proposal.price, product_spec.best_bid, product_spec.best_ask)
+        if post_only.allowed:
+            return True
+        return not bool(order.get("current_retry_attempt") or gridbot.get("current_retry_attempt"))
+
     def _terminalize_never_submitted_orders(
         self,
         run: dict,
@@ -2045,6 +2056,15 @@ class DurableGridBotLifecycle:
             "skipped": 0,
             "existing": 0,
             "cancel_replaced": 0,
+            "deferred_current": 0,
+            "deferred_reconsidered": 0,
+            "deferred_reactivated": 0,
+            "deferred_still_blocked": 0,
+            "deferred_superseded": 0,
+            "reactivation_capacity_lots": {"buy": "0", "sell": "0"},
+            "reactivation_attempts": 0,
+            "reactivation_successes": 0,
+            "reactivation_post_only_redeferred": 0,
             "items": [],
             "metrics": {},
         }
@@ -2063,18 +2083,53 @@ class DurableGridBotLifecycle:
         if operational_inventory_value in [None, ""]:
             operational_inventory_value = (reconciliation or {}).get("gridbot_inventory")
         inventory = _decimal(operational_inventory_value, str(_position_size(self.client, product_id)))
+        outcome["deferred_current"] = len(
+            [
+                order
+                for order in (run.get("deferred_orders") or {}).values()
+                if int(order.get("config_version") or 0) == int((run.get("config") or {}).get("config_version") or 1)
+                and str(order.get("status") or "").lower() in DEFERRED_ORDER_STATUSES
+            ]
+        )
+        reservation = evaluate_order_semantics(
+            GridType(run["config"]["grid_type"]),
+            inventory,
+            _decimal(run["config"]["max_inventory_lots"]),
+            Side.BUY,
+            Decimal("0"),
+            self._open_order_records(run),
+        )
+        outcome["reactivation_capacity_lots"] = {
+            "buy": str(max(Decimal("0"), _decimal(run["config"]["max_inventory_lots"]) - reservation.reserved_long_after)),
+            "sell": str(max(Decimal("0"), _decimal(run["config"]["max_inventory_lots"]) - reservation.reserved_short_after)),
+        }
         outcome["skipped"] = int(run.pop("_replacement_refresh_skipped", 0) or 0)
-        for group_key, group in sorted((run.get("replacement_entitlements") or {}).items()):
+        product_spec = self.client.product_spec((run.get("product") or {}).get("symbol") or (run.get("config") or {}).get("product_symbol") or "ETHUSD")
+        group_keys = self._replacement_entitlement_processing_order(run, product_spec.mark_price or product_spec.last_price)
+        for group_key in group_keys:
+            group = (run.get("replacement_entitlements") or {}).get(group_key)
+            if not group:
+                continue
             with self._replacement_entitlement_lock(run["run_id"], group_key):
                 self._refresh_replacement_entitlements(run)
                 group = (run.get("replacement_entitlements") or {}).get(group_key) or group
-                result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory)
+                result = self._place_replacement_for_entitlement(run, product_id, group_key, group, inventory, product_spec=product_spec)
             if result:
                 outcome[result["state"]] = outcome.get(result["state"], 0) + 1
                 if result.get("cancel_replaced"):
                     outcome["cancel_replaced"] += 1
                 if result.get("retried_attempts"):
                     outcome["retried_attempts"] = outcome.get("retried_attempts", 0) + int(result.get("retried_attempts") or 0)
+                if result.get("deferred_reconsidered"):
+                    outcome["deferred_reconsidered"] += int(result.get("deferred_reconsidered") or 0)
+                    outcome["reactivation_attempts"] += 1
+                    if result["state"] == "created":
+                        outcome["deferred_reactivated"] += int(result.get("deferred_reconsidered") or 0)
+                        outcome["reactivation_successes"] += 1
+                    elif result["state"] == "deferred":
+                        outcome["deferred_still_blocked"] += int(result.get("deferred_reconsidered") or 0)
+                        if "POST_ONLY" in str(result.get("reason") or ""):
+                            outcome["reactivation_post_only_redeferred"] += 1
                 outcome["items"].append(result)
         outcome["metrics"] = self._replacement_metrics(run)
         return outcome
@@ -2103,6 +2158,29 @@ class DurableGridBotLifecycle:
         target = deepcopy(levels[target_index])
         target["side"] = Side.SELL.value if fill_side == Side.BUY else Side.BUY.value
         return target
+
+    def _replacement_entitlement_processing_order(self, run: dict, market_price: Decimal | None = None) -> list[str]:
+        entitlements = run.get("replacement_entitlements") or {}
+
+        def sort_key(item: tuple[str, dict]) -> tuple:
+            group_key, group = item
+            side = str(group.get("target_side") or "")
+            price = _decimal(group.get("target_price"))
+            level_id = str(group.get("target_level_id") or "")
+            created_at = str(group.get("created_at") or "")
+            if side == Side.BUY.value:
+                side_rank = 0
+                price_rank = -price
+            elif side == Side.SELL.value:
+                side_rank = 1
+                price_rank = price
+            else:
+                side_rank = 2
+                price_rank = abs(price - market_price) if market_price is not None else price
+            return (side_rank, price_rank, level_id, created_at, group_key)
+
+        return [group_key for group_key, _group in sorted(entitlements.items(), key=sort_key)]
+
 
     def _refresh_replacement_entitlements(self, run: dict) -> None:
         entitlements: dict[str, dict] = {}
@@ -2240,6 +2318,7 @@ class DurableGridBotLifecycle:
         group_key: str,
         group: dict,
         current_inventory: Decimal | None = None,
+        product_spec=None,
     ) -> dict | None:
         entitlement = _decimal(group.get("replacement_entitlement_qty"))
         filled = _decimal(group.get("replacement_qty_already_filled"))
@@ -2252,16 +2331,23 @@ class DurableGridBotLifecycle:
             if self._order_represents_replacement_entitlement(order, group_key, group)
             and str(order.get("status") or "").lower() not in START_TERMINAL_ORDER_STATUSES
         ]
-        related_deferred = [
-            order
-            for order in list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values())
-            if order.get("client_order_id") != group.get("source_order_key")
-            and order.get("order_kind") != "safety_flatten"
-            and order.get("level_id") == group.get("target_level_id")
-            and order.get("side") == group.get("target_side")
-            and _decimal(order.get("price")) == _decimal(group.get("target_price"))
-            and str(order.get("status") or "").lower() in DEFERRED_ORDER_STATUSES
-        ]
+        related_deferred = []
+        related_deferred_seen: set[str] = set()
+        for order in list((run.get("orders") or {}).values()) + list((run.get("deferred_orders") or {}).values()):
+            client_order_id = str(order.get("client_order_id") or order.get("order_key") or "")
+            if not client_order_id or client_order_id in related_deferred_seen:
+                continue
+            if (
+                order.get("client_order_id") != group.get("source_order_key")
+                and order.get("order_kind") != "safety_flatten"
+                and int(order.get("config_version") or 0) == int((run.get("config") or {}).get("config_version") or 1)
+                and order.get("level_id") == group.get("target_level_id")
+                and order.get("side") == group.get("target_side")
+                and _decimal(order.get("price")) == _decimal(group.get("target_price"))
+                and str(order.get("status") or "").lower() in DEFERRED_ORDER_STATUSES
+            ):
+                related_deferred_seen.add(client_order_id)
+                related_deferred.append(order)
         if deficit <= 0:
             return {"state": "existing", "replacement_group_key": group_key, "entitlement": str(entitlement), "open": str(open_qty), "filled": str(filled)}
         if related_open:
@@ -2275,18 +2361,6 @@ class DurableGridBotLifecycle:
                 "reason": "accepted_replacement_order_already_current",
                 "retried_attempts": retried_attempts,
             }
-        if related_deferred:
-            return {
-                "state": "deferred",
-                "replacement_group_key": group_key,
-                "entitlement": str(entitlement),
-                "open": str(open_qty),
-                "filled": str(filled),
-                "residual": str(deficit),
-                "reason": "target_level_deferred_by_inventory_reservation",
-                "retried_attempts": retried_attempts,
-            }
-
         target = {
             "level_id": group["target_level_id"],
             "side": group["target_side"],
@@ -2311,6 +2385,22 @@ class DurableGridBotLifecycle:
             quantity=deficit,
             client_order_id=client_order_id,
         )
+        if related_deferred:
+            reconsidered = [order for order in related_deferred if self._deferred_order_should_be_reconsidered(order, proposal, product_spec)]
+            if not reconsidered:
+                return {
+                    "state": "deferred",
+                    "replacement_group_key": group_key,
+                    "entitlement": str(entitlement),
+                    "open": str(open_qty),
+                    "filled": str(filled),
+                    "residual": str(deficit),
+                    "reason": "target_level_deferred_still_current",
+                    "retried_attempts": retried_attempts,
+                }
+            for order in reconsidered:
+                self._mark_order_non_current_retry(run, order, status="retried", reason="deferred_reactivation_replaced")
+            retried_attempts += len(reconsidered)
         created = self._place_proposal(
             run,
             product_id,
@@ -2318,6 +2408,7 @@ class DurableGridBotLifecycle:
             "replacement",
             current_inventory=current_inventory,
             source_fill_id=source_fill_ids[0] if len(source_fill_ids) == 1 else group_key,
+            product_spec=product_spec,
         )
         created["replacement_group_key"] = group_key
         created["source_order_key"] = group["source_order_key"]
@@ -2358,6 +2449,8 @@ class DurableGridBotLifecycle:
             "entitlement": str(entitlement),
             "cancel_replaced": bool(related_open),
             "retried_attempts": retried_attempts,
+            "deferred_reconsidered": len(reconsidered) if related_deferred else 0,
+            "reason": created.get("rejection_reason"),
         }
 
     def _place_replacement_for_fill(

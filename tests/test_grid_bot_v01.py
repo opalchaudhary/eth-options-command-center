@@ -3213,6 +3213,37 @@ def _replacement_run(grid_type="neutral", source_level="L002", source_side="buy"
     }
 
 
+def _add_replacement_source(run, *, level_id, side, price, fill_id, size="1", order_id=None):
+    client_order_id = f"DGB01-truth-{level_id}-{side[0].upper()}-{fill_id}"
+    exchange_order_id = order_id or f"ex-{fill_id}"
+    run["orders"][client_order_id] = {
+        "order_key": client_order_id,
+        "run_id": run["run_id"],
+        "level_id": level_id,
+        "side": side,
+        "price": price,
+        "requested_quantity": size,
+        "filled_quantity": size,
+        "remaining_quantity": "0",
+        "client_order_id": client_order_id,
+        "exchange_order_id": exchange_order_id,
+        "status": "filled",
+        "order_kind": "initial_grid",
+        "config_version": run["config"]["config_version"],
+        "opens_inventory": True,
+    }
+    run["fills"][fill_id] = {
+        "id": fill_id,
+        "order_id": exchange_order_id,
+        "client_order_id": client_order_id,
+        "side": side,
+        "price": price,
+        "size": size,
+        "commission": "0",
+    }
+    return client_order_id
+
+
 def test_exchange_truth_open_order_remains_open():
     run = _truth_run()
     result = reconcile_exchange_truth(run, _TruthClient(open_orders=[_open_exchange_order()], position="0"))
@@ -3741,6 +3772,211 @@ def test_deferred_replacement_submits_when_post_only_becomes_eligible(tmp_path):
     assert replacement["exchange_order_id"]
     assert replacement["client_order_id"] == client.orders[0]["client_order_id"]
     assert run["deferred_orders"] == {}
+
+
+def test_stale_same_target_deferred_row_is_reconsidered_for_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L003", source_side="sell", fill_id="fill-sell")
+    run["config"]["max_inventory_lots"] = "2"
+    run["orders"]["existing-buy-reservation"] = {
+        "client_order_id": "existing-buy-reservation",
+        "order_key": "existing-buy-reservation",
+        "run_id": run["run_id"],
+        "level_id": "L001",
+        "side": "buy",
+        "price": "2490",
+        "requested_quantity": "1",
+        "remaining_quantity": "1",
+        "filled_quantity": "0",
+        "exchange_order_id": "open-buy-1",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 3,
+        "opens_inventory": True,
+    }
+    stale = {
+        "client_order_id": "stale-l002-buy",
+        "order_key": "stale-l002-buy",
+        "run_id": run["run_id"],
+        "level_id": "L002",
+        "side": "buy",
+        "price": "2495",
+        "requested_quantity": "1",
+        "remaining_quantity": "0",
+        "filled_quantity": "0",
+        "exchange_order_id": "",
+        "status": "deferred",
+        "order_kind": "edit_grid",
+        "config_version": 3,
+        "rejection_reason": "LONG_OPENING_RESERVATION_EXCEEDED",
+    }
+    run["orders"][stale["client_order_id"]] = stale
+    run["deferred_orders"][stale["client_order_id"]] = stale
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "0"})
+    replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement" and order.get("status") == "open"]
+
+    assert result["created"] == 1
+    assert result["deferred_reconsidered"] == 1
+    assert result["deferred_reactivated"] == 1
+    assert replacements[0]["level_id"] == "L002"
+    assert replacements[0]["side"] == "buy"
+    assert run["orders"]["stale-l002-buy"]["status"] == "retried"
+    assert run["orders"]["stale-l002-buy"]["terminal_reason"] == "deferred_reactivation_replaced"
+    assert sum(Decimal(str(order.get("remaining_quantity") or "0")) for order in run["orders"].values() if order.get("side") == "buy" and order.get("status") == "open") == Decimal("2")
+
+
+def test_reactivation_allocates_limited_buy_capacity_once_by_nearest_market(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L003", source_side="sell", fill_id="sell-near")
+    run["levels"] = [
+        {"level_id": "L001", "index": 1, "side": "buy", "price": "2485", "quantity": "1", "state": "active"},
+        {"level_id": "L002", "index": 2, "side": "buy", "price": "2495", "quantity": "1", "state": "active"},
+        {"level_id": "L003", "index": 3, "side": "sell", "price": "2498", "quantity": "1", "state": "active"},
+        {"level_id": "L004", "index": 4, "side": "sell", "price": "2499", "quantity": "1", "state": "active"},
+    ]
+    run["config"]["max_inventory_lots"] = "2"
+    _add_replacement_source(run, level_id="L004", side="sell", price="2499", fill_id="sell-far")
+    run["orders"]["existing-buy-reservation"] = {
+        "client_order_id": "existing-buy-reservation",
+        "order_key": "existing-buy-reservation",
+        "run_id": run["run_id"],
+        "level_id": "L001",
+        "side": "buy",
+        "price": "2485",
+        "requested_quantity": "1",
+        "remaining_quantity": "1",
+        "filled_quantity": "0",
+        "exchange_order_id": "open-buy-1",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 3,
+        "opens_inventory": True,
+    }
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "0"})
+    open_replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement" and order.get("status") == "open"]
+    deferred_replacements = [order for order in run["deferred_orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert result["created"] == 1
+    assert result["deferred"] == 1
+    assert open_replacements[0]["level_id"] == "L003"
+    assert open_replacements[0]["price"] == "2498"
+    assert "LONG_OPENING_RESERVATION_EXCEEDED" in deferred_replacements[0]["rejection_reason"]
+    assert sum(Decimal(str(order.get("remaining_quantity") or "0")) for order in run["orders"].values() if order.get("side") == "buy" and order.get("status") == "open") == Decimal("2")
+
+
+def test_reactivation_post_only_failure_does_not_consume_buy_capacity(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L003", source_side="sell", fill_id="sell-valid")
+    run["levels"] = [
+        {"level_id": "L001", "index": 1, "side": "buy", "price": "2485", "quantity": "1", "state": "active"},
+        {"level_id": "L002", "index": 2, "side": "buy", "price": "2495", "quantity": "1", "state": "active"},
+        {"level_id": "L003", "index": 3, "side": "sell", "price": "2505", "quantity": "1", "state": "active"},
+        {"level_id": "L004", "index": 4, "side": "sell", "price": "2510", "quantity": "1", "state": "active"},
+    ]
+    run["config"]["max_inventory_lots"] = "2"
+    _add_replacement_source(run, level_id="L004", side="sell", price="2510", fill_id="sell-cross")
+    run["orders"]["existing-buy-reservation"] = {
+        "client_order_id": "existing-buy-reservation",
+        "order_key": "existing-buy-reservation",
+        "run_id": run["run_id"],
+        "level_id": "L001",
+        "side": "buy",
+        "price": "2485",
+        "requested_quantity": "1",
+        "remaining_quantity": "1",
+        "filled_quantity": "0",
+        "exchange_order_id": "open-buy-1",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 3,
+        "opens_inventory": True,
+    }
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "0"})
+    open_replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement" and order.get("status") == "open"]
+    deferred_reasons = [order.get("rejection_reason") for order in run["deferred_orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert result["created"] == 1
+    assert result["deferred"] == 1
+    assert open_replacements[0]["level_id"] == "L002"
+    assert any("POST_ONLY_BUY_WOULD_CROSS_ASK" in reason for reason in deferred_reasons)
+    assert sum(Decimal(str(order.get("remaining_quantity") or "0")) for order in run["orders"].values() if order.get("side") == "buy" and order.get("status") == "open") == Decimal("2")
+
+
+def test_reactivation_allocates_limited_sell_capacity_symmetrically(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L001", source_side="buy", fill_id="buy-near")
+    run["levels"] = [
+        {"level_id": "L001", "index": 1, "side": "buy", "price": "2490", "quantity": "1", "state": "active"},
+        {"level_id": "L002", "index": 2, "side": "buy", "price": "2505", "quantity": "1", "state": "active"},
+        {"level_id": "L003", "index": 3, "side": "sell", "price": "2510", "quantity": "1", "state": "active"},
+        {"level_id": "L004", "index": 4, "side": "sell", "price": "2515", "quantity": "1", "state": "active"},
+    ]
+    run["config"]["max_inventory_lots"] = "2"
+    _add_replacement_source(run, level_id="L002", side="buy", price="2505", fill_id="buy-far")
+    run["orders"]["existing-sell-reservation"] = {
+        "client_order_id": "existing-sell-reservation",
+        "order_key": "existing-sell-reservation",
+        "run_id": run["run_id"],
+        "level_id": "L004",
+        "side": "sell",
+        "price": "2515",
+        "requested_quantity": "1",
+        "remaining_quantity": "1",
+        "filled_quantity": "0",
+        "exchange_order_id": "open-sell-1",
+        "status": "open",
+        "order_kind": "initial_grid",
+        "config_version": 3,
+        "opens_inventory": True,
+    }
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "0"})
+    open_replacements = [order for order in run["orders"].values() if order.get("order_kind") == "replacement" and order.get("status") == "open"]
+    deferred_replacements = [order for order in run["deferred_orders"].values() if order.get("order_kind") == "replacement"]
+
+    assert result["created"] == 1
+    assert result["deferred"] == 1
+    assert open_replacements[0]["level_id"] == "L002"
+    assert open_replacements[0]["side"] == "sell"
+    assert "SHORT_OPENING_RESERVATION_EXCEEDED" in deferred_replacements[0]["rejection_reason"]
+    assert sum(Decimal(str(order.get("remaining_quantity") or "0")) for order in run["orders"].values() if order.get("side") == "sell" and order.get("status") == "open") == Decimal("2")
+
+
+def test_retired_config_deferred_target_does_not_reactivate_or_block_current_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", use_supabase=False)
+    run = _replacement_run(source_level="L003", source_side="sell", fill_id="fill-current")
+    retired = {
+        "client_order_id": "retired-l002-buy",
+        "order_key": "retired-l002-buy",
+        "run_id": run["run_id"],
+        "level_id": "L002",
+        "side": "buy",
+        "price": "2495",
+        "requested_quantity": "1",
+        "remaining_quantity": "0",
+        "filled_quantity": "0",
+        "exchange_order_id": "",
+        "status": "deferred",
+        "order_kind": "replacement",
+        "config_version": 2,
+        "rejection_reason": "LONG_OPENING_RESERVATION_EXCEEDED",
+    }
+    run["orders"][retired["client_order_id"]] = retired
+    run["deferred_orders"][retired["client_order_id"]] = retired
+
+    result = lifecycle.process_replacements(run, {"gridbot_inventory": "0"})
+
+    assert result["created"] == 1
+    assert run["orders"]["retired-l002-buy"]["status"] == "deferred"
+    assert run["deferred_orders"]["retired-l002-buy"]["status"] == "deferred"
 
 
 def test_replacement_retry_terminalizes_old_attempts_after_ten_deterministic_rejections(tmp_path):
