@@ -4948,6 +4948,78 @@ def test_continuous_worker_recovers_same_run_when_persisted_status_changes(tmp_p
     assert db.stats()["select"] > 2
 
 
+def test_compact_recovers_persisted_active_run_when_worker_memory_empty(tmp_path, monkeypatch):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    class EmptyWorker:
+        def __init__(self, db):
+            self.db = db
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": True,
+                "thread_alive": True,
+                "run_id": None,
+                "status": "idle",
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "accounting": {},
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", EmptyWorker(db))
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["run_id"] == started["run"]["run_id"]
+    assert compact["status"] == "reattach_pending"
+    assert compact["config"]["config_version"] == 1
+    assert compact["current_orders"]["open_order_count"] == len(started["run"]["orders"])
+
+
+def test_worker_reattach_ingests_down_fill_without_immediate_replacement(tmp_path):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+    run_id = started["run"]["run_id"]
+    buy_order = next(order for order in client.orders if order["side"] == "buy")
+    buy_order["state"] = "closed"
+    buy_order["unfilled_size"] = "0"
+    client.fill_rows = [
+        {
+            "id": "fill-worker-down",
+            "order_id": buy_order["id"],
+            "client_order_id": buy_order["client_order_id"],
+            "side": "buy",
+            "size": buy_order["size"],
+            "price": buy_order["limit_price"],
+            "created_at": utc_now(),
+        }
+    ]
+    client.position_size = str(buy_order["size"])
+    before_order_count = len(client.orders)
+
+    worker = ContinuousGridBotWorker(client=client, db=db, poll_interval_seconds=0.01, snapshot_interval_seconds=3600)
+    recovered = worker._recover_active_run()
+    result = worker._reattach_reconcile_once(recovered)
+
+    assert result["new_fills"] == 1
+    assert result["gridbot_inventory"] == str(buy_order["size"])
+    assert result["delta_position"] == str(buy_order["size"])
+    assert result["position_mismatches"] == 0
+    assert len(client.orders) == before_order_count
+    assert worker.state()["reattach_reconciliation_pending"] is False
+    loaded = db.load_run_state(run_id)
+    assert "fill-worker-down" in loaded["fills"]
+    assert loaded["orders"][buy_order["client_order_id"]]["status"] == "filled"
+
+
 def test_continuous_worker_advances_persisted_edit_after_client_disconnect(tmp_path):
     client = _FakeLifecycleClient()
     db = _CountingSupabaseGridRepository()

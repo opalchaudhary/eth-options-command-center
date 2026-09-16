@@ -165,6 +165,8 @@ class ContinuousGridBotWorker:
             "accounting": build_run_accounting({}).as_dict(),
             "health": evaluate_gridbot_health({}),
             "recent_resolved_health_issues": [],
+            "reattach_reconciliation_pending": False,
+            "last_reattach_reconciliation": None,
         }
 
     def start(self) -> dict:
@@ -257,6 +259,7 @@ class ContinuousGridBotWorker:
             delta_position="0",
             last_fill=None,
             last_replacement=None,
+            reattach_reconciliation_pending=False,
         )
 
     def _recover_active_run(self) -> dict | None:
@@ -276,6 +279,7 @@ class ContinuousGridBotWorker:
                     "known_fill_count": len(run.get("fills") or {}),
                     "known_order_count": len(run.get("orders") or {}),
                     "replacement_count": len(run.get("replacement_keys") or {}),
+                    "reattach_reconciliation_pending": run.get("status") == GridStatus.RUNNING.value,
                 }
             )
         return run
@@ -397,6 +401,12 @@ class ContinuousGridBotWorker:
                         continue
                     run = recovered_run
 
+                if run.get("status") == GridStatus.RUNNING.value and self._state.get("reattach_reconciliation_pending"):
+                    result = self._reattach_reconcile_once(run)
+                    elapsed = time.monotonic() - started
+                    self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
+                    continue
+
                 result = self._poll_once(run)
                 duration = time.monotonic() - started
                 poll_count = self._state["poll_count"] + 1
@@ -442,6 +452,71 @@ class ContinuousGridBotWorker:
             self._stop.wait(max(0.0, self.poll_interval_seconds - elapsed))
         self._set_state(running=False, thread_alive=False, status="stopped")
         logger.info("DeltaGridBot V0.1 continuous worker stopped.")
+
+    def _reattach_reconcile_once(self, run: dict) -> dict:
+        before_fills = set((run.get("fills") or {}).keys())
+        result = reconcile_exchange_truth(run, self.client, self.db if self.db.enabled else None, persist_order_updates=True)
+        before_telemetry_counts = dict(self.account_telemetry.request_counts)
+        telemetry = self.account_telemetry.get("ETHUSD")
+        telemetry_refreshed = dict(self.account_telemetry.request_counts) != before_telemetry_counts
+        new_fill_ids = [fill_id for fill_id in (run.get("fills") or {}) if fill_id not in before_fills]
+        if new_fill_ids:
+            self._set_state(last_fill={"fill_id": new_fill_ids[-1], "raw": (run.get("fills") or {}).get(new_fill_ids[-1])})
+        clean = (
+            not result.get("errors")
+            and int(result.get("unresolved_orders") or 0) == 0
+            and int(result.get("position_mismatches") or 0) == 0
+            and int(result.get("fill_ledger_mismatches") or 0) == 0
+        )
+        replacement_result = {"created": 0, "deferred": 0, "skipped": len(run.get("fills") or {}), "items": [{"state": "skipped", "reason": "startup_reattach_reconciliation"}], "metrics": {}}
+        if self.db.enabled:
+            risk = {
+                "created_at": utc_now(),
+                "position": result.get("delta_position"),
+                "gridbot_inventory": result.get("gridbot_inventory"),
+                "open_gridbot_orders": result.get("exchange_open_orders"),
+                "position_mismatches": result.get("position_mismatches"),
+                "fill_ledger_mismatches": result.get("fill_ledger_mismatches"),
+                "reconciliation": result,
+                "replacements": replacement_result,
+                "account_risk_state": telemetry.as_dict(),
+                "snapshot_reason": "startup_reattach_reconciliation",
+            }
+            run.setdefault("risk_snapshots", []).append(risk)
+            persisted = self.db.persist_snapshot(run, risk, run.get("summary"))
+            self._last_snapshot_monotonic = time.monotonic()
+            self._last_snapshot_signature = self._snapshot_signature(run, result, replacement_result, telemetry)
+            if persisted is not False:
+                self._set_state(snapshot_writes=self._state["snapshot_writes"] + 1)
+        self._set_state(
+            status="running" if clean else "reattach_blocked",
+            poll_count=self._state["poll_count"] + 1,
+            successful_polls=self._state["successful_polls"] + (1 if clean else 0),
+            last_poll_at=utc_now(),
+            last_successful_poll_at=utc_now() if clean else self._state.get("last_successful_poll_at"),
+            last_successful_reconcile=result.get("last_successful_reconcile") or self._state.get("last_successful_reconcile"),
+            last_error=None if clean else "; ".join(result.get("errors") or ["reattach reconciliation not clean"])[:500],
+            fill_derived_inventory=result.get("gridbot_inventory"),
+            delta_position=result.get("delta_position"),
+            open_gridbot_orders=result.get("exchange_open_orders"),
+            known_fill_count=len(run.get("fills") or {}),
+            known_order_count=len(run.get("orders") or {}),
+            replacement_count=len(run.get("replacement_keys") or {}),
+            deferred_replacement_count=len(run.get("deferred_orders") or {}),
+            position_mismatches=result.get("position_mismatches"),
+            fill_ledger_mismatches=result.get("fill_ledger_mismatches"),
+            account_risk_state=telemetry.as_dict(),
+            accounting=build_run_accounting(run, mark_price=telemetry.mark_price, account_position_lots=telemetry.position_lots).as_dict(),
+            account_telemetry_refresh_count=self._state["account_telemetry_refresh_count"] + (1 if telemetry_refreshed else 0),
+            delta_account_telemetry_request_counts=dict(self.account_telemetry.request_counts),
+            replacement_aggregation_metrics=replacement_result.get("metrics") or {},
+            last_reattach_reconciliation=result,
+            reattach_reconciliation_pending=not clean,
+        )
+        with self._lock:
+            self._run = run
+        self._update_health(run, result)
+        return result
 
     def _snapshot_signature(self, run: dict, reconciliation: dict, replacement_result: dict, telemetry: Any) -> tuple:
         telemetry_payload = telemetry.as_dict() if hasattr(telemetry, "as_dict") else (telemetry or {})
@@ -655,9 +730,17 @@ def stop_continuous_gridbot_worker() -> dict:
 def gridbot_live_state() -> dict:
     state = worker.state()
     health_run = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
+    db = getattr(worker, "db", None)
     try:
-        if state.get("run_id") and worker.db.enabled:
-            latest_run = worker.db.load_run_state(state["run_id"])
+        if db and getattr(db, "enabled", False) and not state.get("run_id") and hasattr(db, "active_run"):
+            active = db.active_run()
+            if active:
+                latest_run = db.load_run_state(active["run_id"])
+                health_run = latest_run
+                state = _apply_run_to_live_state(state, latest_run)
+                state["status"] = "reattach_pending" if latest_run.get("status") == GridStatus.RUNNING.value else state.get("status")
+        elif state.get("run_id") and db and getattr(db, "enabled", False):
+            latest_run = db.load_run_state(state["run_id"])
             if latest_run:
                 health_run = latest_run
                 state = _apply_run_to_live_state(state, latest_run)
@@ -693,11 +776,23 @@ def _compact_order_counts(rows: list[dict]) -> dict:
 
 def gridbot_compact_live_state() -> dict:
     state = worker.state()
-    if state.get("run_id") and worker.db.enabled:
+    db = getattr(worker, "db", None)
+    if state.get("run_id") and db and getattr(db, "enabled", False):
         try:
-            latest_run = worker.db.load_run_state(state["run_id"])
+            latest_run = db.load_run_state(state["run_id"])
             if latest_run:
                 state = _apply_run_to_live_state(state, latest_run)
+        except Exception as exc:
+            state["active_run_refresh_error"] = str(exc)[:300]
+    elif db and getattr(db, "enabled", False) and hasattr(db, "active_run"):
+        try:
+            active = db.active_run()
+            if active:
+                latest_run = db.load_run_state(active["run_id"])
+                if latest_run:
+                    state = _apply_run_to_live_state(state, latest_run)
+                    state["status"] = "reattach_pending" if latest_run.get("status") == GridStatus.RUNNING.value else state.get("status")
+                    state["source"] = "persisted_active_run_compact"
         except Exception as exc:
             state["active_run_refresh_error"] = str(exc)[:300]
     if not state.get("run_id"):
