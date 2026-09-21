@@ -1013,6 +1013,8 @@ def gridbot_compact_live_state() -> dict:
             "overall_status": health.get("overall_status"),
             "safe_for_risk_increase": health.get("safe_for_risk_increase"),
             "safe_for_risk_reduce": health.get("safe_for_risk_reduce"),
+            "new_order_restricted": health.get("new_order_restricted"),
+            "dynamic_risk": health.get("dynamic_risk") or {},
             "operator_attention_required": health.get("operator_attention_required"),
             "active_issues": health.get("active_issues") or [],
             "position_inventory_agreement": health.get("position_inventory_agreement") or {},

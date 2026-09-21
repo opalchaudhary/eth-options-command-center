@@ -36,7 +36,7 @@ from grid_bot.reconciliation import reconcile_orders
 from grid_bot.repository import InMemoryGridRepository
 from grid_bot.rest_fallback import RestFallbackPoller, RestFallbackState
 from grid_bot.risk import GridRiskController, RiskInputs, RiskState, grid_risk_ratio, inventory_utilisation
-from grid_bot.semantics import evaluate_order_semantics, round_price_for_side, validate_post_only_price
+from grid_bot.semantics import dynamic_inventory_reservation, evaluate_order_semantics, order_risk_breakdown, round_price_for_side, validate_post_only_price
 from grid_bot.supabase_repository import SupabaseGridRepository, SupabasePersistenceError, _reconstructed_deployment_completeness
 
 
@@ -297,6 +297,78 @@ def test_outstanding_opening_order_reservation_blocks_only_new_openers():
     neutral_buys = [{"side": "buy", "remaining_quantity": "5", "status": "open", "opens_inventory": True} for _ in range(10)]
     assert not evaluate_order_semantics(GridType.NEUTRAL, Decimal("0"), Decimal("50"), Side.BUY, Decimal("5"), neutral_buys).allowed
     assert evaluate_order_semantics(GridType.NEUTRAL, Decimal("0"), Decimal("50"), Side.SELL, Decimal("5"), neutral_buys).allowed
+
+
+def test_order_risk_breakdown_reclassifies_against_current_inventory():
+    reducing_sell = order_risk_breakdown(Decimal("20"), Side.SELL, Decimal("10"))
+    crossing_sell = order_risk_breakdown(Decimal("5"), Side.SELL, Decimal("10"))
+    increasing_sell = order_risk_breakdown(Decimal("-20"), Side.SELL, Decimal("10"))
+
+    assert reducing_sell.reducing_quantity == Decimal("10")
+    assert reducing_sell.increasing_quantity == Decimal("0")
+    assert crossing_sell.reducing_quantity == Decimal("5")
+    assert crossing_sell.short_opening_quantity == Decimal("5")
+    assert increasing_sell.short_opening_quantity == Decimal("10")
+    assert increasing_sell.risk_increasing is True
+
+
+def test_dynamic_reservation_ignores_stale_opens_inventory_flags():
+    stale_sells = [
+        {"client_order_id": f"sell-{index}", "side": "sell", "remaining_quantity": "10", "status": "open", "opens_inventory": False}
+        for index in range(4)
+    ]
+
+    reservation = dynamic_inventory_reservation(GridType.NEUTRAL, Decimal("-120"), stale_sells)
+
+    assert reservation.short_reserved == Decimal("160")
+    assert reservation.short_opening_resting == Decimal("40")
+    assert reservation.risk_increasing_resting_quantity == Decimal("40")
+    assert len(reservation.risk_increasing_resting_orders) == 4
+
+
+def test_dynamic_order_admission_blocks_only_current_risk_increasing_side():
+    stale_sells = [
+        {"client_order_id": "old-sell", "side": "sell", "remaining_quantity": "10", "status": "open", "opens_inventory": False}
+    ]
+
+    sell = evaluate_order_semantics(GridType.NEUTRAL, Decimal("-120"), Decimal("100"), Side.SELL, Decimal("10"), stale_sells)
+    buy = evaluate_order_semantics(GridType.NEUTRAL, Decimal("-120"), Decimal("100"), Side.BUY, Decimal("10"), stale_sells)
+
+    assert sell.allowed is False
+    assert "MAX_INVENTORY_EXCEEDED" in sell.reason_codes
+    assert "SHORT_OPENING_RESERVATION_EXCEEDED" in sell.reason_codes
+    assert buy.allowed is True
+    assert buy.opens_inventory is False
+    assert buy.reduces_inventory is True
+
+
+def test_dynamic_order_admission_blocks_aggregate_cross_zero_opening():
+    existing_sells = [
+        {"client_order_id": "sell-a", "side": "sell", "remaining_quantity": "10", "status": "open", "opens_inventory": False},
+        {"client_order_id": "sell-b", "side": "sell", "remaining_quantity": "10", "status": "open", "opens_inventory": False},
+    ]
+
+    decision = evaluate_order_semantics(GridType.NEUTRAL, Decimal("15"), Decimal("5"), Side.SELL, Decimal("1"), existing_sells)
+
+    assert decision.allowed is False
+    assert decision.reserved_short_after == Decimal("6")
+    assert "MAX_INVENTORY_EXCEEDED" not in decision.reason_codes
+    assert "SHORT_OPENING_RESERVATION_EXCEEDED" in decision.reason_codes
+
+
+def test_dynamic_order_admission_mirrors_long_side_over_max():
+    stale_buys = [
+        {"client_order_id": "old-buy", "side": "buy", "remaining_quantity": "10", "status": "open", "opens_inventory": False}
+    ]
+
+    buy = evaluate_order_semantics(GridType.NEUTRAL, Decimal("120"), Decimal("100"), Side.BUY, Decimal("10"), stale_buys)
+    sell = evaluate_order_semantics(GridType.NEUTRAL, Decimal("120"), Decimal("100"), Side.SELL, Decimal("10"), stale_buys)
+
+    assert buy.allowed is False
+    assert "MAX_INVENTORY_EXCEEDED" in buy.reason_codes
+    assert "LONG_OPENING_RESERVATION_EXCEEDED" in buy.reason_codes
+    assert sell.allowed is True
+    assert sell.opens_inventory is False
 
 
 def test_side_aware_tick_rounding_and_post_only_guard():
@@ -4574,7 +4646,7 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
             "grid_count": 4,
             "spacing_type": "arithmetic",
             "lot_size": "1",
-            "max_inventory_lots": "10",
+            "max_inventory_lots": "20",
             "product_symbol": "ETHUSD",
             "config_version": 1,
         },
@@ -6125,6 +6197,38 @@ def test_gridbot_health_flags_risk_increasing_directional_open_order(grid_type, 
     assert "GRID_NATURE_INVENTORY_VIOLATION" in {issue["code"] for issue in issues}
     assert any(reason in issue.get("context", {}).get("reason_codes", []) for issue in issues)
     assert health["overall_status"] == "CRITICAL"
+
+
+def test_gridbot_health_distinguishes_position_over_max_from_resting_risk():
+    run = {
+        "run_id": "run-neutral-over-max",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "max_inventory_lots": "100"},
+        "orders": {
+            f"sell-{index}": {
+                "client_order_id": f"DGB01-sell-{index}",
+                "exchange_order_id": f"ex-sell-{index}",
+                "status": "open",
+                "side": "sell",
+                "remaining_quantity": "10",
+                "requested_quantity": "10",
+                "opens_inventory": False,
+            }
+            for index in range(4)
+        },
+        "fills": {},
+    }
+    state = {"running": True, "thread_alive": True, "run_id": run["run_id"], "lifecycle_state": GridStatus.RUNNING.value}
+
+    health = evaluate_gridbot_health(state, run, {"gridbot_inventory": "-120", "delta_position": "-120", "exchange_open_orders": 4})
+    codes = {issue["code"] for issue in health["active_issues"]}
+
+    assert "POSITION_OVER_MAX" in codes
+    assert "RISK_INCREASING_RESTING_EXPOSURE" in codes
+    assert health["dynamic_risk"]["short_reserved"] == "160"
+    assert health["dynamic_risk"]["risk_increasing_resting_quantity"] == "40"
+    assert health["new_order_restricted"] is True
+    assert health["safe_for_risk_reduce"] is True
 
 
 @pytest.mark.parametrize(

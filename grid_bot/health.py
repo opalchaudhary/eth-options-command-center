@@ -9,6 +9,7 @@ from typing import Any
 from .accounting import build_run_accounting
 from .exchange_truth import directional_open_order_violations
 from .models import GridStatus, GridType, utc_now
+from .semantics import resting_order_risk_summary
 
 
 class HealthStatus(str, Enum):
@@ -48,7 +49,9 @@ CRITICAL_CODES = {
     "ACTIVE_LOCK_CONTRADICTION",
     "GRID_NATURE_INVENTORY_VIOLATION",
     "MAX_INVENTORY_VIOLATION",
+    "POSITION_OVER_MAX",
     "POSITION_ATTRIBUTION_UNSAFE",
+    "RISK_INCREASING_RESTING_EXPOSURE",
     "STOPPED_WITH_EXPOSURE",
     "WORKER_DEAD_RUNNING",
 }
@@ -386,10 +389,31 @@ def evaluate_gridbot_health(
         elif event_type == "FILL_LEDGER_MISMATCH":
             issues.append(_issue("FILL_LEDGER_MISMATCH", HealthSeverity.CRITICAL, "Fill ledger exceeds requested order quantity.", run_for_issue, **payload))
 
+    open_orders = _open_orders(run)
     grid_type = str((run.get("config") or {}).get("grid_type") or "")
     max_inventory = abs(_decimal((run.get("config") or {}).get("max_inventory_lots")))
+    dynamic_risk: dict[str, Any] = {}
+    if grid_type in {item.value for item in GridType}:
+        dynamic_risk = resting_order_risk_summary(GridType(grid_type), operational_inventory, max_inventory, open_orders)
     if _max_inventory_exceeded(grid_type, operational_inventory, max_inventory):
-        issues.append(_issue("MAX_INVENTORY_VIOLATION", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(operational_inventory), max_inventory=str(max_inventory)))
+        issues.append(_issue("POSITION_OVER_MAX", HealthSeverity.CRITICAL, "GridBot inventory exceeds max inventory.", run_for_issue, inventory=str(operational_inventory), max_inventory=str(max_inventory)))
+    if dynamic_risk.get("risk_increasing_resting_exposure") and (dynamic_risk.get("long_reserved_over_max") or dynamic_risk.get("short_reserved_over_max")):
+        issues.append(
+            _issue(
+                "RISK_INCREASING_RESTING_EXPOSURE",
+                HealthSeverity.CRITICAL,
+                "Resting GridBot orders can increase already constrained inventory exposure.",
+                run_for_issue,
+                current_inventory=dynamic_risk.get("current_inventory"),
+                worst_case_long=dynamic_risk.get("worst_case_long"),
+                worst_case_short=dynamic_risk.get("worst_case_short"),
+                long_reserved=dynamic_risk.get("long_reserved"),
+                short_reserved=dynamic_risk.get("short_reserved"),
+                max_inventory=dynamic_risk.get("max_inventory"),
+                risk_increasing_resting_quantity=dynamic_risk.get("risk_increasing_resting_quantity"),
+                risk_increasing_resting_orders=dynamic_risk.get("risk_increasing_resting_orders"),
+            )
+        )
     for violation in directional_open_order_violations(run, operational_inventory):
         issues.append(
             _issue(
@@ -403,7 +427,6 @@ def evaluate_gridbot_health(
     if not external_adjustment_active and abs(position - inventory) > 0 and not transient_fill_position_catchup:
         issues.append(_issue("POSITION_ATTRIBUTION_UNSAFE", HealthSeverity.CRITICAL, "Account exposure cannot be safely attributed to this GridBot.", run_for_issue, delta_position=str(position), gridbot_inventory=str(inventory)))
 
-    open_orders = _open_orders(run)
     known_gridbot_orders = state.get("known_gridbot_orders") or list(((run or {}).get("orders") or {}).values())
     known_open_count = len(open_orders) if run else len([order for order in known_gridbot_orders if str(order.get("status") or "").lower() in OPEN_ORDER_STATUSES])
     exchange_open_count = int(reconciliation.get("exchange_open_orders") or 0)
@@ -531,6 +554,8 @@ def evaluate_gridbot_health(
         "run_id": run_id,
         "safe_for_risk_increase": safe_for_risk_increase,
         "safe_for_risk_reduce": safe_for_risk_reduce,
+        "new_order_restricted": not safe_for_risk_increase,
+        "dynamic_risk": dynamic_risk,
         "operator_attention_required": operator_attention_required,
         "worker_health": {
             "running": bool(state.get("running")),

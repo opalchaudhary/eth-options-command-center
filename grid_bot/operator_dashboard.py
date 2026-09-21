@@ -56,6 +56,8 @@ HEALTH_MESSAGES = {
     "DUPLICATE_FILL_IGNORED": "A duplicate fill was safely ignored.",
     "MISSING_REPLACEMENT": "A filled order has not been replaced yet.",
     "MAX_INVENTORY_VIOLATION": "Inventory is above the configured maximum.",
+    "POSITION_OVER_MAX": "Position is above the configured maximum.",
+    "RISK_INCREASING_RESTING_EXPOSURE": "Resting orders can increase constrained inventory exposure.",
     "GRID_NATURE_INVENTORY_VIOLATION": "Inventory direction does not match this grid type.",
     "PAUSED_WITH_RESTING_ORDERS": "The bot is paused but still has resting orders.",
     "STOPPED_WITH_EXPOSURE": "The bot is stopped but exposure or orders remain.",
