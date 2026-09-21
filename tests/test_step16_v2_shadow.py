@@ -163,6 +163,7 @@ class FakeV2PredictionRepository:
     def __init__(self, rows):
         self.rows = sorted(rows, key=lambda row: (row["prediction_timestamp"], row["horizon"], row["target"], row["id"]))
         self.keyset_calls = 0
+        self.window_calls = 0
 
     def mature_candidates(self, before_iso, limit=100, offset=0):
         before = pd.Timestamp(before_iso)
@@ -177,6 +178,37 @@ class FakeV2PredictionRepository:
         if after is not None:
             pending = [row for row in pending if pd.Timestamp(row["prediction_timestamp"]) > after]
         return pending[:limit]
+
+    def mature_candidates_window(self, start_iso, before_iso, horizon=None, limit=100, offset=0):
+        self.window_calls += 1
+        start = pd.Timestamp(start_iso)
+        before = pd.Timestamp(before_iso)
+        rows = [
+            row for row in self.rows
+            if start <= pd.Timestamp(row["prediction_timestamp"]) <= before
+            and (horizon is None or str(row["horizon"]).upper() == str(horizon).upper())
+        ]
+        rows = sorted(rows, key=lambda row: (pd.Timestamp(row["prediction_timestamp"]), row["target"], row["id"]), reverse=True)
+        return rows[offset : offset + limit]
+
+    def frontier_candidates(self, cursor_iso, before_iso, horizon, limit=100):
+        start = pd.Timestamp(cursor_iso)
+        before = pd.Timestamp(before_iso)
+        rows = [
+            row for row in self.rows
+            if start < pd.Timestamp(row["prediction_timestamp"]) <= before
+            and str(row["horizon"]).upper() == str(horizon).upper()
+        ]
+        return sorted(rows, key=lambda row: (pd.Timestamp(row["prediction_timestamp"]), row["target"], row["id"]))[:limit]
+
+    def by_ids(self, prediction_ids):
+        requested = set(prediction_ids)
+        return [row for row in self.rows if row["id"] in requested]
+
+
+class FailingAntiJoinV2PredictionRepository(FakeV2PredictionRepository):
+    def pending_mature_candidates(self, *args, **kwargs):
+        raise AssertionError("timeout-prone anti-join must not be called")
 
 
 class FakeV2OutcomeRepository:
@@ -205,6 +237,44 @@ class FakeV2OutcomeRepository:
             else:
                 failed += 1
         return created, failed
+
+
+class FakeV2FrontierRepository:
+    def __init__(self, state=None, due_retry_ids=None, enqueue_ok=True):
+        self.state = dict(state or {})
+        self.due_retry_ids = list(due_retry_ids or [])
+        self.enqueue_ok = enqueue_ok
+        self.initialized = []
+        self.advanced = []
+        self.queued = []
+        self.cleared = []
+
+    def state_for_horizon(self, horizon):
+        cursor = self.state.get(str(horizon).upper())
+        if cursor is None:
+            return None
+        return {"horizon": str(horizon).upper(), "cursor_prediction_timestamp": cursor}
+
+    def initialize_state(self, horizon, cursor):
+        self.state[str(horizon).upper()] = cursor.isoformat()
+        self.initialized.append((str(horizon).upper(), cursor))
+        return self.state_for_horizon(horizon)
+
+    def due_retry_prediction_ids(self, now, limit=100):
+        return self.due_retry_ids[:limit]
+
+    def enqueue_retry(self, prediction, reason, retry_after, error=None):
+        self.queued.append((prediction["id"], reason, retry_after, error))
+        return self.enqueue_ok
+
+    def clear_retries(self, prediction_ids):
+        self.cleared.extend(prediction_ids)
+        return len(prediction_ids)
+
+    def advance_state(self, horizon, cursor, metadata=None):
+        self.state[str(horizon).upper()] = cursor.isoformat()
+        self.advanced.append((str(horizon).upper(), cursor, metadata or {}))
+        return True
 
 
 class FakeV2SnapshotRepository:
@@ -361,7 +431,20 @@ def test_v2_shadow_outcome_selector_reaches_beyond_completed_prefix(monkeypatch)
     from probability_engine.services import v2_shadow_outcome
     from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
 
-    monkeypatch.setattr(v2_shadow_outcome, "get_probability_config", lambda: type("Config", (), {"v2_outcome_candidate_max_pages": 80})())
+    monkeypatch.setattr(
+        v2_shadow_outcome,
+        "get_probability_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "v2_outcome_candidate_max_pages": 80,
+                "v2_outcome_selector_lookback_hours": 400,
+                "v2_outcome_candidate_page_size": 250,
+                "horizons": ["1H", "2H", "4H", "8H", "12H", "24H"],
+            },
+        )(),
+    )
     start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     completed = [
         _v2_prediction(f"done-{index}", prediction_timestamp=start + timedelta(minutes=5 * index))
@@ -388,18 +471,72 @@ def test_v2_shadow_outcome_selector_reaches_beyond_completed_prefix(monkeypatch)
 
     assert result["attempted_count"] == 25
     assert result["created_count"] == 25
-    assert result["candidate_pages_scanned"] > 20
+    assert result["candidate_pages_scanned"] < 20
     assert result["prediction_query_count"] == result["candidate_pages_scanned"]
-    assert result["outcome_lookup_count"] == result["candidate_pages_scanned"]
+    assert 0 < result["outcome_lookup_count"] <= result["candidate_pages_scanned"]
     assert result["oldest_selected_timestamp"] == pd.Timestamp(pending[0]["prediction_timestamp"]).tz_convert("UTC").isoformat()
     assert {row["prediction_id"] for row in outcomes.inserted} == {row["id"] for row in pending[:25]}
+    assert repo.window_calls == result["candidate_pages_scanned"]
+    assert repo.keyset_calls == 0
+
+
+def test_v2_shadow_outcome_selector_bypasses_failing_antijoin(monkeypatch):
+    from probability_engine.services import v2_shadow_outcome
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    monkeypatch.setattr(
+        v2_shadow_outcome,
+        "get_probability_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "v2_outcome_candidate_max_pages": 20,
+                "v2_outcome_selector_lookback_hours": 48,
+                "v2_outcome_candidate_page_size": 25,
+                "horizons": ["1H", "2H", "4H", "8H", "12H", "24H"],
+            },
+        )(),
+    )
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    repo = FailingAntiJoinV2PredictionRepository([
+        _v2_prediction("done", prediction_timestamp=start),
+        _v2_prediction("pending", prediction_timestamp=start + timedelta(minutes=5)),
+    ])
+    outcomes = FakeV2OutcomeRepository(existing={"done"})
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=repo,
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["created_count"] == 1
+    assert outcomes.inserted[0]["prediction_id"] == "pending"
+    assert result["selector_strategy"] == "bounded_horizon_maturity_windows"
 
 
 def test_v2_shadow_outcome_selector_rerun_advances_without_duplicates(monkeypatch):
     from probability_engine.services import v2_shadow_outcome
     from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
 
-    monkeypatch.setattr(v2_shadow_outcome, "get_probability_config", lambda: type("Config", (), {"v2_outcome_candidate_max_pages": 20})())
+    monkeypatch.setattr(
+        v2_shadow_outcome,
+        "get_probability_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "v2_outcome_candidate_max_pages": 20,
+                "v2_outcome_selector_lookback_hours": 48,
+                "v2_outcome_candidate_page_size": 25,
+                "horizons": ["1H", "2H", "4H", "8H", "12H", "24H"],
+            },
+        )(),
+    )
     start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     rows = [
         _v2_prediction(f"pending-{index}", prediction_timestamp=start + timedelta(minutes=5 * index))
@@ -561,3 +698,109 @@ def test_v2_shadow_outcome_evaluator_falls_back_to_shared_batch_env(monkeypatch)
     )
 
     assert evaluator.batch_limit == 50
+
+
+def test_v2_shadow_frontier_selector_advances_after_success():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction("p1", prediction_timestamp=start),
+        _v2_prediction("p2", prediction_timestamp=start + timedelta(minutes=5)),
+    ]
+    frontier = FakeV2FrontierRepository(state={"1H": (start - timedelta(minutes=5)).isoformat()})
+    outcomes = FakeV2OutcomeRepository()
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        frontier_repository=frontier,
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["selector_strategy"] == "frontier_cursor_retry_queue"
+    assert result["created_count"] == 2
+    assert result["frontier_advanced_count"] == 1
+    assert frontier.advanced[0][0] == "1H"
+    assert frontier.advanced[0][1] == start + timedelta(minutes=5)
+    assert {row["prediction_id"] for row in outcomes.inserted} == {"p1", "p2"}
+
+
+def test_v2_shadow_frontier_queues_incomplete_before_checkpoint_advance():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    row = _v2_prediction("p1", prediction_timestamp=start)
+    frontier = FakeV2FrontierRepository(state={"1H": (start - timedelta(minutes=5)).isoformat()})
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository([row]),
+        outcome_repository=FakeV2OutcomeRepository(),
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        frontier_repository=frontier,
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at, count=3),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["created_count"] == 0
+    assert result["skipped_incomplete_count"] == 1
+    assert result["retry_queued_count"] == 1
+    assert result["frontier_advanced_count"] == 1
+    assert frontier.queued[0][0] == "p1"
+    assert frontier.queued[0][1] == "INCOMPLETE_WINDOW"
+
+
+def test_v2_shadow_frontier_does_not_advance_when_retry_persistence_fails():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    row = _v2_prediction("p1", prediction_timestamp=start)
+    frontier = FakeV2FrontierRepository(
+        state={"1H": (start - timedelta(minutes=5)).isoformat()},
+        enqueue_ok=False,
+    )
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository([row]),
+        outcome_repository=FakeV2OutcomeRepository(),
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        frontier_repository=frontier,
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at, count=3),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["retry_queued_count"] == 0
+    assert result["frontier_advanced_count"] == 0
+    assert frontier.advanced == []
+
+
+def test_v2_shadow_frontier_excludes_existing_duplicate_outcomes():
+    from probability_engine.services.v2_shadow_outcome import V2ShadowOutcomeEvaluator
+
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        _v2_prediction("existing", prediction_timestamp=start),
+        _v2_prediction("pending", prediction_timestamp=start + timedelta(minutes=5)),
+    ]
+    frontier = FakeV2FrontierRepository(state={"1H": (start - timedelta(minutes=5)).isoformat()})
+    outcomes = FakeV2OutcomeRepository(existing={"existing"})
+    evaluator = V2ShadowOutcomeEvaluator(
+        prediction_repository=FakeV2PredictionRepository(rows),
+        outcome_repository=outcomes,
+        feature_snapshot_repository=FakeV2SnapshotRepository(),
+        frontier_repository=frontier,
+        candle_fetcher=lambda symbol, start_at, end_at: _v2_candles(start_at),
+        batch_limit=5,
+    )
+
+    result = evaluator.run(now=start + timedelta(hours=2))
+
+    assert result["skipped_existing_count"] == 1
+    assert result["created_count"] == 1
+    assert outcomes.inserted[0]["prediction_id"] == "pending"
+    assert frontier.advanced

@@ -59,6 +59,11 @@ class ProbabilityEngineConfig:
     v2_shadow_history_days: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_SHADOW_HISTORY_DAYS", 120))
     v2_outcome_batch_limit: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_BATCH_SIZE", _int_env("PROBABILITY_OUTCOME_BATCH_LIMIT", 25)))
     v2_outcome_candidate_max_pages: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_CANDIDATE_MAX_PAGES", 800))
+    v2_outcome_selector_lookback_hours: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_SELECTOR_LOOKBACK_HOURS", 12))
+    v2_outcome_candidate_page_size: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_CANDIDATE_PAGE_SIZE", 250))
+    v2_outcome_frontier_enabled: bool = field(default_factory=lambda: _bool_env("PROBABILITY_V2_OUTCOME_FRONTIER_ENABLED", True))
+    v2_outcome_frontier_bootstrap_minutes: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_FRONTIER_BOOTSTRAP_MINUTES", 60))
+    v2_outcome_retry_delay_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_RETRY_DELAY_SECONDS", 900))
 
 
 def get_probability_config() -> ProbabilityEngineConfig:

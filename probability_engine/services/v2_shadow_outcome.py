@@ -63,15 +63,19 @@ class V2ShadowOutcomeRepository(SupabaseRepository):
         clean_ids = [str(item) for item in prediction_ids if item]
         if not clean_ids:
             return set()
-        rows = self.read(
-            params={
-                "select": "prediction_id",
-                "prediction_id": f"in.({','.join(clean_ids)})",
-                "label_version": f"eq.{label_version}",
-                "limit": str(len(clean_ids)),
-            }
-        )
-        return {row.get("prediction_id") for row in _records(rows) if row.get("prediction_id")}
+        existing = set()
+        for index in range(0, len(clean_ids), 50):
+            chunk = clean_ids[index : index + 50]
+            rows = self.read(
+                params={
+                    "select": "prediction_id",
+                    "prediction_id": f"in.({','.join(chunk)})",
+                    "label_version": f"eq.{label_version}",
+                    "limit": str(len(chunk)),
+                }
+            )
+            existing.update(row.get("prediction_id") for row in _records(rows) if row.get("prediction_id"))
+        return existing
 
     def outcome_payload(self, prediction_id, outcome, label_version="label_v2"):
         outcome_payload = {key: value for key, value in outcome.items() if key in self.outcome_columns}
@@ -173,6 +177,167 @@ class V2ShadowPredictionEvaluationRepository(SupabaseRepository):
             row.pop("probability_v2_shadow_outcomes", None)
             clean_rows.append(row)
         return clean_rows
+
+    def mature_candidates_window(self, start_iso, before_iso, horizon=None, limit=100, offset=0):
+        params = {
+            "select": PREDICTION_SELECT,
+            "prediction_timestamp": f"gte.{start_iso}",
+            "and": f"(prediction_timestamp.lte.{before_iso})",
+            "record_type": "eq.LIVE",
+            "abstained": "eq.false",
+            "order": "prediction_timestamp.desc,target.asc,id.asc",
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        if horizon:
+            params["horizon"] = f"eq.{str(horizon).upper()}"
+        return self.read(params=params)
+
+    def frontier_candidates(self, cursor_iso, before_iso, horizon, limit=100):
+        return self.read(
+            params={
+                "select": PREDICTION_SELECT,
+                "prediction_timestamp": f"gt.{cursor_iso}",
+                "and": f"(prediction_timestamp.lte.{before_iso})",
+                "record_type": "eq.LIVE",
+                "abstained": "eq.false",
+                "horizon": f"eq.{str(horizon).upper()}",
+                "order": "prediction_timestamp.asc,target.asc,id.asc",
+                "limit": str(limit),
+            }
+        )
+
+    def by_ids(self, prediction_ids):
+        clean_ids = [str(item) for item in prediction_ids if item]
+        if not clean_ids:
+            return []
+        rows = []
+        for index in range(0, len(clean_ids), 50):
+            chunk = clean_ids[index : index + 50]
+            page = self.read(
+                params={
+                    "select": PREDICTION_SELECT,
+                    "id": f"in.({','.join(chunk)})",
+                    "limit": str(len(chunk)),
+                }
+            )
+            rows.extend(_records(page))
+        return rows
+
+
+class V2OutcomeFrontierRepository(SupabaseRepository):
+    table_name = "probability_v2_outcome_frontier_state"
+    retry_table_name = "probability_v2_outcome_retry_queue"
+
+    def state_for_horizon(self, horizon: str) -> dict[str, Any] | None:
+        rows = self.read(
+            params={
+                "select": "horizon,cursor_prediction_timestamp,cursor_prediction_id,updated_at,metadata_json",
+                "horizon": f"eq.{str(horizon).upper()}",
+                "limit": "1",
+            }
+        )
+        records = _records(rows)
+        return records[0] if records else None
+
+    def initialize_state(self, horizon: str, cursor: datetime) -> dict[str, Any]:
+        payload = {
+            "horizon": str(horizon).upper(),
+            "cursor_prediction_timestamp": cursor.isoformat(),
+            "metadata_json": {"initialized_by": "step18b3_frontier", "mode": "routine_new_work_only"},
+        }
+        response = requests.post(
+            f"{database_reader.SUPABASE_URL}/rest/v1/{self.table_name}",
+            headers={
+                **database_reader.HEADERS,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=ignore-duplicates,return=representation",
+            },
+            params={"on_conflict": "horizon"},
+            json=payload,
+            timeout=15,
+        )
+        if response.status_code not in [200, 201, 204]:
+            raise RuntimeError(f"frontier state initialize failed: {response.status_code} {response.text[:200]}")
+        return self.state_for_horizon(horizon) or payload
+
+    def advance_state(self, horizon: str, cursor: datetime, metadata: dict[str, Any] | None = None) -> bool:
+        payload = {
+            "horizon": str(horizon).upper(),
+            "cursor_prediction_timestamp": cursor.isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata_json": metadata or {},
+        }
+        response = requests.post(
+            f"{database_reader.SUPABASE_URL}/rest/v1/{self.table_name}",
+            headers={
+                **database_reader.HEADERS,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            params={"on_conflict": "horizon"},
+            json=payload,
+            timeout=15,
+        )
+        return response.status_code in [200, 201, 204]
+
+    def due_retry_prediction_ids(self, now: datetime, limit: int = 100) -> list[str]:
+        rows = database_reader.read_supabase_table(
+            self.retry_table_name,
+            params={
+                "select": "prediction_id",
+                "retry_after": f"lte.{now.isoformat()}",
+                "order": "prediction_timestamp.asc,horizon.asc,prediction_id.asc",
+                "limit": str(limit),
+            },
+        )
+        return [row.get("prediction_id") for row in _records(rows) if row.get("prediction_id")]
+
+    def enqueue_retry(self, prediction: dict[str, Any], reason: str, retry_after: datetime, error: str | None = None) -> bool:
+        payload = {
+            "prediction_id": prediction.get("id"),
+            "retry_after": retry_after.isoformat(),
+            "attempt_count": int((prediction.get("retry_attempt_count") or 0)) + 1,
+            "horizon": str(prediction.get("horizon") or "").upper(),
+            "target": prediction.get("target"),
+            "prediction_timestamp": prediction.get("prediction_timestamp"),
+            "reason": reason,
+            "last_error": error,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "metadata_json": {
+                "model_version": prediction.get("model_version"),
+                "manifest_hash": prediction.get("manifest_hash"),
+            },
+        }
+        response = requests.post(
+            f"{database_reader.SUPABASE_URL}/rest/v1/{self.retry_table_name}",
+            headers={
+                **database_reader.HEADERS,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            params={"on_conflict": "prediction_id"},
+            json=payload,
+            timeout=15,
+        )
+        return response.status_code in [200, 201, 204]
+
+    def clear_retries(self, prediction_ids) -> int:
+        clean_ids = [str(item) for item in prediction_ids if item]
+        if not clean_ids:
+            return 0
+        cleared = 0
+        for index in range(0, len(clean_ids), 50):
+            chunk = clean_ids[index : index + 50]
+            response = requests.delete(
+                f"{database_reader.SUPABASE_URL}/rest/v1/{self.retry_table_name}",
+                headers=database_reader.HEADERS,
+                params={"prediction_id": f"in.({','.join(chunk)})"},
+                timeout=15,
+            )
+            if response.status_code in [200, 202, 204]:
+                cleared += len(chunk)
+        return cleared
 
 
 class V2FeatureSnapshotEvaluationRepository(SupabaseRepository):
@@ -369,20 +534,126 @@ class V2ShadowOutcomeEvaluator:
         prediction_repository=None,
         outcome_repository=None,
         feature_snapshot_repository=None,
+        frontier_repository=None,
         candle_fetcher=None,
         batch_limit=None,
     ):
+        using_default_prediction_repository = prediction_repository is None
         self.prediction_repository = prediction_repository or V2ShadowPredictionEvaluationRepository()
         self.outcome_repository = outcome_repository or V2ShadowOutcomeRepository()
         self.feature_snapshot_repository = feature_snapshot_repository or V2FeatureSnapshotEvaluationRepository()
+        config = get_probability_config()
+        if frontier_repository is not None:
+            self.frontier_repository = frontier_repository
+        elif using_default_prediction_repository and getattr(config, "v2_outcome_frontier_enabled", True):
+            self.frontier_repository = V2OutcomeFrontierRepository()
+        else:
+            self.frontier_repository = None
         self.candle_fetcher = candle_fetcher or load_future_ohlcv
-        self.batch_limit = batch_limit if batch_limit is not None else get_probability_config().v2_outcome_batch_limit
-        self.max_candidate_pages = get_probability_config().v2_outcome_candidate_max_pages
+        self.batch_limit = batch_limit if batch_limit is not None else config.v2_outcome_batch_limit
+        self.max_candidate_pages = config.v2_outcome_candidate_max_pages
+        self.selector_lookback_hours = max(1, int(getattr(config, "v2_outcome_selector_lookback_hours", 12) or 12))
+        self.candidate_page_size = max(25, min(1000, int(getattr(config, "v2_outcome_candidate_page_size", 250) or 250)))
+        self.frontier_bootstrap_minutes = max(5, int(getattr(config, "v2_outcome_frontier_bootstrap_minutes", 60) or 60))
+        self.retry_delay_seconds = max(60, int(getattr(config, "v2_outcome_retry_delay_seconds", 900) or 900))
+        self.horizons = {str(item).upper() for item in getattr(config, "horizons", ["1H", "2H", "4H", "8H", "12H", "24H"])}
 
     def select_pending(self, now: datetime, batch_limit: int) -> dict[str, Any]:
-        candidate_limit = batch_limit * 4
+        if self.frontier_repository is not None:
+            return self.select_pending_frontier(now=now, batch_limit=batch_limit)
+        return self.select_pending_bounded_windows(now=now, batch_limit=batch_limit)
+
+    def select_pending_frontier(self, now: datetime, batch_limit: int) -> dict[str, Any]:
+        candidate_limit = max(self.candidate_page_size, batch_limit * 2)
+        started = time.perf_counter()
+        candidates = []
+        pending = []
+        existing_ids = set()
+        retry_ids = self.frontier_repository.due_retry_prediction_ids(now, limit=batch_limit)
+        prediction_query_count = 0
+        outcome_lookup_count = 0
+        frontier_before = {}
+        frontier_boundaries: dict[str, str] = {}
+
+        if retry_ids and hasattr(self.prediction_repository, "by_ids"):
+            retry_rows = _records(self.prediction_repository.by_ids(retry_ids))
+            for row in retry_rows:
+                row["frontier_source"] = "retry"
+            candidates.extend(retry_rows)
+
+        for horizon, minutes in sorted(HORIZON_MINUTES.items(), key=lambda item: item[1]):
+            if horizon not in self.horizons:
+                continue
+            cutoff = now - timedelta(minutes=minutes)
+            state = self.frontier_repository.state_for_horizon(horizon)
+            if not state:
+                state = self.frontier_repository.initialize_state(
+                    horizon,
+                    cutoff - timedelta(minutes=self.frontier_bootstrap_minutes),
+                )
+            cursor_iso = state.get("cursor_prediction_timestamp")
+            frontier_before[horizon] = cursor_iso
+            rows = _records(
+                self.prediction_repository.frontier_candidates(
+                    cursor_iso,
+                    cutoff.isoformat(),
+                    horizon=horizon,
+                    limit=candidate_limit,
+                )
+            )
+            prediction_query_count += 1
+            for row in rows:
+                row["frontier_source"] = "frontier"
+            candidates.extend(rows)
+            if rows:
+                frontier_boundaries[horizon] = max(
+                    pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC").isoformat()
+                    for row in rows
+                )
+            if len(candidates) >= batch_limit:
+                break
+
+        mature = [row for row in candidates if is_mature(row, now=now)]
+        page_existing = self.outcome_repository.existing_prediction_ids([row.get("id") for row in mature])
+        outcome_lookup_count += 1 if mature else 0
+        existing_ids.update(page_existing)
+        pending = [row for row in mature if row.get("id") not in existing_ids]
+
+        pending = sorted(
+            pending,
+            key=lambda row: (
+                pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC")
+                + pd.Timedelta(minutes=HORIZON_MINUTES.get(str(row.get("horizon") or "").upper(), 0)),
+                pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC"),
+                str(row.get("horizon") or ""),
+                str(row.get("target") or ""),
+                str(row.get("id") or ""),
+            ),
+        )
+        selected_timestamps = [pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") for row in pending]
+        return {
+            "pending": pending,
+            "candidates": candidates,
+            "mature": mature,
+            "existing_ids": existing_ids,
+            "candidate_pages_scanned": prediction_query_count,
+            "prediction_query_count": prediction_query_count,
+            "outcome_lookup_count": outcome_lookup_count,
+            "selector_runtime_seconds": time.perf_counter() - started,
+            "selector_exhausted": True,
+            "oldest_selected_timestamp": min(selected_timestamps).isoformat() if selected_timestamps else None,
+            "newest_selected_timestamp": max(selected_timestamps).isoformat() if selected_timestamps else None,
+            "selector_strategy": "frontier_cursor_retry_queue",
+            "selector_lookback_hours": None,
+            "candidate_page_size": candidate_limit,
+            "frontier_before": frontier_before,
+            "frontier_boundaries": frontier_boundaries,
+            "retry_candidate_count": len(retry_ids),
+        }
+
+    def select_pending_bounded_windows(self, now: datetime, batch_limit: int) -> dict[str, Any]:
+        candidate_limit = max(self.candidate_page_size, batch_limit * 4)
         max_candidate_pages = max(1, int(self.max_candidate_pages or 800))
-        before_iso = (now - timedelta(minutes=min(HORIZON_MINUTES.values()))).isoformat()
         started = time.perf_counter()
         candidates = []
         mature = []
@@ -390,75 +661,74 @@ class V2ShadowOutcomeEvaluator:
         existing_ids = set()
         outcome_lookup_count = 0
         prediction_query_count = 0
-        cursor_timestamp = None
         exhausted = False
 
-        if hasattr(self.prediction_repository, "pending_mature_candidates"):
-            rows = _records(
-                self.prediction_repository.pending_mature_candidates(
-                    before_iso,
-                    limit=batch_limit,
-                    label_version="label_v2",
-                )
-            )
-            prediction_query_count = 1
-            candidates.extend(rows)
-            mature.extend(row for row in rows if is_mature(row, now=now))
-            existing_ids = self.outcome_repository.existing_prediction_ids([row.get("id") for row in mature])
-            outcome_lookup_count = 1
-            pending = [row for row in mature if row.get("id") not in existing_ids][:batch_limit]
-            exhausted = len(rows) < batch_limit
-            selected_timestamps = [pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") for row in pending]
-            return {
-                "pending": pending,
-                "candidates": candidates,
-                "mature": mature,
-                "existing_ids": existing_ids,
-                "candidate_pages_scanned": 1,
-                "prediction_query_count": prediction_query_count,
-                "outcome_lookup_count": outcome_lookup_count,
-                "selector_runtime_seconds": time.perf_counter() - started,
-                "selector_exhausted": exhausted,
-                "oldest_selected_timestamp": min(selected_timestamps).isoformat() if selected_timestamps else None,
-                "newest_selected_timestamp": max(selected_timestamps).isoformat() if selected_timestamps else None,
-            }
+        horizon_windows: list[tuple[str, datetime, datetime]] = []
+        for horizon, minutes in sorted(HORIZON_MINUTES.items(), key=lambda item: item[1]):
+            if horizon not in self.horizons:
+                continue
+            window_end = now - timedelta(minutes=minutes)
+            window_start = window_end - timedelta(hours=self.selector_lookback_hours)
+            horizon_windows.append((horizon, window_start, window_end))
 
-        for page in range(max_candidate_pages):
-            if hasattr(self.prediction_repository, "mature_candidates_after"):
-                rows = _records(
-                    self.prediction_repository.mature_candidates_after(
-                        before_iso,
-                        after_timestamp_iso=cursor_timestamp,
-                        limit=candidate_limit,
+        pages_scanned = 0
+        for horizon, window_start, window_end in horizon_windows:
+            offset = 0
+            horizon_exhausted = False
+            while pages_scanned < max_candidate_pages:
+                if hasattr(self.prediction_repository, "mature_candidates_window"):
+                    rows = _records(
+                        self.prediction_repository.mature_candidates_window(
+                            window_start.isoformat(),
+                            window_end.isoformat(),
+                            horizon=horizon,
+                            limit=candidate_limit,
+                            offset=offset,
+                        )
                     )
-                )
-            else:
-                rows = _records(
-                    self.prediction_repository.mature_candidates(
-                        before_iso,
-                        limit=candidate_limit,
-                        offset=page * candidate_limit,
+                else:
+                    rows = _records(
+                        self.prediction_repository.mature_candidates(
+                            window_end.isoformat(),
+                            limit=candidate_limit,
+                            offset=offset,
+                        )
                     )
-                )
-            prediction_query_count += 1
-            if not rows:
-                exhausted = True
-                break
+                    rows = [
+                        row for row in rows
+                        if str(row.get("horizon") or "").upper() == horizon
+                        and pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") >= pd.Timestamp(window_start)
+                    ]
+                prediction_query_count += 1
+                pages_scanned += 1
+                if not rows:
+                    horizon_exhausted = True
+                    break
 
-            candidates.extend(rows)
-            page_mature = [row for row in rows if is_mature(row, now=now)]
-            mature.extend(page_mature)
-            page_existing = self.outcome_repository.existing_prediction_ids([row.get("id") for row in page_mature])
-            outcome_lookup_count += 1
-            existing_ids.update(page_existing)
-            pending.extend(row for row in page_mature if row.get("id") not in page_existing)
-            pending = pending[:batch_limit]
-            cursor_timestamp = pd.Timestamp(rows[-1].get("prediction_timestamp")).tz_convert("UTC").isoformat()
-            if len(pending) >= batch_limit:
-                break
-            if len(rows) < candidate_limit:
-                exhausted = True
-                break
+                candidates.extend(rows)
+                page_mature = [row for row in rows if is_mature(row, now=now)]
+                mature.extend(page_mature)
+                page_existing = self.outcome_repository.existing_prediction_ids([row.get("id") for row in page_mature])
+                outcome_lookup_count += 1
+                existing_ids.update(page_existing)
+                pending.extend(row for row in page_mature if row.get("id") not in page_existing)
+                if len(rows) < candidate_limit:
+                    horizon_exhausted = True
+                    break
+                offset += candidate_limit
+            exhausted = exhausted or horizon_exhausted
+
+        pending = sorted(
+            pending,
+            key=lambda row: (
+                pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC")
+                + pd.Timedelta(minutes=HORIZON_MINUTES.get(str(row.get("horizon") or "").upper(), 0)),
+                pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC"),
+                str(row.get("horizon") or ""),
+                str(row.get("target") or ""),
+                str(row.get("id") or ""),
+            ),
+        )[:batch_limit]
 
         selected_timestamps = [pd.Timestamp(row.get("prediction_timestamp")).tz_convert("UTC") for row in pending]
         return {
@@ -466,14 +736,44 @@ class V2ShadowOutcomeEvaluator:
             "candidates": candidates,
             "mature": mature,
             "existing_ids": existing_ids,
-            "candidate_pages_scanned": page + 1 if "page" in locals() else 0,
+            "candidate_pages_scanned": pages_scanned,
             "prediction_query_count": prediction_query_count,
             "outcome_lookup_count": outcome_lookup_count,
             "selector_runtime_seconds": time.perf_counter() - started,
             "selector_exhausted": exhausted,
             "oldest_selected_timestamp": min(selected_timestamps).isoformat() if selected_timestamps else None,
             "newest_selected_timestamp": max(selected_timestamps).isoformat() if selected_timestamps else None,
+            "selector_strategy": "bounded_horizon_maturity_windows",
+            "selector_lookback_hours": self.selector_lookback_hours,
+            "candidate_page_size": candidate_limit,
         }
+
+    def _enqueue_incomplete_retries(self, rows, now: datetime, reason: str) -> int:
+        if self.frontier_repository is None:
+            return 0
+        retry_after = now + timedelta(seconds=self.retry_delay_seconds)
+        queued = 0
+        for row in rows:
+            if self.frontier_repository.enqueue_retry(row, reason=reason, retry_after=retry_after):
+                queued += 1
+        return queued
+
+    def _advance_frontiers_after_success(self, selection, now: datetime) -> int:
+        if self.frontier_repository is None:
+            return 0
+        advanced = 0
+        for horizon, timestamp_iso in (selection.get("frontier_boundaries") or {}).items():
+            ok = self.frontier_repository.advance_state(
+                horizon,
+                pd.Timestamp(timestamp_iso).tz_convert("UTC").to_pydatetime(),
+                metadata={
+                    "advanced_by": "step18b3_frontier",
+                    "advanced_at": now.isoformat(),
+                    "selector_strategy": selection.get("selector_strategy"),
+                },
+            )
+            advanced += 1 if ok else 0
+        return advanced
 
     def run(self, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
@@ -485,6 +785,8 @@ class V2ShadowOutcomeEvaluator:
         existing_ids = selection["existing_ids"]
 
         if not pending:
+            retry_queued = 0
+            frontier_advanced = self._advance_frontiers_after_success(selection, now=now)
             return {
                 "ok": True,
                 "action": "EVALUATED",
@@ -503,10 +805,21 @@ class V2ShadowOutcomeEvaluator:
                 "selector_exhausted": selection["selector_exhausted"],
                 "oldest_selected_timestamp": selection["oldest_selected_timestamp"],
                 "newest_selected_timestamp": selection["newest_selected_timestamp"],
+                "selector_strategy": selection.get("selector_strategy"),
+                "selector_lookback_hours": selection.get("selector_lookback_hours"),
+                "candidate_page_size": selection.get("candidate_page_size"),
+                "retry_queued_count": retry_queued,
+                "retries_cleared_count": 0,
+                "frontier_advanced_count": frontier_advanced,
+                "frontier_before": selection.get("frontier_before"),
+                "frontier_boundaries": selection.get("frontier_boundaries"),
+                "retry_candidate_count": selection.get("retry_candidate_count", 0),
             }
 
         snapshots = self.feature_snapshot_repository.by_ids([row.get("feature_snapshot_id") for row in pending])
         ready_outcomes = []
+        ready_prediction_ids = []
+        incomplete_rows = []
         incomplete = 0
         failed = 0
         ohlcv_fetch_count = 0
@@ -526,13 +839,16 @@ class V2ShadowOutcomeEvaluator:
                     snapshot = snapshots.get(row.get("feature_snapshot_id"))
                     if not snapshot:
                         incomplete += 1
+                        incomplete_rows.append(row)
                         continue
                     outcome = evaluate_shadow_target(row, candles, snapshot)
                     if not outcome.get("ok"):
                         incomplete += 1
+                        incomplete_rows.append(row)
                         continue
                     outcome["evaluated_at"] = now.isoformat()
                     ready_outcomes.append((row.get("id"), outcome))
+                    ready_prediction_ids.append(row.get("id"))
             except Exception:
                 failed += len(group_rows)
 
@@ -546,6 +862,13 @@ class V2ShadowOutcomeEvaluator:
                     created += 1
                 else:
                     failed += 1
+
+        retry_queued = self._enqueue_incomplete_retries(incomplete_rows, now=now, reason="INCOMPLETE_WINDOW")
+        retries_cleared = 0
+        frontier_advanced = 0
+        if self.frontier_repository is not None and failed == 0 and retry_queued == len(incomplete_rows):
+            retries_cleared = self.frontier_repository.clear_retries(ready_prediction_ids)
+            frontier_advanced = self._advance_frontiers_after_success(selection, now=now)
 
         return {
             "ok": failed == 0,
@@ -565,7 +888,16 @@ class V2ShadowOutcomeEvaluator:
             "selector_exhausted": selection["selector_exhausted"],
             "oldest_selected_timestamp": selection["oldest_selected_timestamp"],
             "newest_selected_timestamp": selection["newest_selected_timestamp"],
+            "selector_strategy": selection.get("selector_strategy"),
+            "selector_lookback_hours": selection.get("selector_lookback_hours"),
+            "candidate_page_size": selection.get("candidate_page_size"),
             "ohlcv_fetch_count": ohlcv_fetch_count,
             "outcome_group_count": len(groups),
             "bulk_persistence": hasattr(self.outcome_repository, "safe_insert_outcomes"),
+            "retry_queued_count": retry_queued,
+            "retries_cleared_count": retries_cleared,
+            "frontier_advanced_count": frontier_advanced,
+            "frontier_before": selection.get("frontier_before"),
+            "frontier_boundaries": selection.get("frontier_boundaries"),
+            "retry_candidate_count": selection.get("retry_candidate_count", 0),
         }
