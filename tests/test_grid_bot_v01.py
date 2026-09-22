@@ -5454,6 +5454,20 @@ def test_compact_recovers_persisted_active_run_when_worker_memory_empty(tmp_path
     class EmptyWorker:
         def __init__(self, db):
             self.db = db
+            self.account_telemetry = self
+
+        def get(self, symbol):
+            assert symbol == "ETHUSD"
+
+            class Telemetry:
+                def as_dict(self):
+                    return {
+                        "telemetry_status": "HEALTHY",
+                        "position_lots": "0",
+                        "open_order_count": len(started["run"]["orders"]),
+                    }
+
+            return Telemetry()
 
         def state(self):
             return {
@@ -5479,6 +5493,93 @@ def test_compact_recovers_persisted_active_run_when_worker_memory_empty(tmp_path
     assert compact["freshness"] == "fresh"
     assert compact["config"]["config_version"] == 1
     assert compact["current_orders"]["open_order_count"] == len(started["run"]["orders"])
+
+
+def test_compact_persisted_active_run_refreshes_delta_position_when_worker_memory_empty(tmp_path, monkeypatch):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    class EmptyWorker:
+        def __init__(self, db):
+            self.db = db
+            self.account_telemetry = self
+
+        def get(self, symbol):
+            assert symbol == "ETHUSD"
+
+            class Telemetry:
+                def as_dict(self):
+                    return {"telemetry_status": "HEALTHY", "position_lots": "-100", "open_order_count": 20}
+
+            return Telemetry()
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": False,
+                "thread_alive": False,
+                "run_id": None,
+                "status": "idle",
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "accounting": {},
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", EmptyWorker(db))
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["run_id"] == started["run"]["run_id"]
+    assert compact["source"] == "persisted_active_run_compact"
+    assert compact["freshness"] == "fresh"
+    assert compact["delta_position"] == "-100"
+
+
+def test_compact_persisted_active_run_marks_unknown_when_telemetry_unavailable(tmp_path, monkeypatch):
+    client = _FakeLifecycleClient()
+    db = _CountingSupabaseGridRepository()
+    lifecycle = DurableGridBotLifecycle(client, tmp_path / "state.json", db=db, use_supabase=True)
+    started = lifecycle.start_tiny_grid()
+
+    class EmptyWorker:
+        def __init__(self, db):
+            self.db = db
+            self.account_telemetry = self
+
+        def get(self, symbol):
+            assert symbol == "ETHUSD"
+            raise RuntimeError("temporary telemetry timeout")
+
+        def state(self):
+            return {
+                "ok": True,
+                "worker_owner": "test",
+                "running": False,
+                "thread_alive": False,
+                "run_id": None,
+                "status": "idle",
+                "fill_derived_inventory": "0",
+                "delta_position": "0",
+                "accounting": {},
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", EmptyWorker(db))
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["run_id"] == started["run"]["run_id"]
+    assert compact["status"] == "reattach_pending"
+    assert compact["source"] == "persisted_active_run_compact"
+    assert compact["freshness"] == "stale"
+    assert compact["delta_position"] is None
+    assert compact["health"]["overall_status"] == "DEGRADED"
+    assert compact["health"]["position_inventory_agreement"]["status"] == "UNKNOWN"
+    assert "temporary telemetry timeout" in compact["account_risk_state_error"]
 
 
 def test_worker_reattach_ingests_down_fill_without_immediate_replacement(tmp_path):

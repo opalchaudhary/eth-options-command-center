@@ -48,6 +48,55 @@ def _fresh_open_order_count(telemetry: dict) -> int | None:
     return max(int(telemetry.get("open_order_count") or 0), side_total)
 
 
+def _has_position_telemetry(state: dict) -> bool:
+    telemetry = state.get("account_risk_state") or {}
+    return telemetry.get("position_lots") not in [None, ""]
+
+
+def _refresh_compact_account_telemetry(state: dict) -> None:
+    telemetry = worker.account_telemetry.get("ETHUSD").as_dict()
+    state["account_risk_state"] = telemetry
+    open_order_count = _fresh_open_order_count(telemetry)
+    if open_order_count is not None:
+        state["open_gridbot_orders"] = open_order_count
+
+
+def _mark_compact_telemetry_unavailable(state: dict, exc: Exception) -> None:
+    state["account_risk_state_error"] = str(exc)[:300]
+    state["delta_position"] = None
+    health = state.get("health") if isinstance(state.get("health"), dict) else {}
+    active_issues = list(health.get("active_issues") or [])
+    active_issues.append(
+        {
+            "code": "ACCOUNT_TELEMETRY_UNAVAILABLE",
+            "severity": "WARNING",
+            "message": "Account telemetry is unavailable; Delta position is unknown.",
+            "active": True,
+            "run_id": state.get("run_id"),
+            "context": {"error": str(exc)[:300]},
+        }
+    )
+    health.update(
+        {
+            "overall_status": "DEGRADED",
+            "safe_for_risk_increase": False,
+            "safe_for_risk_reduce": False,
+            "new_order_restricted": True,
+            "operator_attention_required": True,
+            "active_issues": active_issues,
+            "position_inventory_agreement": {
+                "gridbot_inventory": state.get("fill_derived_inventory"),
+                "delta_position": None,
+                "matches": False,
+                "difference": None,
+                "status": "UNKNOWN",
+            },
+            "telemetry_freshness": {"status": "UNAVAILABLE", "errors": [str(exc)[:300]]},
+        }
+    )
+    state["health"] = health
+
+
 def _reconciliation_from_state(state: dict) -> dict:
     payload = {
         "gridbot_inventory": state.get("fill_derived_inventory"),
@@ -883,10 +932,18 @@ def gridbot_compact_live_state() -> dict:
             if active:
                 latest_run = db.load_run_state(active["run_id"])
                 if latest_run:
+                    telemetry_error = None
+                    try:
+                        _refresh_compact_account_telemetry(state)
+                    except Exception as exc:
+                        telemetry_error = exc
+                        state["delta_position"] = None
                     state = _apply_run_to_live_state(state, latest_run)
+                    if telemetry_error is not None or not _has_position_telemetry(state):
+                        _mark_compact_telemetry_unavailable(state, telemetry_error or RuntimeError("position telemetry unavailable"))
                     state["status"] = "reattach_pending" if latest_run.get("status") == GridStatus.RUNNING.value else state.get("status")
                     compact_source = "persisted_active_run_compact"
-                    freshness = "fresh"
+                    freshness = "fresh" if telemetry_error is None else "stale"
                     state["active_run_refresh_error"] = None
             else:
                 compact_source = "no_active_run"
@@ -928,6 +985,7 @@ def gridbot_compact_live_state() -> dict:
         "freshness": freshness,
         "generated_at": utc_now(),
         "active_run_refresh_error": state.get("active_run_refresh_error"),
+        "account_risk_state_error": state.get("account_risk_state_error"),
         "worker_owner": state.get("worker_owner"),
         "running": state.get("running"),
         "thread_alive": state.get("thread_alive"),
