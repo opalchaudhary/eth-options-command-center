@@ -1,21 +1,55 @@
 {
-  "created_at": "2026-09-22T15:06:32.809090+00:00",
-  "decision": "C. STEP 19 BLOCKED - ARTIFACT / REPLAY / PERSISTENCE GATE FAILED",
-  "blocked_gate": "production persistence schema creation",
-  "local_code_complete": true,
-  "local_tests": {
-    "py_compile": "passed",
-    "pytest": "29 passed for tests/test_step16_v2_shadow.py and tests/test_v2_1_shadow_service.py"
+  "created_at": "2026-09-22T15:44:36.426693+00:00",
+  "decision": "B. STEP 19 COMPLETE - V2.1 SHADOW LIVE WITH SAFE FALLBACK, MINOR NON-BLOCKING LIMITATIONS",
+  "deployed_commit": "20c18e44d74bff9391d35e53066e1dcba79c8f28",
+  "production_enabled": true,
+  "schema_verified": true,
+  "eth_fastapi_restarted": true,
+  "eth_fastapi": {
+    "active": true,
+    "main_pid": 3608112,
+    "n_restarts": 0,
+    "memory_current_bytes": 424747008
   },
-  "artifact_hashes_match": true,
-  "commit": "5e9356bdf7aaa0d5f65617ff84e1d4d58251dacd",
-  "production_deployed": false,
-  "natural_v21_cycles_observed": 0,
+  "natural_v21_cycles_observed": 6,
+  "v21_prediction_rows": 180,
+  "cycle_timestamps": [
+    "2026-09-22T15:10:00+00:00",
+    "2026-09-22T15:20:00+00:00",
+    "2026-09-22T15:25:00+00:00",
+    "2026-09-22T15:30:00+00:00",
+    "2026-09-22T15:35:00+00:00",
+    "2026-09-22T15:40:00+00:00"
+  ],
   "rich_predictions_generated": 0,
-  "fallbacks_generated": 0,
+  "fallbacks_generated": 180,
+  "fallback_breakdown": {
+    "V2_0_CHAMPION": 168,
+    "ORDERFLOW_INCOMPLETE": 12
+  },
   "invalid_probabilities": 0,
+  "high_scrutiny_rows": 6,
+  "v21_outcomes_persisted": 0,
+  "outcome_note": "No V2.1 predictions from the soak were mature yet; 1H earliest soak row matures at/after 2026-09-22T16:10:00Z, 12H much later.",
   "v2_0_unchanged": true,
   "v1_unchanged": true,
-  "grid_unaffected_by_v21": true,
-  "required_unblock": "Apply migrations/probability_v2_1_shadow_schema.sql through Supabase SQL/Postgres channel, then enable PROBABILITY_V2_1_SHADOW_ENABLED=true and restart eth-fastapi with Grid reconciliation."
+  "collectors_healthy": true,
+  "grid_reconciliation": {
+    "run_id": "run_c11f416bcf364a02",
+    "status": "RUNNING",
+    "operational_state": "DEGRADED_PREEXISTING",
+    "inventory": -100,
+    "open_orders": 20,
+    "risk_state": "GREEN",
+    "delta_position": "-100",
+    "gridbot_inventory": "-100",
+    "unaffected_by_v21": true
+  },
+  "non_blocking_limitations": [
+    "Orderflow source_status remained incomplete for the two rich champion outputs, so both rich models correctly used FALLBACK_V2_0 during all six cycles.",
+    "One Grid compact live-state read race occurred after soak: RuntimeError dictionary changed size during iteration. Heartbeats and DB reconciliation remained healthy; not attributable to V2.1.",
+    "Authenticated API endpoints returned 401 to unauthenticated local curl; verification used DB/log/service checks."
+  ],
+  "zero_trading_authority": true,
+  "ready_for_ongoing_forward_validation": true
 }

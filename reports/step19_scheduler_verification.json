@@ -1,13 +1,18 @@
 {
-  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "created_at": "2026-09-22T15:44:36.426693+00:00",
   "implemented_jobs": [
     "probability_v2_1_shadow_prediction_v1",
     "probability_v2_1_shadow_outcome_evaluator_v1"
   ],
-  "enabled_by_default": false,
-  "production_running_count": {
-    "prediction": 0,
-    "outcome_evaluator": 0
-  },
-  "reason": "Not deployed/enabled because persistence gate is blocked."
+  "enabled": true,
+  "prediction_job_observed_cycles": 6,
+  "outcome_job_observed": true,
+  "duplicate_job_evidence": false,
+  "prediction_cycle_runtimes_seconds_observed": [
+    2.182,
+    2.17,
+    1.877,
+    1.513
+  ],
+  "timeout_oom_error": false
 }
