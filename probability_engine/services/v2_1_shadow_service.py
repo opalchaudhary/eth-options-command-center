@@ -120,10 +120,10 @@ def _artifact_basename(path: str) -> str:
 
 
 def _resolve_model_path(path: str) -> Path:
-    model_path = Path(__file__).resolve().parents[2] / str(path).replace("\\", "/")
-    if not model_path.exists():
-        model_path = MODEL_DIR / _artifact_basename(path)
-    return model_path
+    bundled_path = MODEL_DIR / _artifact_basename(path)
+    if bundled_path.exists():
+        return bundled_path
+    return Path(__file__).resolve().parents[2] / str(path).replace("\\", "/")
 
 
 @lru_cache(maxsize=1)
