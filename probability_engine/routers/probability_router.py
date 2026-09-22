@@ -7,6 +7,11 @@ from probability_engine.config import get_probability_config
 from probability_engine.repositories.prediction_repository import PredictionRepository
 from probability_engine.services.market_data_service import ProbabilityMarketDataService
 from probability_engine.services.model_registry import ModelRegistry
+from probability_engine.services.v2_1_shadow_service import (
+    V21ShadowEngine,
+    V21ShadowPredictionRepository,
+    shadow_health as v21_shadow_health,
+)
 from probability_engine.services.v2_shadow_service import V2ShadowEngine, V2ShadowPredictionRepository, shadow_health
 
 
@@ -157,9 +162,34 @@ def probability_v2_shadow_dry_run():
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/v2.1/shadow/health")
+def probability_v2_1_shadow_health():
+    return v21_shadow_health()
+
+
+@router.get("/v2.1/shadow/latest")
+def probability_v2_1_shadow_latest(limit: int = Query(default=200, ge=1, le=500)):
+    try:
+        rows = V21ShadowPredictionRepository().latest(limit=limit)
+        return {"ok": True, "rows": _json_records(rows)}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"V2.1 shadow storage unavailable: {exc}") from exc
+
+
+@router.get("/v2.1/shadow/dry-run")
+def probability_v2_1_shadow_dry_run():
+    try:
+        return V21ShadowEngine().run_shadow_prediction(persist=False, force_disabled=True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 public_shadow_router.add_api_route("/v2/shadow/health", probability_v2_shadow_health, methods=["GET"])
 public_shadow_router.add_api_route("/v2/shadow/latest", probability_v2_shadow_latest, methods=["GET"])
 public_shadow_router.add_api_route("/v2/shadow/dry-run", probability_v2_shadow_dry_run, methods=["GET"])
+public_shadow_router.add_api_route("/v2.1/shadow/health", probability_v2_1_shadow_health, methods=["GET"])
+public_shadow_router.add_api_route("/v2.1/shadow/latest", probability_v2_1_shadow_latest, methods=["GET"])
+public_shadow_router.add_api_route("/v2.1/shadow/dry-run", probability_v2_1_shadow_dry_run, methods=["GET"])
 
 
 @router.get("/storage-stats")

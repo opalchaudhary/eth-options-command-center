@@ -1,0 +1,49 @@
+{
+  "model_version": "probability_v2_1_candidate_v1",
+  "feature_contract": "probability_v2_1_features_v1",
+  "calibration": "calibration_v2_1_candidate_v1",
+  "target": "up_excursion_ge_1_0_atr",
+  "horizon": "1H",
+  "family": "orderflow",
+  "freshness_policy": "FALLBACK_TO_V2_0 if required rich feature is missing/stale/incomplete; deriv<=10m, orderflow/orderbook<=2m, options D1<=15m/W1<=35m.",
+  "fallback": "V2.0",
+  "model": {
+    "beta": [
+      0.7162590341028291,
+      0.13696865084429244,
+      0.2146057227749084,
+      -0.05704716667528473,
+      -0.016929858810979078,
+      -0.08573112932636587,
+      0.1417458094408692,
+      0.09080014960460443
+    ],
+    "mu": [
+      0.4652635422974659,
+      -89.26468455402465,
+      186.23906212231086,
+      514.0309402948997,
+      1088.1213439690598,
+      0.501221515758984,
+      12950.51824993957
+    ],
+    "sd": [
+      0.24827084085899803,
+      10902.163955519181,
+      19285.643927905025,
+      29954.43659388786,
+      45005.03810360632,
+      0.25569029548577027,
+      18833.469310549837
+    ],
+    "features": [
+      "cvd_increment",
+      "cvd_5m",
+      "cvd_15m",
+      "cvd_1h",
+      "taker_buy_ratio",
+      "total_volume"
+    ],
+    "formulation": "logit(v2_probability) + selected_rich_features"
+  }
+}

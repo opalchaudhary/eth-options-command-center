@@ -1,0 +1,23 @@
+{
+  "created": true,
+  "model_version": "probability_v2_1_candidate_v1",
+  "feature_contract": "probability_v2_1_features_v1",
+  "calibration": "calibration_v2_1_candidate_v1",
+  "champion_map_path": "reports/step18_final_champion_map.csv",
+  "fallback_behavior": "FALLBACK_TO_V2_0 whenever required rich data is stale, missing, incomplete, or outside feature contract.",
+  "models": [
+    {
+      "target": "realized_over_range_width_ge_1",
+      "horizon": "12H",
+      "path": "reports\\step18_v21_models\\probability_v2_1_candidate_v1__realized_over_range_width_ge_1__12h.json",
+      "sha256": "fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f"
+    },
+    {
+      "target": "up_excursion_ge_1_0_atr",
+      "horizon": "1H",
+      "path": "reports\\step18_v21_models\\probability_v2_1_candidate_v1__up_excursion_ge_1_0_atr__1h.json",
+      "sha256": "eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499"
+    }
+  ],
+  "sha256": "c4fdcdc18f64927c2d767cf1b37442a298c3062b4b2341f0f92473d0affbfd95"
+}

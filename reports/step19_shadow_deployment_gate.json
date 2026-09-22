@@ -1,0 +1,80 @@
+{
+  "created_at": "2026-09-22T15:02:45.213386+00:00",
+  "step": "STEP 19",
+  "mode": "Probability V2.1 shadow-only deployment gate",
+  "v2_incumbent_unchanged": true,
+  "v21_model_version": "probability_v2_1_candidate_v1",
+  "feature_version": "probability_v2_1_features_v1",
+  "calibration_version": "calibration_v2_1_candidate_v1",
+  "label_version": "label_v2",
+  "manifest_sha256": "c4fdcdc18f64927c2d767cf1b37442a298c3062b4b2341f0f92473d0affbfd95",
+  "frozen_artifact_verification": [
+    {
+      "target": "realized_over_range_width_ge_1",
+      "horizon": "12H",
+      "expected_sha256": "fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f",
+      "observed_sha256": "fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f",
+      "features": [
+        "cvd_increment",
+        "cvd_5m",
+        "cvd_15m",
+        "cvd_1h",
+        "taker_buy_ratio",
+        "total_volume"
+      ],
+      "status": "MATCH"
+    },
+    {
+      "target": "up_excursion_ge_1_0_atr",
+      "horizon": "1H",
+      "expected_sha256": "eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499",
+      "observed_sha256": "eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499",
+      "features": [
+        "cvd_increment",
+        "cvd_5m",
+        "cvd_15m",
+        "cvd_1h",
+        "taker_buy_ratio",
+        "total_volume"
+      ],
+      "status": "MATCH"
+    }
+  ],
+  "fallback_contract": {
+    "rich_champions": [
+      "realized_over_range_width_ge_1/12H",
+      "up_excursion_ge_1_0_atr/1H"
+    ],
+    "required_orderflow_features": [
+      "cvd_increment",
+      "cvd_5m",
+      "cvd_15m",
+      "cvd_1h",
+      "taker_buy_ratio",
+      "total_volume"
+    ],
+    "orderflow_version": "rich_data_v2_orderflow_ws",
+    "max_age_seconds": 120,
+    "fallback_to_v2_0_on": [
+      "ORDERFLOW_MISSING",
+      "ORDERFLOW_STALE",
+      "ORDERFLOW_INCOMPLETE",
+      "FEATURE_MISSING",
+      "MODEL_LOAD_FAILURE",
+      "OTHER_SAFE_FALLBACK"
+    ]
+  },
+  "trading_isolation": {
+    "shadow_only": true,
+    "zero_trading_authority": true,
+    "grid_strategy_config_orders_positions_modified": false,
+    "ironfly_modified": false
+  },
+  "tests": {
+    "command": "python -m pytest -q tests/test_step16_v2_shadow.py tests/test_v2_1_shadow_service.py",
+    "returncode": 0,
+    "passed": true,
+    "headline": "29 passed"
+  },
+  "final_gate_predeploy": "READY_FOR_SURGICAL_DEPLOYMENT"
+}

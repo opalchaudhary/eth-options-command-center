@@ -64,6 +64,9 @@ class ProbabilityEngineConfig:
     v2_outcome_frontier_enabled: bool = field(default_factory=lambda: _bool_env("PROBABILITY_V2_OUTCOME_FRONTIER_ENABLED", True))
     v2_outcome_frontier_bootstrap_minutes: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_FRONTIER_BOOTSTRAP_MINUTES", 60))
     v2_outcome_retry_delay_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_OUTCOME_RETRY_DELAY_SECONDS", 900))
+    v21_shadow_enabled: bool = field(default_factory=lambda: _bool_env("PROBABILITY_V2_1_SHADOW_ENABLED", False))
+    v21_shadow_interval_seconds: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_1_SHADOW_INTERVAL", _int_env("PROBABILITY_V2_SHADOW_INTERVAL", 300)))
+    v21_outcome_batch_limit: int = field(default_factory=lambda: _int_env("PROBABILITY_V2_1_OUTCOME_BATCH_SIZE", _int_env("PROBABILITY_V2_OUTCOME_BATCH_SIZE", _int_env("PROBABILITY_OUTCOME_BATCH_LIMIT", 25))))
 
 
 def get_probability_config() -> ProbabilityEngineConfig:
