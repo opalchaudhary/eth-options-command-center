@@ -1,0 +1,21 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "production_pre_audit": {
+    "commit_before": "706525956acbd4927bf44e9a8e5d9df659af64b5",
+    "worktree_notes": [
+      "untracked incident_snapshots/",
+      "untracked reports/dgb_v01_presoak_run_2243bd7f4920450c.jsonl"
+    ],
+    "eth_fastapi": {
+      "active": true,
+      "main_pid": 3594333,
+      "n_restarts": 0,
+      "memory_current_bytes": 711983104
+    },
+    "eth_dashboard": {
+      "active": false
+    },
+    "grid_compact_endpoint": "Authentication required from unauthenticated probe",
+    "recent_log_note": "One pre-existing grid compact live-state warning observed before Step 19 deploy attempt."
+  }
+}

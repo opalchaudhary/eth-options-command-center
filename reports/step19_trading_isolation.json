@@ -1,0 +1,6 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "zero_trading_authority": true,
+  "code_isolation_scan": "No V2.1 service/job imports or calls to GridBot, IronFly, order execution, positions, inventory, or strategy config. Scheduler retains pre-existing Grid heartbeat only.",
+  "production_trading_actions_attributable_to_v21": 0
+}

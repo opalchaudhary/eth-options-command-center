@@ -1,0 +1,41 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "manifest_sha256": "c4fdcdc18f64927c2d767cf1b37442a298c3062b4b2341f0f92473d0affbfd95",
+  "models": [
+    {
+      "target": "realized_over_range_width_ge_1",
+      "horizon": "12H",
+      "family": "ORDERFLOW",
+      "features": [
+        "cvd_increment",
+        "cvd_5m",
+        "cvd_15m",
+        "cvd_1h",
+        "taker_buy_ratio",
+        "total_volume"
+      ],
+      "expected_sha256": "fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f",
+      "observed_sha256": "fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f",
+      "match": true,
+      "high_scrutiny": true
+    },
+    {
+      "target": "up_excursion_ge_1_0_atr",
+      "horizon": "1H",
+      "family": "ORDERFLOW",
+      "features": [
+        "cvd_increment",
+        "cvd_5m",
+        "cvd_15m",
+        "cvd_1h",
+        "taker_buy_ratio",
+        "total_volume"
+      ],
+      "expected_sha256": "eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499",
+      "observed_sha256": "eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499",
+      "match": true,
+      "high_scrutiny": false
+    }
+  ],
+  "all_hashes_match": true
+}

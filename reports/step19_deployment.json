@@ -1,0 +1,9 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "local_commit": "5e9356bdf7aaa0d5f65617ff84e1d4d58251dacd",
+  "pushed": true,
+  "deployed_to_production": false,
+  "restart_performed": false,
+  "blocker": "Supabase V2.1 persistence tables are absent and production shell has no DDL channel: psql unavailable, supabase CLI unavailable, public.exec_sql RPC missing.",
+  "safety_action": "Stopped before enabling PROBABILITY_V2_1_SHADOW_ENABLED or restarting eth-fastapi."
+}

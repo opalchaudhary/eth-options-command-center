@@ -1,0 +1,5 @@
+target,horizon,test,status,details
+realized_over_range_width_ge_1,12H,artifact_hash_replay_gate,PASS,fb9eda0fba033a1f7a024f96d5daf9275e67b0dc6d85c9c4e60941327bc1310f
+up_excursion_ge_1_0_atr,1H,artifact_hash_replay_gate,PASS,eaa2b4db1da44c104245f335da9f8b7e8d17b8fb1f26348c90b32d37c777f499
+ALL_FALLBACK_OUTPUTS,ALL,fallback_mapping_count,PASS,28 outputs mapped to V2.0 fallback by hybrid contract
+ALL,ALL,deterministic_local_tests,PASS,tests/test_v2_1_shadow_service.py

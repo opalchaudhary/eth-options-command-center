@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "implemented_jobs": [
+    "probability_v2_1_shadow_prediction_v1",
+    "probability_v2_1_shadow_outcome_evaluator_v1"
+  ],
+  "enabled_by_default": false,
+  "production_running_count": {
+    "prediction": 0,
+    "outcome_evaluator": 0
+  },
+  "reason": "Not deployed/enabled because persistence gate is blocked."
+}

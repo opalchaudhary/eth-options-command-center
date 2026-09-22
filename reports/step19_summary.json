@@ -1,0 +1,21 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "decision": "C. STEP 19 BLOCKED - ARTIFACT / REPLAY / PERSISTENCE GATE FAILED",
+  "blocked_gate": "production persistence schema creation",
+  "local_code_complete": true,
+  "local_tests": {
+    "py_compile": "passed",
+    "pytest": "29 passed for tests/test_step16_v2_shadow.py and tests/test_v2_1_shadow_service.py"
+  },
+  "artifact_hashes_match": true,
+  "commit": "5e9356bdf7aaa0d5f65617ff84e1d4d58251dacd",
+  "production_deployed": false,
+  "natural_v21_cycles_observed": 0,
+  "rich_predictions_generated": 0,
+  "fallbacks_generated": 0,
+  "invalid_probabilities": 0,
+  "v2_0_unchanged": true,
+  "v1_unchanged": true,
+  "grid_unaffected_by_v21": true,
+  "required_unblock": "Apply migrations/probability_v2_1_shadow_schema.sql through Supabase SQL/Postgres channel, then enable PROBABILITY_V2_1_SHADOW_ENABLED=true and restart eth-fastapi with Grid reconciliation."
+}

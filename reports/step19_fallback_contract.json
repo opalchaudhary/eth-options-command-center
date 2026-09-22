@@ -1,0 +1,24 @@
+{
+  "created_at": "2026-09-22T15:06:32.809090+00:00",
+  "orderflow_version": "rich_data_v2_orderflow_ws",
+  "max_age_seconds": 120,
+  "required_features": [
+    "cvd_increment",
+    "cvd_5m",
+    "cvd_15m",
+    "cvd_1h",
+    "taker_buy_ratio",
+    "total_volume"
+  ],
+  "point_in_time_rule": "feature_source_timestamp <= prediction_timestamp",
+  "fallback_reasons": [
+    "ORDERFLOW_MISSING",
+    "ORDERFLOW_STALE",
+    "ORDERFLOW_INCOMPLETE",
+    "FEATURE_MISSING:<feature>",
+    "MODEL_LOAD_FAILURE",
+    "QUALITY_GATE_FAILED",
+    "OTHER_SAFE_FALLBACK"
+  ],
+  "fallback_probability_rule": "Fallback rows retain the exact V2.0 baseline probability."
+}
