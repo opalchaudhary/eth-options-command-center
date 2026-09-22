@@ -115,6 +115,17 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _artifact_basename(path: str) -> str:
+    return Path(str(path).replace("\\", "/")).name
+
+
+def _resolve_model_path(path: str) -> Path:
+    model_path = Path(__file__).resolve().parents[2] / str(path).replace("\\", "/")
+    if not model_path.exists():
+        model_path = MODEL_DIR / _artifact_basename(path)
+    return model_path
+
+
 @lru_cache(maxsize=1)
 def load_manifest() -> dict[str, Any]:
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -125,9 +136,7 @@ def load_manifest() -> dict[str, Any]:
     if manifest.get("calibration") != CALIBRATION_VERSION:
         raise ValueError("V2.1 manifest calibration mismatch")
     for model in manifest.get("models", []):
-        model_path = (Path(__file__).resolve().parents[2] / model["path"]).resolve()
-        if not model_path.exists():
-            model_path = MODEL_DIR / Path(model["path"]).name
+        model_path = _resolve_model_path(model["path"])
         actual = file_sha256(model_path)
         if actual != model["sha256"]:
             raise ValueError(f"V2.1 model hash mismatch for {model.get('target')}/{model.get('horizon')}")
@@ -139,9 +148,7 @@ def load_model(target: str, horizon: str) -> dict[str, Any] | None:
     manifest = load_manifest()
     for entry in manifest.get("models", []):
         if entry.get("target") == target and str(entry.get("horizon")).upper() == horizon.upper():
-            model_path = Path(__file__).resolve().parents[2] / entry["path"]
-            if not model_path.exists():
-                model_path = MODEL_DIR / Path(entry["path"]).name
+            model_path = _resolve_model_path(entry["path"])
             payload = json.loads(model_path.read_text(encoding="utf-8"))
             return {**payload, "artifact_hash": entry["sha256"], "artifact_path": str(model_path)}
     return None
