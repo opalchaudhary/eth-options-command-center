@@ -431,6 +431,7 @@ def test_active_telemetry_failure_preserves_operator_controls_and_blocks_false_c
     assert 'render_actions(live)' in operator_panel_body
     assert 'render_pending_operator_forms(live)' in operator_panel_body
     assert 'live.get("authority_state") == "CONFIRMED_NO_ACTIVE"' in operator_panel_body
+    assert "render_idle(live)" not in operator_panel_body
     assert operator_panel_body.index("render_actions(live)") < operator_panel_body.index('live.get("authority_state") == "CONFIRMED_NO_ACTIVE"')
     assert '"gridbot_edit_preview"' in edit_body
     assert '"edit_lower"' in edit_body

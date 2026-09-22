@@ -633,7 +633,7 @@ def render_operator_panel(live: dict) -> None:
     elif live.get("authority_state") == "CONFIRMED_NO_ACTIVE":
         render_create_grid(live)
     else:
-        render_idle(live)
+        return
 
 
 def render_edit_grid(live: dict) -> None:

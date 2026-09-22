@@ -4781,6 +4781,112 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
     assert "fills" not in compact
 
 
+def test_gridbot_compact_live_state_returns_degraded_active_payload_on_builder_failure(monkeypatch):
+    latest_run = {
+        "run_id": "run-compact-fallback",
+        "status": GridStatus.RUNNING.value,
+        "config": {
+            "grid_type": "neutral",
+            "lower_price": "2400",
+            "upper_price": "2600",
+            "grid_count": 4,
+            "spacing_type": "arithmetic",
+            "lot_size": "1",
+            "max_inventory_lots": "20",
+            "product_symbol": "ETHUSD",
+            "config_version": 1,
+        },
+        "orders": {
+            "buy-open": {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
+            "sell-open": {"client_order_id": "sell-open", "side": "sell", "status": "open", "remaining_quantity": "1"},
+        },
+        "fills": {"fill": {"id": "fill", "side": "buy", "size": "5", "price": "2500", "commission": "0"}},
+        "deployment_completeness": {"expected": 2, "confirmed_open": 2, "filled": 0, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
+    }
+
+    class DB:
+        enabled = True
+
+        def load_run_state(self, run_id):
+            assert run_id == "run-compact-fallback"
+            return latest_run
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            raise RuntimeError("compact builder exploded")
+
+    class RecoveryWorker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "run_id": "run-compact-fallback",
+                "running": True,
+                "thread_alive": True,
+                "status": "running",
+                "account_risk_state": {"position_lots": "5", "mark_price": "2500"},
+            }
+
+    original_worker = Worker()
+    recovery_worker = RecoveryWorker()
+
+    def flaky_impl():
+        monkeypatch.setattr(continuous_worker_module, "worker", recovery_worker)
+        raise RuntimeError("Delta telemetry unavailable")
+
+    monkeypatch.setattr(continuous_worker_module, "worker", original_worker)
+    monkeypatch.setattr(continuous_worker_module, "_gridbot_compact_live_state", flaky_impl)
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["ok"] is False
+    assert compact["source"] == "compact_exception"
+    assert compact["freshness"] == "unavailable"
+    assert compact["run_id"] == "run-compact-fallback"
+    assert compact["lifecycle_state"] == GridStatus.RUNNING.value
+    assert compact["config"]["config_version"] == 1
+    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
+    assert compact["delta_position"] is None
+    assert compact["account_risk_state_error"] == "Delta telemetry unavailable"
+    assert compact["compact_live_state_error"] == "Delta telemetry unavailable"
+    assert compact["health"]["overall_status"] == "DEGRADED"
+    assert compact["health"]["new_order_restricted"] is True
+
+
+def test_gridbot_compact_live_state_preserves_zero_delta_position(monkeypatch):
+    class DB:
+        enabled = False
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "running": True,
+                "thread_alive": True,
+                "run_id": "run-zero",
+                "status": "running",
+                "lifecycle_state": GridStatus.RUNNING.value,
+                "config": {"grid_type": "neutral", "config_version": 2},
+                "known_gridbot_orders": [],
+                "fill_derived_inventory": "0",
+                "delta_position": 0,
+                "health": {"overall_status": "HEALTHY", "active_issues": []},
+                "account_risk_state": {"position_lots": "7"},
+                "accounting": {},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert compact["delta_position"] == 0
+
+
 def test_gridbot_compact_resting_orders_survive_large_historical_order_set(monkeypatch):
     historical = [
         {"client_order_id": f"hist-{index}", "side": "buy", "status": "manual_cancelled", "remaining_quantity": "0", "price": "2400"}

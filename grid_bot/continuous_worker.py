@@ -41,6 +41,13 @@ def _decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in [None, ""]:
+            return value
+    return None
+
+
 def _fresh_open_order_count(telemetry: dict) -> int | None:
     if telemetry.get("open_order_count") in [None, ""] and telemetry.get("open_buy_order_count") in [None, ""] and telemetry.get("open_sell_order_count") in [None, ""]:
         return None
@@ -64,6 +71,11 @@ def _refresh_compact_account_telemetry(state: dict) -> None:
 def _mark_compact_telemetry_unavailable(state: dict, exc: Exception) -> None:
     state["account_risk_state_error"] = str(exc)[:300]
     state["delta_position"] = None
+    telemetry = deepcopy(state.get("account_risk_state") or {})
+    telemetry["telemetry_status"] = "UNAVAILABLE"
+    telemetry["position_lots"] = None
+    telemetry["position_side"] = None
+    state["account_risk_state"] = telemetry
     health = state.get("health") if isinstance(state.get("health"), dict) else {}
     active_issues = list(health.get("active_issues") or [])
     active_issues.append(
@@ -100,7 +112,7 @@ def _mark_compact_telemetry_unavailable(state: dict, exc: Exception) -> None:
 def _reconciliation_from_state(state: dict) -> dict:
     payload = {
         "gridbot_inventory": state.get("fill_derived_inventory"),
-        "delta_position": state.get("delta_position") or (state.get("account_risk_state") or {}).get("position_lots"),
+        "delta_position": _first_present(state.get("delta_position"), (state.get("account_risk_state") or {}).get("position_lots")),
         "exchange_open_orders": state.get("open_gridbot_orders"),
         "position_mismatches": state.get("position_mismatches") or 0,
         "unresolved_orders": state.get("unresolved_orders") or 0,
@@ -910,6 +922,41 @@ def _compact_resting_orders(rows: list[dict]) -> list[dict]:
 
 
 def gridbot_compact_live_state() -> dict:
+    try:
+        return _gridbot_compact_live_state()
+    except Exception as exc:
+        logger.exception("Failed to build GridBot compact live state.")
+        return _compact_failure_live_state(exc)
+
+
+def _compact_failure_live_state(exc: Exception) -> dict:
+    try:
+        state = worker.state()
+    except Exception as state_exc:
+        state = {"active_run_refresh_error": str(state_exc)[:300]}
+    db = getattr(worker, "db", None)
+    if db and getattr(db, "enabled", False):
+        try:
+            run_id = state.get("run_id")
+            active = None
+            if not run_id and hasattr(db, "active_run"):
+                active = db.active_run()
+                run_id = (active or {}).get("run_id")
+            if run_id:
+                latest_run = db.load_run_state(run_id)
+                if latest_run:
+                    state = _apply_run_to_live_state(state, latest_run)
+                    if latest_run.get("status") == GridStatus.RUNNING.value and state.get("status") not in {"running", GridStatus.RUNNING.value}:
+                        state["status"] = "reattach_pending"
+        except Exception as fallback_exc:
+            state["active_run_refresh_error"] = str(fallback_exc)[:300]
+    state["ok"] = False
+    _mark_compact_telemetry_unavailable(state, exc)
+    state["compact_live_state_error"] = str(exc)[:300]
+    return _compact_live_state_payload(state, "compact_exception", "unavailable")
+
+
+def _gridbot_compact_live_state() -> dict:
     state = worker.state()
     db = getattr(worker, "db", None)
     compact_source = state.get("active_run_source") or ("worker_memory_compact" if state.get("run_id") else "no_active_run")
@@ -965,6 +1012,10 @@ def gridbot_compact_live_state() -> dict:
             if compact_source == "no_active_run":
                 compact_source = "unavailable"
                 freshness = "unavailable"
+    return _compact_live_state_payload(state, compact_source, freshness)
+
+
+def _compact_live_state_payload(state: dict, compact_source: str, freshness: str) -> dict:
     run = state.get("active_run") if isinstance(state.get("active_run"), dict) else {}
     config = state.get("config") or (run.get("config") if isinstance(run, dict) else {}) or {}
     telemetry = state.get("account_risk_state") or {}
@@ -986,6 +1037,7 @@ def gridbot_compact_live_state() -> dict:
         "generated_at": utc_now(),
         "active_run_refresh_error": state.get("active_run_refresh_error"),
         "account_risk_state_error": state.get("account_risk_state_error"),
+        "compact_live_state_error": state.get("compact_live_state_error"),
         "worker_owner": state.get("worker_owner"),
         "running": state.get("running"),
         "thread_alive": state.get("thread_alive"),
@@ -1038,7 +1090,7 @@ def gridbot_compact_live_state() -> dict:
         "resting_orders": resting_orders,
         **counts,
         "fill_derived_inventory": state.get("fill_derived_inventory"),
-        "delta_position": state.get("delta_position") or telemetry.get("position_lots"),
+        "delta_position": _first_present(state.get("delta_position"), telemetry.get("position_lots")),
         "known_fill_count": state.get("known_fill_count"),
         "accounting": {
             "gross_realized_pnl": accounting.get("gross_realized_pnl"),
