@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from .account_telemetry import AccountTelemetryCache, account_telemetry_cache
-from .accounting import build_run_accounting
+from .accounting import accounting_run_snapshot, build_run_accounting
 from .delta_testnet_client import DeltaTestnetClient
 from .durable_lifecycle import DurableGridBotLifecycle
 from .exchange_truth import inventory_from_fills, reconcile_exchange_truth
@@ -124,6 +124,7 @@ def _reconciliation_from_state(state: dict) -> dict:
 
 
 def _apply_run_to_live_state(state: dict, run: dict) -> dict:
+    run = accounting_run_snapshot(run)
     state.update(
         {
             "active_run": deepcopy(run),
@@ -264,39 +265,40 @@ class ContinuousGridBotWorker:
     def state(self) -> dict:
         with self._lock:
             state = deepcopy(self._state)
-            run = self._run or {}
-            if run:
-                state.update(
-                    {
-                        "run_id": run.get("run_id"),
-                        "active_run": deepcopy(run),
-                        "lifecycle_state": run.get("status"),
-                        "config": run.get("config") or {},
-                        "config_version": (run.get("config") or {}).get("config_version"),
-                        "grid_nature": (run.get("config") or {}).get("grid_type"),
-                        "grid_levels": run.get("levels") or [],
-                        "deployment_completeness": run.get("deployment_completeness") or {},
-                        "lifecycle_progress": run.get("lifecycle_progress") or run.get("startup") or {},
-                        "lifecycle_timing": run.get("lifecycle_timing") or {},
-                        "known_gridbot_orders": list((run.get("orders") or {}).values()),
-                        "known_fill_ids": list((run.get("fills") or {}).keys()),
-                        "replacement_state": run.get("replacement_keys") or {},
-                    }
-                )
+            run = accounting_run_snapshot(self._run or {})
             state["thread_alive"] = bool(self._thread and self._thread.is_alive())
-            if hasattr(self.db, "stats"):
-                state["supabase_request_counts"] = self.db.stats()
-            cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
-            if cached:
-                state["account_risk_state"] = cached
-                open_order_count = _fresh_open_order_count(cached)
-                if open_order_count is not None:
-                    state["open_gridbot_orders"] = open_order_count
-            if run:
-                state = _apply_run_to_live_state(state, run)
-            state["recent_resolved_health_issues"] = self._health_tracker.recent_resolved
-            state["health"] = evaluate_gridbot_health(state, run, _reconciliation_from_state(state), state.get("accounting"))
-            return state
+            recent_resolved = list(self._health_tracker.recent_resolved)
+        if run:
+            state.update(
+                {
+                    "run_id": run.get("run_id"),
+                    "active_run": deepcopy(run),
+                    "lifecycle_state": run.get("status"),
+                    "config": run.get("config") or {},
+                    "config_version": (run.get("config") or {}).get("config_version"),
+                    "grid_nature": (run.get("config") or {}).get("grid_type"),
+                    "grid_levels": run.get("levels") or [],
+                    "deployment_completeness": run.get("deployment_completeness") or {},
+                    "lifecycle_progress": run.get("lifecycle_progress") or run.get("startup") or {},
+                    "lifecycle_timing": run.get("lifecycle_timing") or {},
+                    "known_gridbot_orders": list((run.get("orders") or {}).values()),
+                    "known_fill_ids": list((run.get("fills") or {}).keys()),
+                    "replacement_state": run.get("replacement_keys") or {},
+                }
+            )
+        if hasattr(self.db, "stats"):
+            state["supabase_request_counts"] = self.db.stats()
+        cached = self.account_telemetry.snapshot() or account_telemetry_cache.snapshot()
+        if cached:
+            state["account_risk_state"] = cached
+            open_order_count = _fresh_open_order_count(cached)
+            if open_order_count is not None:
+                state["open_gridbot_orders"] = open_order_count
+        if run:
+            state = _apply_run_to_live_state(state, run)
+        state["recent_resolved_health_issues"] = recent_resolved
+        state["health"] = evaluate_gridbot_health(state, run, _reconciliation_from_state(state), state.get("accounting"))
+        return state
 
     def ensure_active_worker(self) -> dict:
         if self.db.enabled:

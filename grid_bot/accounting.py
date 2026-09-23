@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
@@ -195,6 +196,42 @@ def explicit_decimal(value: Any) -> Decimal | None:
         return None
 
 
+def _snapshot_mapping(value: Any) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {key: deepcopy(row) for key, row in value.copy().items()}
+
+
+def _snapshot_sequence(value: Any) -> list:
+    if value in [None, ""]:
+        return []
+    if not isinstance(value, list):
+        return deepcopy(value)
+    return [deepcopy(row) for row in list(value)]
+
+
+def accounting_run_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(run or {})
+    for key in [
+        "orders",
+        "fills",
+        "replacement_keys",
+        "deferred_orders",
+        "summary",
+        "external_position_adjustment",
+        "external_position_resolution",
+        "stop_diagnostics",
+        "product",
+        "config",
+    ]:
+        if isinstance((run or {}).get(key), dict):
+            snapshot[key] = _snapshot_mapping(run.get(key))
+    for key in ["exchange_costs", "levels"]:
+        if key in (run or {}):
+            snapshot[key] = _snapshot_sequence(run.get(key))
+    return snapshot
+
+
 def normalize_maker_taker_role(raw: dict[str, Any]) -> str:
     value = str(
         raw.get("maker_taker_role")
@@ -258,8 +295,9 @@ def normalize_fill(run: dict[str, Any], fill_id: str, fill: dict[str, Any]) -> A
     orders = run.get("orders") or {}
     client_order_id = str(raw.get("client_order_id") or fill.get("client_order_id") or "")
     exchange_order_id = str(raw.get("order_id") or raw.get("exchange_order_id") or fill.get("exchange_order_id") or "")
+    order_rows = list(orders.values())
     order = orders.get(client_order_id) or next(
-        (row for row in orders.values() if str(row.get("exchange_order_id") or "") == exchange_order_id),
+        (row for row in order_rows if str(row.get("exchange_order_id") or "") == exchange_order_id),
         {},
     )
     side = Side(str(raw.get("side") or fill.get("side") or order.get("side") or "").lower())
@@ -383,6 +421,7 @@ def _fill_sort_key(fill: AccountingFill) -> tuple[str, str]:
 
 
 def build_cycle_ledger(run: dict[str, Any]) -> tuple[list[CycleRecord], list[AccountingFill], Decimal, Decimal]:
+    run = accounting_run_snapshot(run)
     fills = sorted(
         [normalize_fill(run, fill_id, fill) for fill_id, fill in (run.get("fills") or {}).items()],
         key=_fill_sort_key,
@@ -460,6 +499,7 @@ def build_cycle_ledger(run: dict[str, Any]) -> tuple[list[CycleRecord], list[Acc
 
 
 def build_grid_cycle_ledger(run: dict[str, Any]) -> list[CycleRecord]:
+    run = accounting_run_snapshot(run)
     fills = sorted(
         [normalize_fill(run, fill_id, fill) for fill_id, fill in (run.get("fills") or {}).items()],
         key=_fill_sort_key,
@@ -551,7 +591,9 @@ def build_run_accounting(
     mark_price: Decimal | None = None,
     account_position_lots: Decimal | None = None,
 ) -> RunAccounting:
-    costs = [normalize_cost(cost) for cost in (costs if costs is not None else run.get("exchange_costs") or [])]
+    run = accounting_run_snapshot(run)
+    cost_rows = _snapshot_sequence(costs) if costs is not None else run.get("exchange_costs") or []
+    costs = [normalize_cost(cost) for cost in cost_rows]
     cycles, fills, remaining_lots, remaining_basis = build_cycle_ledger(run)
     grid_cycles = build_grid_cycle_ledger(run)
     gross = sum((cycle.gross_pnl for cycle in cycles), Decimal("0"))

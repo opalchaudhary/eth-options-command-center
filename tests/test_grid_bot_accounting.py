@@ -269,6 +269,22 @@ def test_lineaged_grid_cycles_allocate_partial_source_once():
     assert [cycle.cycle_id for cycle in first] == [cycle.cycle_id for cycle in second]
 
 
+def test_accounting_snapshots_order_lookup_before_iterating_values():
+    class MutatingOrders(dict):
+        def values(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    fill = _fill("entry", "buy", "3000", size="1", fee="0")
+    run = _run([fill])
+    order = run["orders"].pop(fill["client_order_id"])
+    run["orders"] = MutatingOrders({"different-key": order})
+
+    accounting = build_run_accounting(run, mark_price=Decimal("3000"), account_position_lots=Decimal("1"))
+
+    assert accounting.fills_total == 1
+    assert accounting.remaining_inventory_lots == Decimal("1")
+
+
 def test_unrealized_long_short_flat_and_ambiguous_attribution():
     assert calculate_unrealized_pnl(Decimal("2"), Decimal("6000"), Decimal("3010"), Decimal("1"), True) == Decimal("20")
     assert calculate_unrealized_pnl(Decimal("-2"), Decimal("-6020"), Decimal("3000"), Decimal("1"), True) == Decimal("20")

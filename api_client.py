@@ -10,6 +10,7 @@ except Exception:  # pragma: no cover - backend/test import fallback
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 AUTH_SESSION_STATE_KEY = "deltaforge_session_token"
+DELTAFORGE_SESSION_COOKIE_NAME = "deltaforge_session"
 
 
 def backend_url():
@@ -25,13 +26,30 @@ def _bounded_timeout(timeout):
     return max(1, min(requested, MAX_STREAMLIT_REQUEST_TIMEOUT_SECONDS))
 
 
-def _session_token():
+def _session_state_token():
     if st is None:
         return None
     try:
         return st.session_state.get(AUTH_SESSION_STATE_KEY)
     except Exception:
         return None
+
+
+def _cookie_token():
+    if st is None:
+        return None
+    try:
+        return st.context.cookies.get(DELTAFORGE_SESSION_COOKIE_NAME)
+    except Exception:
+        return None
+
+
+def current_streamlit_auth_token():
+    return _session_state_token() or _cookie_token()
+
+
+def _session_token():
+    return current_streamlit_auth_token()
 
 
 def _auth_headers(auth_token=None, include_auth=True):

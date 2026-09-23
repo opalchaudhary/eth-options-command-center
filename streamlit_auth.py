@@ -6,10 +6,10 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-from api_client import AUTH_SESSION_STATE_KEY, api_get, api_post
+from api_client import AUTH_SESSION_STATE_KEY, DELTAFORGE_SESSION_COOKIE_NAME, api_get, api_post, current_streamlit_auth_token
 
 
-COOKIE_NAME = "deltaforge_session"
+COOKIE_NAME = DELTAFORGE_SESSION_COOKIE_NAME
 USER_STATE_KEY = "deltaforge_user"
 
 
@@ -52,7 +52,7 @@ def _clear_auth_state() -> None:
 
 
 def _token() -> str | None:
-    return st.session_state.get(AUTH_SESSION_STATE_KEY) or _cookie_token()
+    return current_streamlit_auth_token()
 
 
 def _validate_existing_session() -> bool:
@@ -119,4 +119,3 @@ def require_authentication() -> dict:
         _clear_cookie_script()
         st.rerun()
     return user
-
