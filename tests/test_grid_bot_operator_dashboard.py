@@ -402,6 +402,14 @@ def test_dashboard_live_path_trace_events_are_present() -> None:
         assert event in text
 
 
+def test_dashboard_trace_emits_at_production_visible_warning_level() -> None:
+    text = PAGE.read_text()
+    trace_body = text.split("def trace_event", maxsplit=1)[1].split("def compact_error_type", maxsplit=1)[0]
+
+    assert 'LOGGER.warning("GRIDBOT_UI_TRACE %s"' in trace_body
+    assert 'LOGGER.info("GRIDBOT_UI_TRACE %s"' not in trace_body
+
+
 def test_dashboard_trace_does_not_log_auth_secret_values() -> None:
     text = PAGE.read_text()
 

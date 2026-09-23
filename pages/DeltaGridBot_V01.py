@@ -78,7 +78,7 @@ def trace_event(event: str, **fields: Any) -> None:
         **trace_state_fields(),
         **fields,
     }
-    LOGGER.info("GRIDBOT_UI_TRACE %s", json.dumps(payload, sort_keys=True, default=str))
+    LOGGER.warning("GRIDBOT_UI_TRACE %s", json.dumps(payload, sort_keys=True, default=str))
 
 
 def compact_error_type(exc: Exception) -> str:
