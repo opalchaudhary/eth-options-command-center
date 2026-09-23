@@ -211,6 +211,8 @@ def _snapshot_sequence(value: Any) -> list:
 
 
 def accounting_run_snapshot(run: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(run, dict) and run.get("_accounting_snapshot") is True:
+        return run
     snapshot = dict(run or {})
     for key in [
         "orders",
@@ -229,6 +231,13 @@ def accounting_run_snapshot(run: dict[str, Any]) -> dict[str, Any]:
     for key in ["exchange_costs", "levels"]:
         if key in (run or {}):
             snapshot[key] = _snapshot_sequence(run.get(key))
+    orders = snapshot.get("orders") if isinstance(snapshot.get("orders"), dict) else {}
+    snapshot["_orders_by_exchange_order_id"] = {
+        str(row.get("exchange_order_id")): row
+        for row in orders.values()
+        if isinstance(row, dict) and row.get("exchange_order_id") not in [None, ""]
+    }
+    snapshot["_accounting_snapshot"] = True
     return snapshot
 
 
@@ -293,13 +302,10 @@ def normalize_fill(run: dict[str, Any], fill_id: str, fill: dict[str, Any]) -> A
     raw = fill.get("raw") if isinstance(fill, dict) and isinstance(fill.get("raw"), dict) else fill
     raw = raw or {}
     orders = run.get("orders") or {}
+    orders_by_exchange = run.get("_orders_by_exchange_order_id") if isinstance(run.get("_orders_by_exchange_order_id"), dict) else {}
     client_order_id = str(raw.get("client_order_id") or fill.get("client_order_id") or "")
     exchange_order_id = str(raw.get("order_id") or raw.get("exchange_order_id") or fill.get("exchange_order_id") or "")
-    order_rows = list(orders.values())
-    order = orders.get(client_order_id) or next(
-        (row for row in order_rows if str(row.get("exchange_order_id") or "") == exchange_order_id),
-        {},
-    )
+    order = orders.get(client_order_id) or orders_by_exchange.get(exchange_order_id) or {}
     side = Side(str(raw.get("side") or fill.get("side") or order.get("side") or "").lower())
     price = decimal_value(raw.get("price") or raw.get("fill_price") or fill.get("price") or order.get("price"))
     quantity_lots = decimal_value(raw.get("size") or raw.get("quantity") or raw.get("fill_size") or fill.get("quantity"))
