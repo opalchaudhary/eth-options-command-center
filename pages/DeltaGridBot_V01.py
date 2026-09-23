@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import json
+import logging
+import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
+from uuid import uuid4
 
 import pandas as pd
 import requests
 import streamlit as st
 
-from api_client import api_get, api_post, backend_url
+from api_client import api_get, api_post, backend_url, current_streamlit_auth_token
 from grid_bot.operator_dashboard import (
     active_orders,
     fmt_lots,
@@ -37,9 +42,109 @@ from streamlit_auth import require_authentication
 from ui_styles import load_css
 
 
+LOGGER = logging.getLogger("deltaforge.gridbot.ui")
+PAGE_NAME = "DeltaGridBot_V01"
+TRACE_ID_KEY = "gridbot_ui_session_trace_id"
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ui_session_trace_id() -> str:
+    trace_id = st.session_state.get(TRACE_ID_KEY)
+    if not trace_id:
+        trace_id = uuid4().hex
+        st.session_state[TRACE_ID_KEY] = trace_id
+    return trace_id
+
+
+def trace_state_fields() -> dict:
+    return {
+        "authority_state": st.session_state.get("gridbot_live_authority"),
+        "has_auth_session_state": "deltaforge_session_token" in st.session_state,
+        "has_last_live": "gridbot_last_live_state" in st.session_state,
+        "has_lkg": "gridbot_last_good_active_live_state" in st.session_state,
+        "has_manual_refresh_flag": "gridbot_history_needs_refresh" in st.session_state,
+    }
+
+
+def trace_event(event: str, **fields: Any) -> None:
+    payload = {
+        "timestamp_utc": utc_timestamp(),
+        "event": event,
+        "ui_session_trace_id": ui_session_trace_id(),
+        "page": PAGE_NAME,
+        **trace_state_fields(),
+        **fields,
+    }
+    LOGGER.info("GRIDBOT_UI_TRACE %s", json.dumps(payload, sort_keys=True, default=str))
+
+
+def compact_error_type(exc: Exception) -> str:
+    if isinstance(exc, requests.Timeout):
+        return "TIMEOUT"
+    if isinstance(exc, requests.ConnectionError):
+        return "CONNECTION"
+    if isinstance(exc, requests.HTTPError):
+        status_code = getattr(exc.response, "status_code", None)
+        if status_code in {401, 403}:
+            return "AUTH_401"
+        if status_code == 400:
+            return "HTTP_400"
+        if status_code and status_code >= 500:
+            return "HTTP_500"
+        return "HTTP"
+    if isinstance(exc, ValueError):
+        return "JSON"
+    return "OTHER"
+
+
+def live_summary_fields(live: dict | None) -> dict:
+    live = live or {}
+    health = live.get("health") or {}
+    return {
+        "run_id": live.get("run_id"),
+        "generated_at": live.get("generated_at"),
+        "authority_state": live.get("authority_state") or st.session_state.get("gridbot_live_authority"),
+        "health": health.get("overall_status"),
+    }
+
+
+def render_mode_for(live: dict | None) -> str:
+    live = live or {}
+    if not current_streamlit_auth_token():
+        return "AUTH_REQUIRED"
+    if live.get("authority_state") == "UNKNOWN":
+        if st.session_state.get("gridbot_last_good_active_live_state"):
+            return "DEGRADED_LKG"
+        return "UNKNOWN"
+    if live.get("authority_state") == "CONFIRMED_NO_ACTIVE":
+        return "NO_ACTIVE_GRID"
+    if live.get("run_id") or live.get("lifecycle_state"):
+        return "CURRENT"
+    return "OTHER"
+
+
+@contextmanager
+def fragment_context(name: str):
+    previous = st.session_state.get("gridbot_current_fragment")
+    st.session_state["gridbot_current_fragment"] = name
+    try:
+        yield
+    finally:
+        if previous is None:
+            st.session_state.pop("gridbot_current_fragment", None)
+        else:
+            st.session_state["gridbot_current_fragment"] = previous
+
+
 st.set_page_config(page_title="Delta Grid Bot", layout="wide")
 load_css()
+trace_event("GRIDBOT_UI_PAGE_RUN_START")
+trace_event("GRIDBOT_UI_AUTH_ENTER")
 require_authentication()
+trace_event("GRIDBOT_UI_AUTH_OK", auth_present=bool(current_streamlit_auth_token()))
 
 
 st.markdown(
@@ -154,9 +259,36 @@ def fragment(run_every: str | None = None) -> Callable:
 
 
 def safe_get(path: str, params: dict | None = None, timeout: int = 15) -> dict:
+    compact_request = path == "/api/grid/v01/live/compact"
+    started = time.monotonic()
+    if compact_request:
+        trace_event(
+            "GRIDBOT_UI_COMPACT_REQUEST_START",
+            timeout=timeout,
+            auth_present=bool(current_streamlit_auth_token()),
+            backend_host=backend_url(),
+        )
     try:
-        return api_get(path, params=params, timeout=timeout)
+        response = api_get(path, params=params, timeout=timeout)
+        if compact_request:
+            trace_event(
+                "GRIDBOT_UI_COMPACT_REQUEST_RESULT",
+                status=200,
+                ok=bool(response.get("ok", True)),
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                timeout=False,
+            )
+        return response
     except requests.Timeout:
+        if compact_request:
+            trace_event(
+                "GRIDBOT_UI_COMPACT_REQUEST_RESULT",
+                ok=False,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                error_type="TIMEOUT",
+                timeout=True,
+            )
+            trace_event("GRIDBOT_UI_EXCEPTION", location="safe_get", error_type="Timeout", message="timeout")
         return {"ok": False, "error": "timeout", "status_class": "UNKNOWN", "failure_kind": "timeout"}
     except requests.HTTPError as exc:
         status_code = getattr(exc.response, "status_code", None)
@@ -165,8 +297,27 @@ def safe_get(path: str, params: dict | None = None, timeout: int = 15) -> dict:
             message = exc.response.json().get("detail") or message
         except Exception:
             pass
+        if compact_request:
+            trace_event(
+                "GRIDBOT_UI_COMPACT_REQUEST_RESULT",
+                status=status_code,
+                ok=False,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                error_type=compact_error_type(exc),
+                timeout=False,
+            )
+            trace_event("GRIDBOT_UI_EXCEPTION", location="safe_get", error_type=exc.__class__.__name__, message=str(message)[:240])
         return {"ok": False, "error": str(message), "status_code": status_code, "status_class": "UNKNOWN", "failure_kind": "auth" if status_code in {401, 403} else "backend"}
     except Exception as exc:
+        if compact_request:
+            trace_event(
+                "GRIDBOT_UI_COMPACT_REQUEST_RESULT",
+                ok=False,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 3),
+                error_type=compact_error_type(exc),
+                timeout=False,
+            )
+            trace_event("GRIDBOT_UI_EXCEPTION", location="safe_get", error_type=exc.__class__.__name__, message=str(exc)[:240])
         return {"ok": False, "error": str(exc), "status_class": "UNKNOWN", "failure_kind": "backend"}
 
 
@@ -230,6 +381,7 @@ def apply_pending_suggested_range(button_key: str) -> None:
 
 @st.cache_data(ttl=5, show_spinner=False)
 def fetch_compact_live_state() -> dict:
+    trace_event("GRIDBOT_UI_FETCH_COMPACT_ENTER", fragment=st.session_state.get("gridbot_current_fragment"))
     return safe_get("/api/grid/v01/live/compact", timeout=10)
 
 
@@ -239,6 +391,7 @@ def fetch_detailed_live_state() -> dict:
 
 
 def fetch_operational_live_state() -> dict:
+    trace_event("GRIDBOT_UI_FETCH_OPERATIONAL_ENTER", fragment=st.session_state.get("gridbot_current_fragment"))
     return fetch_compact_live_state()
 
 
@@ -554,11 +707,19 @@ def degraded_live_from_failure(live: dict) -> dict:
 
 def remember_live_state(live: dict) -> bool:
     if not live.get("ok", True):
+        previous_authority = st.session_state.get("gridbot_live_authority")
         st.session_state["gridbot_live_authority"] = "UNKNOWN"
+        trace_event(
+            "GRIDBOT_UI_AUTHORITY_UPDATE",
+            previous_authority=previous_authority,
+            new_authority="UNKNOWN",
+            reason="live_fetch_failure",
+        )
         st.session_state["gridbot_live_unknown_at"] = datetime.now(timezone.utc).isoformat()
         coalesced_live_warning(live)
         degraded = degraded_live_from_failure(live)
         st.session_state["gridbot_last_live_state"] = degraded
+        trace_event("GRIDBOT_UI_LAST_LIVE_UPDATE", reason="degraded_failure", **live_summary_fields(degraded))
         live.clear()
         live.update(degraded)
         return True
@@ -566,11 +727,27 @@ def remember_live_state(live: dict) -> bool:
     if live.get("run_id") or live.get("lifecycle_state"):
         live["authority_state"] = "CONFIRMED_ACTIVE"
         st.session_state["gridbot_last_good_active_live_state"] = live
+        trace_event("GRIDBOT_UI_LKG_UPDATE", source=st.session_state.get("gridbot_current_fragment"), **live_summary_fields(live))
+        previous_authority = st.session_state.get("gridbot_live_authority")
         st.session_state["gridbot_live_authority"] = "CONFIRMED_ACTIVE"
+        trace_event(
+            "GRIDBOT_UI_AUTHORITY_UPDATE",
+            previous_authority=previous_authority,
+            new_authority="CONFIRMED_ACTIVE",
+            reason="active_live_state",
+        )
     else:
         live["authority_state"] = "CONFIRMED_NO_ACTIVE"
+        previous_authority = st.session_state.get("gridbot_live_authority")
         st.session_state["gridbot_live_authority"] = "CONFIRMED_NO_ACTIVE"
+        trace_event(
+            "GRIDBOT_UI_AUTHORITY_UPDATE",
+            previous_authority=previous_authority,
+            new_authority="CONFIRMED_NO_ACTIVE",
+            reason="no_active_grid",
+        )
     st.session_state["gridbot_last_live_state"] = live
+    trace_event("GRIDBOT_UI_LAST_LIVE_UPDATE", reason="current_live_state", **live_summary_fields(live))
     return True
 
 
@@ -705,40 +882,48 @@ def render_edit_grid(live: dict) -> None:
 
 @fragment(run_every="5s")
 def live_status_fragment() -> None:
-    live = fetch_operational_live_state()
-    if not remember_live_state(live):
-        return
-    if live.get("run_id") or live.get("lifecycle_state"):
-        render_live_status(live)
-    else:
-        render_idle(live)
+    with fragment_context("live_status_fragment"):
+        trace_event("GRIDBOT_UI_FRAGMENT_ENTER", fragment="live_status_fragment")
+        live = fetch_operational_live_state()
+        if not remember_live_state(live):
+            return
+        if live.get("run_id") or live.get("lifecycle_state"):
+            render_live_status(live)
+        else:
+            render_idle(live)
 
 
 @fragment(run_every="5s")
 def live_metrics_fragment() -> None:
-    live = fetch_operational_live_state()
-    if not remember_live_state(live):
-        return
-    if live.get("run_id") or live.get("lifecycle_state"):
-        render_live_metrics(live)
+    with fragment_context("live_metrics_fragment"):
+        trace_event("GRIDBOT_UI_FRAGMENT_ENTER", fragment="live_metrics_fragment")
+        live = fetch_operational_live_state()
+        if not remember_live_state(live):
+            return
+        if live.get("run_id") or live.get("lifecycle_state"):
+            render_live_metrics(live)
 
 
 @fragment(run_every="15s")
 def live_orders_fragment() -> None:
-    live = fetch_operational_live_state()
-    if not remember_live_state(live):
-        return
-    if live.get("run_id") or live.get("lifecycle_state"):
-        render_live_orders(live)
+    with fragment_context("live_orders_fragment"):
+        trace_event("GRIDBOT_UI_FRAGMENT_ENTER", fragment="live_orders_fragment")
+        live = fetch_operational_live_state()
+        if not remember_live_state(live):
+            return
+        if live.get("run_id") or live.get("lifecycle_state"):
+            render_live_orders(live)
 
 
 @fragment(run_every="15s")
 def live_activity_fragment() -> None:
-    live = fetch_operational_live_state()
-    if not remember_live_state(live):
-        return
-    if live.get("run_id") or live.get("lifecycle_state"):
-        render_live_activity(live)
+    with fragment_context("live_activity_fragment"):
+        trace_event("GRIDBOT_UI_FRAGMENT_ENTER", fragment="live_activity_fragment")
+        live = fetch_operational_live_state()
+        if not remember_live_state(live):
+            return
+        if live.get("run_id") or live.get("lifecycle_state"):
+            render_live_activity(live)
 
 
 def render_idle(live: dict) -> None:
@@ -928,9 +1113,14 @@ with st.sidebar:
         fetch_detailed_live_state.clear()
         st.rerun()
 
+trace_event("GRIDBOT_UI_FRAGMENTS_BEGIN")
+trace_event("GRIDBOT_UI_FRAGMENT_INVOKE", fragment="live_status_fragment")
 live_status_fragment()
+trace_event("GRIDBOT_UI_FRAGMENT_INVOKE", fragment="live_metrics_fragment")
 live_metrics_fragment()
+trace_event("GRIDBOT_UI_FRAGMENT_INVOKE", fragment="live_orders_fragment")
 live_orders_fragment()
+trace_event("GRIDBOT_UI_FRAGMENT_INVOKE", fragment="live_activity_fragment")
 live_activity_fragment()
 last_live = st.session_state.get("gridbot_last_live_state") or {}
 if st.session_state.get("gridbot_live_authority") == "UNKNOWN":
@@ -940,5 +1130,7 @@ if st.session_state.get("gridbot_live_authority") == "UNKNOWN":
         "health": {"overall_status": "UNKNOWN"},
         "account_risk_state": {},
     }
+trace_event("GRIDBOT_UI_RENDER_STATE", render_mode=render_mode_for(last_live), **live_summary_fields(last_live))
 render_operator_panel(last_live)
 render_history()
+trace_event("GRIDBOT_UI_PAGE_RUN_END")

@@ -379,6 +379,72 @@ def test_dashboard_uses_live_fragment_without_full_page_refresh() -> None:
     assert "/api/grid/v01/live/state" in text
 
 
+def test_dashboard_live_path_trace_events_are_present() -> None:
+    text = PAGE.read_text()
+    for event in [
+        "GRIDBOT_UI_PAGE_RUN_START",
+        "GRIDBOT_UI_AUTH_ENTER",
+        "GRIDBOT_UI_AUTH_OK",
+        "GRIDBOT_UI_FRAGMENTS_BEGIN",
+        "GRIDBOT_UI_FRAGMENT_INVOKE",
+        "GRIDBOT_UI_FRAGMENT_ENTER",
+        "GRIDBOT_UI_FETCH_OPERATIONAL_ENTER",
+        "GRIDBOT_UI_FETCH_COMPACT_ENTER",
+        "GRIDBOT_UI_COMPACT_REQUEST_START",
+        "GRIDBOT_UI_COMPACT_REQUEST_RESULT",
+        "GRIDBOT_UI_AUTHORITY_UPDATE",
+        "GRIDBOT_UI_LAST_LIVE_UPDATE",
+        "GRIDBOT_UI_LKG_UPDATE",
+        "GRIDBOT_UI_RENDER_STATE",
+        "GRIDBOT_UI_PAGE_RUN_END",
+        "GRIDBOT_UI_EXCEPTION",
+    ]:
+        assert event in text
+
+
+def test_dashboard_trace_does_not_log_auth_secret_values() -> None:
+    text = PAGE.read_text()
+
+    assert "gridbot_ui_session_trace_id" in text
+    assert "uuid4().hex" in text
+    assert "Authorization" not in text
+    assert "COOKIE_NAME" not in text
+    assert "password" not in text.lower()
+    assert "current_streamlit_auth_token()" in text
+    assert "auth_present=bool(current_streamlit_auth_token())" in text
+
+
+def test_dashboard_trace_preserves_live_path_behavior_contract() -> None:
+    text = PAGE.read_text()
+
+    assert "@fragment(run_every=\"5s\")" in text
+    assert "@fragment(run_every=\"15s\")" in text
+    assert "@st.cache_data(ttl=5, show_spinner=False)" in text
+    assert 'return safe_get("/api/grid/v01/live/compact", timeout=10)' in text
+    assert "fetch_compact_live_state.clear()" in text
+    assert "fetch_detailed_live_state.clear()" in text
+    assert 'st.session_state["gridbot_last_good_active_live_state"] = live' in text
+    assert 'st.session_state["gridbot_live_authority"] = "UNKNOWN"' in text
+    assert 'st.session_state["gridbot_last_live_state"] = degraded' in text
+
+
+def test_dashboard_trace_sequence_marks_invocation_before_fragment_body() -> None:
+    text = PAGE.read_text()
+    invocation_block = text.split("with st.sidebar:", maxsplit=1)[1]
+
+    assert invocation_block.index('trace_event("GRIDBOT_UI_FRAGMENTS_BEGIN")') < invocation_block.index("live_status_fragment()")
+    for fragment_name in [
+        "live_status_fragment",
+        "live_metrics_fragment",
+        "live_orders_fragment",
+        "live_activity_fragment",
+    ]:
+        invoke = f'trace_event("GRIDBOT_UI_FRAGMENT_INVOKE", fragment="{fragment_name}")'
+        enter = f'trace_event("GRIDBOT_UI_FRAGMENT_ENTER", fragment="{fragment_name}")'
+        assert invoke in invocation_block
+        assert enter in text
+
+
 def test_dashboard_splits_live_surface_into_small_fragments() -> None:
     text = PAGE.read_text()
 
