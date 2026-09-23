@@ -923,6 +923,20 @@ def _compact_resting_orders(rows: list[dict]) -> list[dict]:
     )
 
 
+def _has_worker_compact_read_model(state: dict) -> bool:
+    if not state.get("run_id"):
+        return False
+    if not isinstance(state.get("active_run"), dict) or not state.get("active_run"):
+        return False
+    if not isinstance(state.get("config"), dict) or not state.get("config"):
+        return False
+    if not isinstance(state.get("known_gridbot_orders"), list):
+        return False
+    if state.get("active_run_freshness") == "unavailable":
+        return False
+    return True
+
+
 def gridbot_compact_live_state() -> dict:
     try:
         return _gridbot_compact_live_state()
@@ -963,12 +977,17 @@ def _gridbot_compact_live_state() -> dict:
     db = getattr(worker, "db", None)
     compact_source = state.get("active_run_source") or ("worker_memory_compact" if state.get("run_id") else "no_active_run")
     freshness = state.get("active_run_freshness") or ("fresh" if state.get("run_id") else "authoritative_no_active")
-    if state.get("run_id") and db and getattr(db, "enabled", False):
+    if _has_worker_compact_read_model(state):
+        compact_source = "worker_memory_compact"
+        if freshness == "unknown":
+            freshness = "fresh"
+        state["active_run_refresh_error"] = None
+    elif state.get("run_id") and db and getattr(db, "enabled", False):
         try:
             latest_run = db.load_run_state(state["run_id"])
             if latest_run:
                 state = _apply_run_to_live_state(state, latest_run)
-                compact_source = "worker_memory_compact"
+                compact_source = "persisted_active_run_compact"
                 freshness = "fresh"
                 state["active_run_refresh_error"] = None
         except Exception as exc:

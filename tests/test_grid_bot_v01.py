@@ -4635,8 +4635,8 @@ def test_gridbot_live_state_refreshes_latest_persisted_transitional_progress(mon
     assert state["health"]["overall_status"] != "HEALTHY"
 
 
-def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monkeypatch):
-    stale_run = {
+def test_gridbot_compact_live_state_uses_worker_read_model_without_supabase_reload(monkeypatch):
+    current_run = {
         "run_id": "run-compact",
         "status": GridStatus.RUNNING.value,
         "config": {
@@ -4652,21 +4652,6 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
         },
         "product": {"product_id": 1699, "symbol": "ETHUSD", "contract_multiplier": "1"},
         "orders": {
-            "old-buy": {"client_order_id": "old-buy", "side": "buy", "status": "open", "remaining_quantity": "1"},
-            "old-sell": {"client_order_id": "old-sell", "side": "sell", "status": "open", "remaining_quantity": "1"},
-        },
-        "fills": {"old": {"id": "old", "side": "buy", "size": "5", "price": "2500", "commission": "0"}},
-        "deployment_completeness": {"expected": 4, "confirmed_open": 3, "filled": 1, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
-        "external_position_adjustment": {
-            "classification": "MANUAL_PARTIAL_REDUCTION_OR_EXTERNAL_REDUCTION",
-            "ledger_inventory": "100",
-            "delta_position": "80",
-            "external_adjustment_lots": "-20",
-        },
-    }
-    latest_run = {
-        **stale_run,
-        "orders": {
             "buy-open": {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
             "sell-open-a": {"client_order_id": "sell-open-a", "side": "sell", "status": "open", "remaining_quantity": "1"},
             "sell-open-b": {"client_order_id": "sell-open-b", "side": "sell", "status": "open", "remaining_quantity": "1"},
@@ -4677,6 +4662,7 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
             "fresh": {"id": "fresh", "side": "buy", "size": "5", "price": "2490", "commission": "0"},
         },
         "lifecycle_progress": {"operation": "RUNNING", "stage": "RUNNING", "message": "Grid running", "expected_orders": 4, "confirmed_orders": 3, "filled_orders": 1},
+        "deployment_completeness": {"expected": 4, "confirmed_open": 3, "filled": 1, "deferred": 0, "ambiguous": 0, "missing": 0, "complete": True},
     }
 
     class DB:
@@ -4684,9 +4670,8 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
         load_calls = 0
 
         def load_run_state(self, run_id):
-            assert run_id == "run-compact"
             self.load_calls += 1
-            return latest_run
+            raise AssertionError("healthy compact fast path must not reload full Supabase run state")
 
         def stats(self):
             return {"select": 99}
@@ -4703,16 +4688,19 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
                 "run_id": "run-compact",
                 "status": "running",
                 "lifecycle_state": GridStatus.RUNNING.value,
-                "active_run": stale_run,
-                "config": stale_run["config"],
-                "deployment_completeness": stale_run["deployment_completeness"],
-                "known_gridbot_orders": list(stale_run["orders"].values()),
-                "fill_derived_inventory": "5",
-                "delta_position": "5",
-                "known_fill_count": 1,
+                "active_run": current_run,
+                "active_run_freshness": "fresh",
+                "active_run_source": "worker_memory_active_run",
+                "config": current_run["config"],
+                "deployment_completeness": current_run["deployment_completeness"],
+                "lifecycle_progress": current_run["lifecycle_progress"],
+                "known_gridbot_orders": list(current_run["orders"].values()),
+                "fill_derived_inventory": "10",
+                "delta_position": "10",
+                "known_fill_count": 2,
                 "accounting": {"net_realized_pnl": "0", "unrealized_pnl": "-1", "live_net_pnl": "-1", "trading_fees": "0.01", "cycles_completed": 0, "accounting_status": "COMPLETE"},
                 "account_risk_state": {"telemetry_status": "HEALTHY", "mark_price": "2500", "account_equity": "1000", "available_margin": "990", "used_margin": "10", "margin_utilisation_pct": "1", "position_lots": "10"},
-                "health": {"overall_status": "ATTENTION_REQUIRED", "active_issues": [{"code": "EXTERNAL_POSITION_CHANGE"}], "position_inventory_agreement": {"gridbot_inventory": "5", "delta_position": "5", "matches": True, "difference": "0"}},
+                "health": {"overall_status": "HEALTHY", "active_issues": [], "safe_for_risk_increase": True, "operator_attention_required": False, "position_inventory_agreement": {"gridbot_inventory": "10", "delta_position": "10", "matches": True, "difference": "0"}},
                 "last_poll_at": utc_now(),
                 "last_successful_poll_at": utc_now(),
                 "last_successful_reconcile": utc_now(),
@@ -4724,6 +4712,7 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
 
     assert compact["source"] == "worker_memory_compact"
     assert compact["freshness"] == "fresh"
+    assert continuous_worker_module.worker.db.load_calls == 0
     assert compact["run_id"] == "run-compact"
     assert compact["fill_derived_inventory"] == "10"
     assert compact["delta_position"] == "10"
@@ -4779,6 +4768,53 @@ def test_gridbot_compact_live_state_refreshes_active_run_before_compacting(monke
     assert "active_run" not in compact
     assert "risk_snapshots" not in compact
     assert "fills" not in compact
+
+
+def test_gridbot_compact_live_state_uses_persisted_fallback_when_worker_read_model_incomplete(monkeypatch):
+    latest_run = {
+        "run_id": "run-compact-fallback-load",
+        "status": GridStatus.RUNNING.value,
+        "config": {"grid_type": "neutral", "config_version": 1, "max_inventory_lots": "20"},
+        "orders": {
+            "buy-open": {"client_order_id": "buy-open", "side": "buy", "status": "open", "remaining_quantity": "1"},
+            "sell-open": {"client_order_id": "sell-open", "side": "sell", "status": "open", "remaining_quantity": "1"},
+        },
+        "fills": {},
+        "deployment_completeness": {"expected": 2, "confirmed_open": 2, "filled": 0, "deferred": 0, "complete": True},
+    }
+
+    class DB:
+        enabled = True
+        load_calls = 0
+
+        def load_run_state(self, run_id):
+            assert run_id == "run-compact-fallback-load"
+            self.load_calls += 1
+            return latest_run
+
+    class Worker:
+        db = DB()
+
+        def state(self):
+            return {
+                "ok": True,
+                "run_id": "run-compact-fallback-load",
+                "status": "running",
+                "running": True,
+                "thread_alive": True,
+                "active_run_freshness": "unknown",
+                "account_risk_state": {"telemetry_status": "HEALTHY", "position_lots": "0", "mark_price": "2500"},
+                "health": {"overall_status": "UNKNOWN", "active_issues": []},
+            }
+
+    monkeypatch.setattr(continuous_worker_module, "worker", Worker())
+
+    compact = continuous_worker_module.gridbot_compact_live_state()
+
+    assert continuous_worker_module.worker.db.load_calls == 1
+    assert compact["source"] == "persisted_active_run_compact"
+    assert compact["run_id"] == "run-compact-fallback-load"
+    assert compact["current_orders"] == {"open_buy_count": 1, "open_sell_count": 1, "open_order_count": 2}
 
 
 def test_gridbot_compact_live_state_returns_degraded_active_payload_on_builder_failure(monkeypatch):
